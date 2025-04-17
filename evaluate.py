@@ -1,0 +1,470 @@
+"""
+Oil Spill Detection - Model Evaluation Script
+
+This script evaluates the trained DeepLabv3+ model on the oil spill detection test dataset.
+It computes class-wise IoU metrics, mean IoU, and inference time.
+The results are compared with a baseline model and saved as a markdown file.
+
+Features:
+- Multi-scale inference (50%, 75%, 100%)
+- Class-wise IoU measurement
+- Inference time benchmarking
+"""
+
+import os
+import time
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pandas as pd
+import glob
+
+# Set TensorFlow logging level to reduce verbosity
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+tf.get_logger().setLevel('ERROR')
+
+# Import the data loading function from data_loader.py
+from data_loader import load_dataset
+
+
+class MultiScalePredictor:
+    """Multi-scale prediction for semantic segmentation."""
+
+    def __init__(self, model, scales=[0.5, 0.75, 1.0]):
+        self.model = model
+        self.scales = scales
+
+    def predict(self, image_batch):
+        """
+        Predict using multiple scales and fuse results.
+
+        Args:
+            image_batch: Batch of images with shape [batch_size, height, width, channels]
+
+        Returns:
+            Fused predictions with shape [batch_size, height, width, num_classes]
+        """
+        batch_size = tf.shape(image_batch)[0]
+        height = tf.shape(image_batch)[1]
+        width = tf.shape(image_batch)[2]
+
+        # Store original size for later use
+        original_size = (height, width)
+
+        # Placeholder for all scaled predictions
+        all_predictions = []
+
+        # Make predictions at each scale
+        for scale in self.scales:
+            try:
+                # For input to the model, always use the original image
+                model_input = tf.identity(image_batch)
+
+                # Run prediction
+                print(f"Running prediction at scale {scale} with input shape {model_input.shape}")
+                logits = self.model(model_input, training=False)
+
+                # For fusion, we'll scale the outputs
+                if scale != 1.0:
+                    # Calculate scaled dimensions for the output
+                    scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
+                    scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
+
+                    # Scale the logits (output) to the scaled size
+                    scaled_logits = tf.image.resize(
+                        logits,
+                        size=(scaled_height, scaled_width),
+                        method='bilinear'
+                    )
+
+                    # Then scale back to original size for fusion
+                    resized_logits = tf.image.resize(
+                        scaled_logits,
+                        size=original_size,
+                        method='bilinear'
+                    )
+                else:
+                    # For scale 1.0, use the output directly
+                    resized_logits = logits
+
+                # Apply softmax to get probabilities
+                probs = tf.nn.softmax(resized_logits, axis=-1)
+                all_predictions.append(probs)
+
+            except Exception as e:
+                print(f"Error at scale {scale}: {e}")
+                # Skip this scale if there's an error
+                continue
+
+        # Check if we have any successful predictions
+        if not all_predictions:
+            raise ValueError("All scales failed in prediction. Cannot proceed.")
+
+        # Average predictions from all scales
+        fused_prediction = tf.reduce_mean(tf.stack(all_predictions, axis=0), axis=0)
+
+        return fused_prediction
+
+
+def compute_iou(y_true, y_pred, num_classes=5):
+    """
+    Compute mean IoU and class-wise IoU.
+
+    Args:
+        y_true: Ground truth labels with shape [batch_size, height, width, 1]
+        y_pred: Predictions with shape [batch_size, height, width, num_classes]
+        num_classes: Number of classes
+
+    Returns:
+        mean_iou: Mean IoU across all classes
+        class_ious: IoU for each class
+    """
+    # Convert y_true to integer class indices and remove last dimension
+    y_true = tf.cast(y_true, tf.int32)
+    y_true = tf.squeeze(y_true, axis=-1)
+
+    # Convert y_pred from logits/probabilities to class indices
+    y_pred = tf.argmax(y_pred, axis=-1)
+    y_pred = tf.cast(y_pred, tf.int32)
+
+    # Initialize confusion matrix
+    confusion_matrix = tf.zeros((num_classes, num_classes), dtype=tf.float32)
+
+    # Update confusion matrix for each image in the batch
+    for i in range(tf.shape(y_true)[0]):
+        true_flat = tf.reshape(y_true[i], [-1])
+        pred_flat = tf.reshape(y_pred[i], [-1])
+
+        # Compute confusion matrix for this image
+        cm_i = tf.math.confusion_matrix(
+            true_flat, pred_flat,
+            num_classes=num_classes,
+            dtype=tf.float32
+        )
+
+        # Add to overall confusion matrix
+        confusion_matrix += cm_i
+
+    # Calculate IoU for each class
+    # IoU = true_positive / (true_positive + false_positive + false_negative)
+    sum_over_row = tf.reduce_sum(confusion_matrix, axis=0)
+    sum_over_col = tf.reduce_sum(confusion_matrix, axis=1)
+    true_positives = tf.linalg.tensor_diag_part(confusion_matrix)
+
+    # sum_over_row + sum_over_col - true_positives = TP + FP + FN
+    denominator = sum_over_row + sum_over_col - true_positives
+
+    # The IoU is set to 0 if the denominator is 0
+    class_ious = tf.math.divide_no_nan(true_positives, denominator)
+
+    # Calculate mean IoU excluding classes that don't appear in ground truth
+    mask = tf.greater(sum_over_col, 0)
+    mean_iou = tf.reduce_mean(tf.boolean_mask(class_ious, mask))
+
+    return mean_iou.numpy(), class_ious.numpy()
+
+
+def measure_inference_time(model, num_runs=10, batch_size=1, multi_scale=False):
+    """
+    Measure average inference time for a model.
+
+    Args:
+        model: The model to measure
+        num_runs: Number of inference runs to average over
+        batch_size: Batch size for inference
+        multi_scale: Whether to use multi-scale prediction
+
+    Returns:
+        Average inference time in milliseconds
+    """
+    # Create a dummy input
+    dummy_input = tf.random.normal((batch_size, 320, 320, 3))
+
+    # Warmup
+    for _ in range(3):
+        if multi_scale:
+            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            _ = predictor.predict(dummy_input)
+        else:
+            _ = model(dummy_input, training=False)
+
+    # Measure time
+    start_time = time.time()
+
+    for _ in range(num_runs):
+        if multi_scale:
+            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            _ = predictor.predict(dummy_input)
+        else:
+            _ = model(dummy_input, training=False)
+
+    end_time = time.time()
+
+    # Calculate average time in milliseconds
+    avg_time = (end_time - start_time) * 1000 / num_runs
+
+    return avg_time
+
+
+def evaluate_model(model_path, test_dataset, batch_size=8):
+    """
+    Evaluate the DeepLabv3+ model on the test dataset.
+
+    Args:
+        model_path: Path to the saved model
+        test_dataset: The test dataset
+        batch_size: Batch size for evaluation
+
+    Returns:
+        Dictionary containing evaluation results
+    """
+    # Import model definition
+    from model import DeepLabv3Plus
+    from loss import hybrid_loss
+
+    # Load model from checkpointed H5 file
+    print(f"Loading model from checkpoint: {model_path}")
+    try:
+        # Load model architecture and weights; compile=False since we only predict
+        model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={'hybrid_loss': hybrid_loss},
+            compile=False
+        )
+        print("Model loaded successfully")
+    except Exception as e:
+        print(f"Failed to load model directly: {e}")
+        print("Falling back to weight loading")
+        # Create a new model instance and load weights
+        model = DeepLabv3Plus(input_shape=(320, 320, 3), num_classes=5)
+        try:
+            model.load_weights(model_path)
+            print("Weights loaded successfully")
+        except Exception as e2:
+            print(f"Error loading weights: {e2}")
+            return None
+
+    # Create a multi-scale predictor
+    predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+
+    # Check if the dataset is already batched
+    is_already_batched = False
+    for images, labels in test_dataset.take(1):
+        print(f"Dataset element shape: images={images.shape}, labels={labels.shape}")
+        if len(images.shape) == 4 and images.shape[0] > 1:
+            is_already_batched = True
+            print("Dataset appears to be already batched")
+
+    # Prepare the test dataset
+    if is_already_batched:
+        test_batches = test_dataset
+    else:
+        test_batches = test_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    # Initialize list to store ground truth and predictions
+    all_true_labels = []
+    all_predictions = []
+
+    # Process each batch
+    print("Evaluating on test dataset...")
+    for images, labels in tqdm(test_batches):
+        try:
+            # Get predictions using multi-scale fusion
+            predictions = predictor.predict(images)
+
+            # Store labels and predictions
+            all_true_labels.append(labels)
+            all_predictions.append(predictions)
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+            continue
+
+    # Check if we have any successful predictions
+    if not all_true_labels:
+        print("No successful predictions were made. Evaluation failed.")
+        return None
+
+    # Concatenate all batches
+    true_labels = tf.concat(all_true_labels, axis=0)
+    predictions = tf.concat(all_predictions, axis=0)
+
+    # Compute IoU metrics
+    mean_iou, class_ious = compute_iou(true_labels, predictions, num_classes=5)
+
+    # Compute inference time
+    inference_time = measure_inference_time(model, multi_scale=True)
+    single_scale_time = measure_inference_time(model, multi_scale=False)
+
+    # Prepare results
+    class_names = ['Sea Surface', 'Oil Spill', 'Look-alike', 'Ship', 'Land']
+
+    results = {
+        'mean_iou': mean_iou * 100,  # Convert to percentage
+        'class_ious': {class_names[i]: class_ious[i] * 100 for i in range(len(class_names))},
+        'inference_time_ms': inference_time,
+        'single_scale_time_ms': single_scale_time
+    }
+
+    return results
+
+
+def plot_class_ious(results, title="Class-wise IoU Comparison"):
+    """
+    Plot class-wise IoU comparison between models.
+
+    Args:
+        results: Dictionary of model results
+        title: Plot title
+    """
+    plt.figure(figsize=(12, 6))
+
+    class_names = list(next(iter(results.values()))['class_ious'].keys())
+    x = np.arange(len(class_names))
+    width = 0.8 / len(results)
+
+    for i, (model_name, model_results) in enumerate(results.items()):
+        class_ious = [model_results['class_ious'][cn] for cn in class_names]
+        plt.bar(x + i*width - 0.4 + width/2, class_ious, width, label=model_name)
+
+    plt.xlabel('Classes')
+    plt.ylabel('IoU (%)')
+    plt.title(title)
+    plt.xticks(x, class_names, rotation=45)
+    plt.legend()
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # Add values on top of bars
+    for i, (model_name, model_results) in enumerate(results.items()):
+        class_ious = [model_results['class_ious'][cn] for cn in class_names]
+        for j, v in enumerate(class_ious):
+            plt.text(j + i*width - 0.4 + width/2, v + 0.5, f"{v:.1f}",
+                     ha='center', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig('class_ious_comparison.png', dpi=300)
+    plt.close()
+
+    print(f"Class-wise IoU comparison plot saved as class_ious_comparison.png")
+
+
+def save_results(results, output_file="evaluation_results.md"):
+    """
+    Save evaluation results to a markdown file.
+
+    Args:
+        results: Dictionary of model results
+        output_file: Output file name
+    """
+    with open(output_file, 'w') as f:
+        f.write("# Oil Spill Detection Model Evaluation Results\n\n")
+        f.write(f"Evaluation Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+        f.write("## Mean IoU Comparison\n\n")
+        f.write("| Model | Mean IoU (%) |\n")
+        f.write("|-------|-------------|\n")
+        for model_name, model_results in results.items():
+            f.write(f"| {model_name} | {model_results['mean_iou']:.2f} |\n")
+
+        f.write("\n## Class-wise IoU Comparison\n\n")
+        f.write("| Model | " + " | ".join(next(iter(results.values()))['class_ious'].keys()) + " |\n")
+        f.write("|-------|" + "|".join(["------" for _ in next(iter(results.values()))['class_ious']]) + "|\n")
+
+        for model_name, model_results in results.items():
+            class_ious = [f"{model_results['class_ious'][cn]:.2f}" for cn in model_results['class_ious'].keys()]
+            f.write(f"| {model_name} | " + " | ".join(class_ious) + " |\n")
+
+        f.write("\n## Inference Time Comparison\n\n")
+        f.write("| Model | Single-Scale (ms) | Multi-Scale (ms) |\n")
+        f.write("|-------|-------------------|------------------|\n")
+        for model_name, model_results in results.items():
+            f.write(f"| {model_name} | {model_results['single_scale_time_ms']:.2f} | {model_results['inference_time_ms']:.2f} |\n")
+
+        f.write("\n![Class-wise IoU Comparison](class_ious_comparison.png)\n")
+
+    print(f"Evaluation results saved to {output_file}")
+
+
+def find_checkpoint_models():
+    """Find all available checkpoint models."""
+    checkpoints_dir = 'checkpoints'
+    model_files = glob.glob(os.path.join(checkpoints_dir, '*.h5'))
+
+    if not model_files:
+        print(f"No model files found in {checkpoints_dir}")
+        return []
+
+    print(f"Found {len(model_files)} model files: {[os.path.basename(f) for f in model_files]}")
+    return model_files
+
+
+def main():
+    """Main evaluation function."""
+    # Configure GPU memory growth to avoid OOM errors
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"Using {len(gpus)} GPU(s)")
+        except RuntimeError as e:
+            print(f"GPU memory configuration error: {e}")
+    else:
+        print("Using CPU")
+
+    # Load the test dataset
+    print("Loading test dataset...")
+    test_dataset = load_dataset(data_dir='dataset', split='test')
+
+    # Find all available checkpoint models
+    model_files = find_checkpoint_models()
+    if not model_files:
+        return
+
+    # Allow specifying a specific model via command line argument
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate oil spill detection models')
+    parser.add_argument('--model', type=str, help='Path to specific model to evaluate')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
+    args = parser.parse_args()
+
+    if args.model:
+        if os.path.exists(args.model):
+            model_files = [args.model]
+        else:
+            print(f"Specified model {args.model} does not exist")
+            return
+
+    # Evaluate each model
+    results = {}
+    for model_path in model_files:
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        print(f"\nEvaluating model: {model_name}")
+
+        model_results = evaluate_model(model_path, test_dataset, batch_size=args.batch_size)
+
+        if model_results:
+            results[model_name] = model_results
+
+            # Print results
+            print(f"\nResults for {model_name}:")
+            print(f"Mean IoU: {model_results['mean_iou']:.2f}%")
+            print("Class-wise IoU:")
+            for class_name, iou in model_results['class_ious'].items():
+                print(f"  {class_name}: {iou:.2f}%")
+            print(f"Single-scale inference time: {model_results['single_scale_time_ms']:.2f} ms")
+            print(f"Multi-scale inference time: {model_results['inference_time_ms']:.2f} ms")
+        else:
+            print(f"Evaluation failed for {model_name}")
+
+    # If we have multiple models, compare them
+    if len(results) > 0:
+        # Plot class-wise IoU comparison
+        plot_class_ious(results)
+
+        # Save results to markdown file
+        save_results(results)
+
+
+if __name__ == "__main__":
+    main()
