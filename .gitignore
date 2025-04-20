@@ -49,3 +49,6 @@ dataset/
 .vscode/
 *.swp
 *.swo
+
+backup/
+.github/
