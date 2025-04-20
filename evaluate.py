@@ -9,6 +9,7 @@ Features:
 - Multi-scale inference (50%, 75%, 100%)
 - Class-wise IoU measurement
 - Inference time benchmarking
+- Mixed precision evaluation support
 """
 
 import os
@@ -23,6 +24,11 @@ import glob
 # Set TensorFlow logging level to reduce verbosity
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 tf.get_logger().setLevel('ERROR')
+
+# Import mixed precision for faster inference
+from tensorflow.keras import mixed_precision # type: ignore
+policy = mixed_precision.global_policy()
+print(f"Current mixed precision policy: {policy.name}")
 
 # Import the data loading function from data_loader.py
 from data_loader import load_dataset
@@ -49,6 +55,10 @@ class MultiScalePredictor:
         height = tf.shape(image_batch)[1]
         width = tf.shape(image_batch)[2]
 
+        # Cast input to the policy's compute dtype (float16 for mixed precision)
+        image_batch = tf.cast(image_batch, policy.compute_dtype)
+        print(f"Input cast to {policy.compute_dtype} for mixed precision inference")
+
         # Store original size for later use
         original_size = (height, width)
 
@@ -62,7 +72,7 @@ class MultiScalePredictor:
                 model_input = tf.identity(image_batch)
 
                 # Run prediction
-                print(f"Running prediction at scale {scale} with input shape {model_input.shape}")
+                print(f"Running prediction at scale {scale} with input shape {model_input.shape}, dtype={model_input.dtype}")
                 logits = self.model(model_input, training=False)
 
                 # For fusion, we'll scale the outputs
@@ -165,7 +175,7 @@ def compute_iou(y_true, y_pred, num_classes=5):
     return mean_iou.numpy(), class_ious.numpy()
 
 
-def measure_inference_time(model, num_runs=10, batch_size=1, multi_scale=False):
+def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     """
     Measure average inference time for a model.
 
@@ -176,35 +186,85 @@ def measure_inference_time(model, num_runs=10, batch_size=1, multi_scale=False):
         multi_scale: Whether to use multi-scale prediction
 
     Returns:
-        Average inference time in milliseconds
+        Average inference time in milliseconds and comparison results
     """
-    # Create a dummy input
-    dummy_input = tf.random.normal((batch_size, 320, 320, 3))
+    # Create a dummy input with the model's expected input shape
+    input_shape = model.input_shape[1:3]
+    dummy_input = tf.random.normal((batch_size, *input_shape, 3))
+
+    # Test with mixed precision (float16)
+    print(f"Testing inference with mixed precision ({policy.compute_dtype})...")
+
+    # Cast input to mixed precision dtype
+    mp_input = tf.cast(dummy_input, policy.compute_dtype)
 
     # Warmup
     for _ in range(3):
         if multi_scale:
             predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
-            _ = predictor.predict(dummy_input)
+            _ = predictor.predict(mp_input)
         else:
-            _ = model(dummy_input, training=False)
+            _ = model(mp_input, training=False)
 
-    # Measure time
+    # Measure time with mixed precision
     start_time = time.time()
-
     for _ in range(num_runs):
         if multi_scale:
             predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
-            _ = predictor.predict(dummy_input)
+            _ = predictor.predict(mp_input)
         else:
-            _ = model(dummy_input, training=False)
-
+            _ = model(mp_input, training=False)
     end_time = time.time()
 
-    # Calculate average time in milliseconds
-    avg_time = (end_time - start_time) * 1000 / num_runs
+    # Calculate average time in milliseconds for mixed precision
+    mp_avg_time = (end_time - start_time) * 1000 / num_runs
+    print(f"Mixed precision average inference time: {mp_avg_time:.2f} ms")
 
-    return avg_time
+    # Test with float32 for comparison
+    print(f"Testing inference with float32...")
+
+    # Cast input to float32
+    fp32_input = tf.cast(dummy_input, tf.float32)
+
+    # Create a temporary policy context for float32
+    original_policy = mixed_precision.global_policy()
+    mixed_precision.set_global_policy('float32')
+
+    # Warmup with float32
+    for _ in range(3):
+        if multi_scale:
+            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            _ = predictor.predict(fp32_input)
+        else:
+            _ = model(fp32_input, training=False)
+
+    # Measure time with float32
+    start_time = time.time()
+    for _ in range(num_runs):
+        if multi_scale:
+            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            _ = predictor.predict(fp32_input)
+        else:
+            _ = model(fp32_input, training=False)
+    end_time = time.time()
+
+    # Calculate average time in milliseconds for float32
+    fp32_avg_time = (end_time - start_time) * 1000 / num_runs
+    print(f"Float32 average inference time: {fp32_avg_time:.2f} ms")
+
+    # Calculate speedup
+    speedup = fp32_avg_time / mp_avg_time if mp_avg_time > 0 else 0
+    print(f"Mixed precision speedup: {speedup:.2f}x")
+
+    # Restore original policy
+    mixed_precision.set_global_policy(original_policy)
+
+    # Return mixed precision time as the primary result along with comparison data
+    return {
+        'mixed_precision_ms': mp_avg_time,
+        'float32_ms': fp32_avg_time,
+        'speedup': speedup
+    }
 
 
 def evaluate_model(model_path, test_dataset, batch_size=8):
@@ -293,8 +353,8 @@ def evaluate_model(model_path, test_dataset, batch_size=8):
     mean_iou, class_ious = compute_iou(true_labels, predictions, num_classes=5)
 
     # Compute inference time
-    inference_time = measure_inference_time(model, multi_scale=True)
-    single_scale_time = measure_inference_time(model, multi_scale=False)
+    inference_time_results = measure_inference_time(model, multi_scale=True)
+    single_scale_time_results = measure_inference_time(model, multi_scale=False)
 
     # Prepare results
     class_names = ['Sea Surface', 'Oil Spill', 'Look-alike', 'Ship', 'Land']
@@ -302,8 +362,8 @@ def evaluate_model(model_path, test_dataset, batch_size=8):
     results = {
         'mean_iou': mean_iou * 100,  # Convert to percentage
         'class_ious': {class_names[i]: class_ious[i] * 100 for i in range(len(class_names))},
-        'inference_time_ms': inference_time,
-        'single_scale_time_ms': single_scale_time
+        'inference_time_ms': inference_time_results,
+        'single_scale_time_ms': single_scale_time_results
     }
 
     return results
@@ -378,7 +438,7 @@ def save_results(results, output_file="evaluation_results.md"):
         f.write("| Model | Single-Scale (ms) | Multi-Scale (ms) |\n")
         f.write("|-------|-------------------|------------------|\n")
         for model_name, model_results in results.items():
-            f.write(f"| {model_name} | {model_results['single_scale_time_ms']:.2f} | {model_results['inference_time_ms']:.2f} |\n")
+            f.write(f"| {model_name} | {model_results['single_scale_time_ms']['mixed_precision_ms']:.2f} | {model_results['inference_time_ms']['mixed_precision_ms']:.2f} |\n")
 
         f.write("\n![Class-wise IoU Comparison](class_ious_comparison.png)\n")
 
@@ -452,8 +512,8 @@ def main():
             print("Class-wise IoU:")
             for class_name, iou in model_results['class_ious'].items():
                 print(f"  {class_name}: {iou:.2f}%")
-            print(f"Single-scale inference time: {model_results['single_scale_time_ms']:.2f} ms")
-            print(f"Multi-scale inference time: {model_results['inference_time_ms']:.2f} ms")
+            print(f"Single-scale inference time: {model_results['single_scale_time_ms']['mixed_precision_ms']:.2f} ms")
+            print(f"Multi-scale inference time: {model_results['inference_time_ms']['mixed_precision_ms']:.2f} ms")
         else:
             print(f"Evaluation failed for {model_name}")
 

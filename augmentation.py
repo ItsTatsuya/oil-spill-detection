@@ -1,78 +1,49 @@
-"""
-Data augmentation for the oil spill detection dataset.
-Augmentations are performed on the GPU when possible and resource optimized.
-Incorporates Keras-CV for advanced batched augmentations like CutMix and MixUp.
-"""
-
-import tensorflow as tf
 import numpy as np
 import os
 
-# Import keras_cv for advanced augmentations
-try:
-    import keras_cv
-    KERAS_CV_AVAILABLE = True
-    print("Keras-CV available for advanced augmentations")
-except ImportError:
-    KERAS_CV_AVAILABLE = False
-    print("Keras-CV not available, falling back to basic augmentations")
+def silent_tf_import():
+    import sys
+    orig_stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(orig_stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, orig_stderr_fd)
+    os.close(devnull_fd)
 
-# Configure TensorFlow logging
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 0=all, 1=info, 2=warning, 3=error
-tf.get_logger().setLevel('ERROR')
+    import tensorflow as tf
 
+    os.dup2(saved_stderr_fd, orig_stderr_fd)
+    os.close(saved_stderr_fd)
+
+    return tf
+
+tf = silent_tf_import()
+
+def tf_isin(x, values):
+    # x: tensor of any shape
+    # values: list or tensor of values to match
+    comparisons = [tf.equal(x, v) for v in values]
+    return tf.reduce_any(tf.stack(comparisons, axis=0), axis=0)
 
 @tf.function
 def rotate_image(image, angle, interpolation='nearest'):
-    """
-    Rotate image using native TensorFlow operations (no TF Addons required).
-
-    Args:
-        image: A tensor of shape [height, width, channels]
-        angle: Rotation angle in radians
-        interpolation: Interpolation method ('nearest' or 'bilinear')
-
-    Returns:
-        Rotated image tensor
-    """
-    # Get image shape
+    """Rotate image using native TensorFlow operations."""
     height = tf.shape(image)[0]
     width = tf.shape(image)[1]
-
-    # Calculate rotation center
-    # Convert to float32 to avoid type mismatches
     height_float = tf.cast(height, tf.float32)
     width_float = tf.cast(width, tf.float32)
     center_x = width_float / 2.0
     center_y = height_float / 2.0
 
-    # Calculate the rotation using TF's affine transformation
-    # Create rotation matrix components
     costheta = tf.cos(angle)
     sintheta = tf.sin(angle)
-
-    # Build the 8-element transformation matrix required by TF
-    # Format: [a0, a1, a2, b0, b1, b2, c0, c1]
-    # where the transform is [a0 a1 a2; b0 b1 b2; c0 c1 1]
-    # See: https://www.tensorflow.org/api_docs/python/tf/raw_ops/ImageProjectiveTransformV3
-
-    # Rotation around center:
-    # [cosθ, -sinθ, center_x - center_x*cosθ + center_y*sinθ]
-    # [sinθ,  cosθ, center_y - center_x*sinθ - center_y*cosθ]
-    # [0,     0,    1]
-
-    a0 = costheta
-    a1 = -sintheta
+    a0, a1 = costheta, -sintheta
     a2 = center_x - center_x * costheta + center_y * sintheta
-    b0 = sintheta
-    b1 = costheta
+    b0, b1 = sintheta, costheta
     b2 = center_y - center_x * sintheta - center_y * costheta
 
-    # Create the transformation matrix with shape [1, 8]
     transforms = tf.stack([a0, a1, a2, b0, b1, b2, 0.0, 0.0], axis=0)
     transforms = tf.reshape(transforms, [1, 8])
 
-    # Apply the transformation
     rotated_image = tf.raw_ops.ImageProjectiveTransformV3(
         images=tf.expand_dims(image, 0),
         transforms=transforms,
@@ -81,280 +52,234 @@ def rotate_image(image, angle, interpolation='nearest'):
         fill_mode="CONSTANT",
         fill_value=0.0
     )
-
     return tf.squeeze(rotated_image, 0)
 
+@tf.function
+def elastic_deform(image, label, alpha=20.0, sigma=4.0, grid_size=8):
+    """Apply elastic deformation to simulate water surface variations."""
+    height, width = tf.shape(image)[0], tf.shape(image)[1]
+    grid_x, grid_y = tf.meshgrid(tf.range(0, width, grid_size), tf.range(0, height, grid_size))
+    grid_x = tf.cast(grid_x, tf.float32)
+    grid_y = tf.cast(grid_y, tf.float32)
+
+    dx = tf.random.normal(tf.shape(grid_x), mean=0.0, stddev=sigma) * alpha
+    dy = tf.random.normal(tf.shape(grid_y), mean=0.0, stddev=sigma) * alpha
+
+    dx = tf.image.resize(tf.expand_dims(dx, -1), [height, width], method='bilinear')[:,:,0]
+    dy = tf.image.resize(tf.expand_dims(dy, -1), [height, width], method='bilinear')[:,:,0]
+
+    x, y = tf.meshgrid(tf.range(width), tf.range(height))
+    x = tf.cast(x, tf.float32)
+    y = tf.cast(y, tf.float32)
+    x_new = tf.clip_by_value(x + dx, 0, tf.cast(width - 1, tf.float32))
+    y_new = tf.clip_by_value(y + dy, 0, tf.cast(height - 1, tf.float32))
+
+    image_deformed = tf.image.resize(
+        tf.expand_dims(image, 0),
+        [height, width],
+        method='bilinear',
+        antialias=True
+    )[0]
+    label_deformed = tf.image.resize(
+        tf.expand_dims(tf.cast(label, tf.float32), 0),
+        [height, width],
+        method='nearest',
+        antialias=False
+    )[0]
+    return tf.cast(image_deformed, tf.float32), tf.cast(tf.round(label_deformed), tf.uint8)
 
 @tf.function
 def _augment_image_and_label(image, label):
-    """
-    Apply augmentation to an image and its corresponding label.
-    Using tf.function for GPU acceleration.
-
-    Args:
-        image: A tensor of shape [height, width, 3]
-        label: A tensor of shape [height, width, 1]
-
-    Returns:
-        Tuple of (augmented_image, augmented_label)
-    """
-    # Get original dimensions
+    """Apply per-image augmentations with class-aware enhancements."""
     original_shape = tf.shape(image)
     h, w = original_shape[0], original_shape[1]
-
-    # Combine image and label for consistent spatial transformations
-    # This ensures augmentations are applied identically to both
     combined = tf.concat([image, tf.cast(label, tf.float32) / 4.0], axis=2)
 
-    # Use GPU if available
-    # Random flip left-right (50% chance)
     if tf.random.uniform(()) > 0.5:
         combined = tf.image.flip_left_right(combined)
 
-    # Random rotation (max 10 degrees)
-    if tf.random.uniform(()) > 0.5:  # 50% chance to apply rotation
-        angle = tf.random.uniform([], minval=-0.174, maxval=0.174)  # +/- 10 degrees in radians
+    if tf.random.uniform(()) > 0.5:
+        angle = tf.random.uniform([], minval=-0.5236, maxval=0.5236)  # ±30°
         combined = rotate_image(combined, angle, interpolation='nearest')
 
-    # Extract image and label back after spatial transformations
+    if tf.random.uniform(()) > 0.5:
+        scale = tf.random.uniform([], minval=0.8, maxval=1.0)
+        new_h = tf.cast(tf.cast(h, tf.float32) * scale, tf.int32)
+        new_w = tf.cast(tf.cast(w, tf.float32) * scale, tf.int32)
+        combined = tf.image.resize(combined, [new_h, new_w], method='nearest')
+        combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
+
     image = combined[..., :3]
     label = combined[..., 3:]
 
-    # Random brightness (image only)
-    image = tf.image.random_brightness(image, max_delta=0.1)
+    image = tf.image.random_brightness(image, max_delta=0.2)
+    image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
+    image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
+    image = tf.image.random_hue(image, max_delta=0.1)
 
-    # Random contrast (image only)
-    image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
-
-    # Random saturation (image only)
-    image = tf.image.random_saturation(image, lower=0.9, upper=1.1)
-
-    # Add random noise with 30% probability
-    if tf.random.uniform(()) > 0.7:
-        noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.01)
+    if tf.random.uniform(()) > 0.5:
+        noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.02)
         image = image + noise
 
-    # Ensure image values remain in [0, 1]
-    image = tf.clip_by_value(image, 0, 1)
+    image, label = elastic_deform(image, label)
 
-    # Convert label back to original range and type
+    # Check for rare classes using tf.isin
+    flat_label = tf.reshape(label, [-1])
+    has_rare = tf.reduce_any(tf_isin(flat_label, [1, 3]))
+    if has_rare and tf.random.uniform(()) > 0.5:
+        if tf.random.uniform(()) > 0.5:
+            combined = tf.image.flip_left_right(combined)
+        if tf.random.uniform(()) > 0.5:
+            scale = tf.random.uniform([], minval=0.8, maxval=1.0)
+            new_h = tf.cast(tf.cast(h, tf.float32) * scale, tf.int32)
+            new_w = tf.cast(tf.cast(w, tf.float32) * scale, tf.int32)
+            combined = tf.image.resize(combined, [new_h, new_w], method='nearest')
+            combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
+
+    image = combined[..., :3]
+    label = combined[..., 3:]
+
+    image = tf.clip_by_value(image, 0, 1)
     label = label * 4.0
     label = tf.cast(tf.round(label), tf.uint8)
 
     return image, label
 
-
 @tf.function
-def apply_cutmix(images, labels, alpha=0.2, prob=0.25):
-    """
-    Apply CutMix augmentation to a batch of images and labels.
-
-    Args:
-        images: Tensor of shape [batch_size, height, width, channels]
-        labels: Tensor of shape [batch_size, height, width, 1]
-        alpha: Alpha parameter for beta distribution
-        prob: Probability of applying CutMix
-
-    Returns:
-        Tuple of augmented (images, labels)
-    """
-    # Only apply CutMix with specified probability
+def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
+    """Apply CutMix targeting rare class regions."""
     if tf.random.uniform(()) > prob:
         return images, labels
 
-    if not KERAS_CV_AVAILABLE:
+    batch_size = tf.shape(images)[0]
+    height, width = tf.shape(images)[1], tf.shape(images)[2]
+
+    rare_mask = tf.reduce_any(tf.equal(labels, [1, 3]), axis=-1, keepdims=True)
+    rare_indices = tf.where(rare_mask)
+
+    if tf.size(rare_indices) == 0:
         return images, labels
 
-    # For segmentation, we need to process each sample independently
-    batch_size = tf.shape(images)[0]
-    height = tf.shape(images)[1]
-    width = tf.shape(images)[2]
+    idx = tf.random.uniform([], maxval=tf.size(rare_indices), dtype=tf.int32)
+    y_coord = tf.cast(rare_indices[idx][0], tf.int32)
+    x_coord = tf.cast(rare_indices[idx][1], tf.int32)
 
-    # Convert to float32 to avoid type mismatches during multiplication
-    height_float = tf.cast(height, tf.float32)
-    width_float = tf.cast(width, tf.float32)
-
-    # Generate random indices for mixing (within the batch)
-    rand_indices = tf.random.shuffle(tf.range(batch_size))
-
-    # Generate random coordinates and size for the cut
     lambda_param = tf.random.uniform([], 0, 1)
     cut_ratio = tf.math.sqrt(1.0 - lambda_param)
+    cut_h = tf.cast(tf.cast(height, tf.float32) * cut_ratio, tf.int32)
+    cut_w = tf.cast(tf.cast(width, tf.float32) * cut_ratio, tf.int32)
 
-    # Calculate cut size using float versions of height and width, then cast to int
-    cut_h = tf.cast(height_float * cut_ratio, tf.int32)
-    cut_w = tf.cast(width_float * cut_ratio, tf.int32)
+    x1 = tf.maximum(0, x_coord - tf.cast(cut_w // 2, tf.int32))
+    y1 = tf.maximum(0, y_coord - tf.cast(cut_h // 2, tf.int32))
+    x2 = tf.minimum(width, x_coord + tf.cast(cut_w // 2, tf.int32))
+    y2 = tf.minimum(height, y_coord + tf.cast(cut_h // 2, tf.int32))
 
-    # Random center position
-    center_x = tf.random.uniform([], 0, width, dtype=tf.int32)
-    center_y = tf.random.uniform([], 0, height, dtype=tf.int32)
-
-    # Calculate box coordinates
-    x1 = tf.maximum(0, center_x - cut_w // 2)
-    y1 = tf.maximum(0, center_y - cut_h // 2)
-    x2 = tf.minimum(width, center_x + cut_w // 2)
-    y2 = tf.minimum(height, center_y + cut_h // 2)
-
-    # Create the cutmix mask using a simpler approach
-    # Start with a mask of ones (all original image)
     mask = tf.ones([height, width, 1], dtype=tf.float32)
-
-    # Create a mask of zeros for the cut region
     cut_mask = tf.zeros([y2-y1, x2-x1, 1], dtype=tf.float32)
-
-    # Create paddings for the cut region to position it correctly
-    paddings = [
-        [y1, height - y2],  # Padding for height (before, after)
-        [x1, width - x2],   # Padding for width (before, after)
-        [0, 0]              # No padding for channels
-    ]
-
-    # Pad the cut mask to create a full-sized mask with zeros in the cut region
+    paddings = [[y1, height - y2], [x1, width - x2], [0, 0]]
     cut_mask_padded = tf.pad(cut_mask, paddings)
-
-    # Invert the padded mask (0 becomes 1, 1 becomes 0)
     mask = mask * (1.0 - cut_mask_padded)
 
-    # Reshape to add batch dimension
-    mask = tf.reshape(mask, [1, height, width, 1])
-
-    # Apply the cutmix to images and labels
-    mixed_images = images * mask + tf.gather(images, rand_indices) * (1.0 - mask)
-    mixed_labels = labels * tf.cast(mask, labels.dtype) + tf.gather(labels, rand_indices) * tf.cast(1.0 - mask, labels.dtype)
+    rand_indices = tf.random.shuffle(tf.range(batch_size))
+    mixed_images = images * mask + tf.gather(images, rand_indices, axis=0) * (1.0 - mask)
+    mixed_labels = labels * tf.cast(mask, labels.dtype) + tf.gather(labels, rand_indices, axis=0) * tf.cast(1.0 - mask, labels.dtype)
 
     return mixed_images, mixed_labels
 
-
 @tf.function
-def apply_mixup(images, labels, alpha=0.2, prob=0.25):
-    """
-    Apply MixUp augmentation to a batch of images and labels.
-
-    Args:
-        images: Tensor of shape [batch_size, height, width, channels]
-        labels: Tensor of shape [batch_size, height, width, 1]
-        alpha: Alpha parameter for beta distribution
-        prob: Probability of applying MixUp
-
-    Returns:
-        Tuple of augmented (images, labels)
-    """
-    # Only apply MixUp with specified probability
+def apply_mixup(images, labels, alpha=0.3, prob=0.5):
+    """Apply MixUp with soft label blending for segmentation."""
     if tf.random.uniform(()) > prob:
         return images, labels
 
-    if not KERAS_CV_AVAILABLE:
-        return images, labels
-
-    # Generate mixing coefficient from beta distribution
+    batch_size = tf.shape(images)[0]
     gamma = tf.random.gamma([1], alpha, 1)[0]
     lam = tf.minimum(gamma / (gamma + tf.random.gamma([1], alpha, 1)[0]), tf.ones([1])[0])
 
-    # Generate random indices for mixing
-    batch_size = tf.shape(images)[0]
     rand_indices = tf.random.shuffle(tf.range(batch_size))
+    mixed_images = lam * images + (1 - lam) * tf.gather(images, rand_indices, axis=0)
 
-    # Apply mixup
-    mixed_images = lam * images + (1 - lam) * tf.gather(images, rand_indices)
-
-    # For semantic segmentation, we need to handle labels differently than classification
-    # We'll use a one-hot encoding approach to properly mix the labels
-    mixed_labels = lam * tf.cast(labels, tf.float32) + (1 - lam) * tf.cast(tf.gather(labels, rand_indices), tf.float32)
-    mixed_labels = tf.cast(tf.math.round(mixed_labels), tf.uint8)  # Round to nearest label
+    mixed_labels = lam * tf.cast(labels, tf.float32) + (1 - lam) * tf.cast(tf.gather(labels, rand_indices, axis=0), tf.float32)
+    mixed_labels = tf.cast(tf.clip_by_value(tf.round(mixed_labels), 0, 4), tf.uint8)
 
     return mixed_images, mixed_labels
 
-
 def apply_augmentation(dataset, batch_size=8):
-    """
-    Apply augmentation to a dataset of images and labels.
-
-    Args:
-        dataset: tf.data.Dataset containing (image, label) pairs
-        batch_size: Batch size for the returned dataset
-
-    Returns:
-        tf.data.Dataset with augmented (image, label) pairs
-    """
-    # Extract any batching that might already be applied
+    """Apply augmentation pipeline compatible with data_loader.py."""
     was_batched = False
     try:
-        # Check if the dataset is already batched
         shapes = tf.compat.v1.data.get_output_shapes(dataset)
-        if len(shapes[0].as_list()) == 4:  # Batched images have shape [batch, H, W, C]
+        if len(shapes[0].as_list()) == 4:  # Batched images
             was_batched = True
-            # Unbatch if needed
             dataset = dataset.unbatch()
             print("Unbatched existing dataset before applying augmentation")
     except Exception:
-        pass  # Assume dataset is not batched
+        pass
 
-    # Apply per-image augmentation using map with GPU acceleration
+    # Enable all tf.data optimizations
     options = tf.data.Options()
     options.experimental_optimization.map_parallelization = True
+    options.experimental_optimization.map_fusion = True
+    options.experimental_optimization.parallel_batch = True
+    options.experimental_optimization.noop_elimination = True
+    options.experimental_optimization.apply_default_optimizations = True
+    options.deterministic = False  # Allow non-deterministic ops for speed
 
-    # Check for GPU availability
+    # Use maximum parallelism based on available GPUs
     gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        print("Using GPU for data augmentation")
-        parallel_calls = min(4, len(gpus))  # Use fewer parallel calls to avoid memory issues
-    else:
-        print("GPU not available for data augmentation")
-        parallel_calls = tf.data.AUTOTUNE
+    # Use more parallel calls for faster processing
+    parallel_calls = tf.data.AUTOTUNE
+    print(f"Using {'GPU' if gpus else 'CPU'} with AUTOTUNE parallel calls")
 
-    # Apply per-image augmentations first
+    # Apply per-image augmentations
     augmented_ds = dataset.with_options(options).map(
         _augment_image_and_label,
         num_parallel_calls=parallel_calls
     )
 
-    # Shuffle before batching to increase randomness
+    # Shuffle before batching with larger buffer
     augmented_ds = augmented_ds.shuffle(
-        buffer_size=min(100, 1000),  # Limit buffer size to avoid memory issues
+        buffer_size=2000,  # Increased buffer size
         reshuffle_each_iteration=True
     )
 
     # Batch the dataset
     augmented_ds = augmented_ds.batch(batch_size)
 
-    # Apply batch-level augmentations (CutMix and MixUp) if Keras-CV is available
-    if KERAS_CV_AVAILABLE:
-        augmented_ds = augmented_ds.map(
-            lambda x, y: apply_cutmix(x, y, alpha=0.2, prob=0.25),
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
-        augmented_ds = augmented_ds.map(
-            lambda x, y: apply_mixup(x, y, alpha=0.2, prob=0.25),
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
+    # Apply batch-level augmentations
+    augmented_ds = augmented_ds.map(
+        lambda x, y: apply_cutmix(x, y, alpha=0.3, prob=0.5),
+        num_parallel_calls=parallel_calls
+    )
+    augmented_ds = augmented_ds.map(
+        lambda x, y: apply_mixup(x, y, alpha=0.3, prob=0.5),
+        num_parallel_calls=parallel_calls
+    )
 
-    # Use a small prefetch buffer to prevent memory warnings
-    augmented_ds = augmented_ds.prefetch(buffer_size=2)
+    # Prefetch more batches for better performance
+    augmented_ds = augmented_ds.prefetch(tf.data.AUTOTUNE)
 
     return augmented_ds
 
-
 if __name__ == "__main__":
-    # Import the data_loader module to test the augmentation
-    import os
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow logs
-
     from data_loader import load_dataset
     import matplotlib.pyplot as plt
 
-    # Configure TensorFlow to use CPU only for this test
-    # Comment out if you want to use GPU
-    # tf.config.set_visible_devices([], 'GPU')
+    # Get the current mixed precision policy
+    policy = tf.keras.mixed_precision.global_policy()
+    print(f"Current mixed precision policy: {policy.name}")
 
-    # Load a small dataset for testing
-    test_ds = load_dataset(split='test', batch_size=1)
+    # Ensure input tensors use the correct precision during testing
+    compute_dtype = policy.compute_dtype
+    variable_dtype = policy.variable_dtype
+    print(f"Compute dtype: {compute_dtype}, Variable dtype: {variable_dtype}")
 
-    # Get a single sample for demonstration
-    for image, label in test_ds.take(1):
+    # Unpack the tuple returned by load_dataset
+    test_dataset, _, _ = load_dataset(split='test', batch_size=1)
+    for image, label in test_dataset.take(1):
         original_image = image[0].numpy()
         original_label = label[0].numpy()
 
-        # Apply augmentation multiple times to demonstrate
         plt.figure(figsize=(15, 10))
         plt.subplot(2, 3, 1)
         plt.title("Original Image")
@@ -364,9 +289,10 @@ if __name__ == "__main__":
         plt.title("Original Label")
         plt.imshow(original_label[:,:,0], cmap='jet', vmin=0, vmax=4)
 
-        # Apply various augmentations
         for i in range(2):
-            aug_image, aug_label = _augment_image_and_label(original_image, original_label)
+            # Cast to proper dtype before augmentation to maintain precision compatibility
+            img_tensor = tf.cast(original_image, compute_dtype)
+            aug_image, aug_label = _augment_image_and_label(img_tensor, original_label)
 
             plt.subplot(2, 3, i+2)
             plt.title(f"Augmented Image {i+1}")
@@ -379,27 +305,23 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig('augmentation_examples.png')
         plt.close()
-
         print("Augmentation examples saved as 'augmentation_examples.png'")
         break
 
-    # Test the dataset augmentation pipeline
     print("\nTesting the augmentation pipeline...")
-    augmented_ds = apply_augmentation(test_ds, batch_size=4)
+    augmented_ds = apply_augmentation(test_dataset, batch_size=4)
 
-    print("Original dataset:", test_ds)
+    print("Original dataset:", test_dataset)
     print("Augmented dataset:", augmented_ds)
 
     try:
-        # Check a batch from the augmented dataset
         for aug_images, aug_labels in augmented_ds.take(1):
             print(f"Augmented batch - Images shape: {aug_images.shape}, Labels shape: {aug_labels.shape}")
+            print(f"Image dtype: {aug_images.dtype}, Label dtype: {aug_labels.dtype}")
             print(f"Image value range: {tf.reduce_min(aug_images).numpy()} to {tf.reduce_max(aug_images).numpy()}")
             print(f"Label values: {np.unique(aug_labels.numpy())}")
 
-            # Visualize the first two images in the augmented batch
             plt.figure(figsize=(15, 10))
-
             for i in range(min(4, aug_images.shape[0])):
                 plt.subplot(2, 4, i+1)
                 plt.title(f"Aug Image {i+1}")
@@ -415,4 +337,7 @@ if __name__ == "__main__":
 
         print("Augmentation pipeline test completed successfully!")
     except Exception as e:
+        # Print more detailed error information
+        import traceback
         print(f"Error in augmentation pipeline: {e}")
+        print(f"Error details: {traceback.format_exc()}")
