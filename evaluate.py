@@ -33,6 +33,18 @@ print(f"Current mixed precision policy: {policy.name}")
 # Import the data loading function from data_loader.py
 from data_loader import load_dataset
 
+# Define baseline results for comparison
+BASELINE_RESULTS = {
+    'mean_iou': 65.06,
+    'class_ious': {
+        'Sea Surface': 96.43,
+        'Oil Spill': 53.38,
+        'Look-alike': 55.40,
+        'Ship': 27.63,
+        'Land': 92.44
+    }
+}
+
 
 class MultiScalePredictor:
     """Multi-scale prediction for semantic segmentation."""
@@ -468,11 +480,16 @@ def plot_class_ious(results, title="Class-wise IoU Comparison"):
 
     class_names = list(next(iter(results.values()))['class_ious'].keys())
     x = np.arange(len(class_names))
-    width = 0.8 / len(results)
+    width = 0.8 / (len(results) + 1)  # +1 for baseline
 
+    # Plot model results
     for i, (model_name, model_results) in enumerate(results.items()):
         class_ious = [model_results['class_ious'][cn] for cn in class_names]
         plt.bar(x + i*width - 0.4 + width/2, class_ious, width, label=model_name)
+
+    # Plot baseline results
+    baseline_ious = [BASELINE_RESULTS['class_ious'][cn] for cn in class_names]
+    plt.bar(x + len(results)*width - 0.4 + width/2, baseline_ious, width, label='Baseline', color='gray', alpha=0.7)
 
     plt.xlabel('Classes')
     plt.ylabel('IoU (%)')
@@ -481,12 +498,17 @@ def plot_class_ious(results, title="Class-wise IoU Comparison"):
     plt.legend()
     plt.grid(axis='y', linestyle='--', alpha=0.7)
 
-    # Add values on top of bars
+    # Add values on top of bars for models
     for i, (model_name, model_results) in enumerate(results.items()):
         class_ious = [model_results['class_ious'][cn] for cn in class_names]
         for j, v in enumerate(class_ious):
             plt.text(j + i*width - 0.4 + width/2, v + 0.5, f"{v:.1f}",
                      ha='center', fontsize=8)
+
+    # Add values on top of bars for baseline
+    for j, v in enumerate(baseline_ious):
+        plt.text(j + len(results)*width - 0.4 + width/2, v + 0.5, f"{v:.1f}",
+                 ha='center', fontsize=8)
 
     plt.tight_layout()
     plt.savefig('class_ious_comparison.png', dpi=300)
@@ -512,6 +534,7 @@ def save_results(results, output_file="evaluation_results.md"):
         f.write("|-------|-------------|\n")
         for model_name, model_results in results.items():
             f.write(f"| {model_name} | {model_results['mean_iou']:.2f} |\n")
+        f.write(f"| Baseline | {BASELINE_RESULTS['mean_iou']:.2f} |\n")
 
         f.write("\n## Class-wise IoU Comparison\n\n")
         f.write("| Model | " + " | ".join(next(iter(results.values()))['class_ious'].keys()) + " |\n")
@@ -520,6 +543,8 @@ def save_results(results, output_file="evaluation_results.md"):
         for model_name, model_results in results.items():
             class_ious = [f"{model_results['class_ious'][cn]:.2f}" for cn in model_results['class_ious'].keys()]
             f.write(f"| {model_name} | " + " | ".join(class_ious) + " |\n")
+        baseline_class_ious = [f"{BASELINE_RESULTS['class_ious'][cn]:.2f}" for cn in BASELINE_RESULTS['class_ious'].keys()]
+        f.write(f"| Baseline | " + " | ".join(baseline_class_ious) + " |\n")
 
         f.write("\n## Inference Time Comparison\n\n")
         f.write("| Model | Single-Scale (ms) | Multi-Scale (ms) |\n")
@@ -530,19 +555,6 @@ def save_results(results, output_file="evaluation_results.md"):
         f.write("\n![Class-wise IoU Comparison](class_ious_comparison.png)\n")
 
     print(f"Evaluation results saved to {output_file}")
-
-
-def find_checkpoint_models():
-    """Find all available checkpoint models."""
-    checkpoints_dir = 'checkpoints'
-    model_files = glob.glob(os.path.join(checkpoints_dir, '*.h5'))
-
-    if not model_files:
-        print(f"No model files found in {checkpoints_dir}")
-        return []
-
-    print(f"Found {len(model_files)} model files: {[os.path.basename(f) for f in model_files]}")
-    return model_files
 
 
 def main():
@@ -562,7 +574,6 @@ def main():
     # Allow specifying a specific model via command line argument
     import argparse
     parser = argparse.ArgumentParser(description='Evaluate oil spill detection models')
-    parser.add_argument('--model', type=str, help='Path to specific model to evaluate')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
     parser.add_argument('--disable_ship_postprocessing', action='store_true',
                        help='Disable ship-specific post-processing')
@@ -573,53 +584,37 @@ def main():
     test_dataset, _, num_test_batches = load_dataset(data_dir='dataset', split='test', batch_size=args.batch_size)
     print(f"Loaded test dataset with {num_test_batches} batches with batch_size={args.batch_size}")
 
-    # Find all available checkpoint models
-    model_files = find_checkpoint_models()
-    if not model_files:
-        return
+    # Evaluate the model
+    model_path = 'checkpoints/improved_deeplabv3plus_best.weights.h5'
+    print(f"\nEvaluating model: improved_deeplabv3plus_best")
 
-    if args.model:
-        if os.path.exists(args.model):
-            model_files = [args.model]
-        else:
-            print(f"Specified model {args.model} does not exist")
-            return
+    apply_ship_postprocessing = not args.disable_ship_postprocessing
+    model_results = evaluate_model(
+        model_path,
+        test_dataset,
+        batch_size=args.batch_size,
+        apply_ship_postprocessing=apply_ship_postprocessing
+    )
 
-    # Evaluate each model
-    results = {}
-    for model_path in model_files:
-        model_name = os.path.splitext(os.path.basename(model_path))[0]
-        print(f"\nEvaluating model: {model_name}")
+    if model_results:
+        results = {'improved_deeplabv3plus_best': model_results}
 
-        apply_ship_postprocessing = not args.disable_ship_postprocessing
-        model_results = evaluate_model(
-            model_path,
-            test_dataset,
-            batch_size=args.batch_size,
-            apply_ship_postprocessing=apply_ship_postprocessing
-        )
+        # Print results
+        print(f"\nResults for improved_deeplabv3plus_best:")
+        print(f"Mean IoU: {model_results['mean_iou']:.2f}%")
+        print("Class-wise IoU:")
+        for class_name, iou in model_results['class_ious'].items():
+            print(f"  {class_name}: {iou:.2f}%")
+        print(f"Single-scale inference time: {model_results['single_scale_time_ms']['mixed_precision_ms']:.2f} ms")
+        print(f"Multi-scale inference time: {model_results['inference_time_ms']['mixed_precision_ms']:.2f} ms")
 
-        if model_results:
-            results[model_name] = model_results
-
-            # Print results
-            print(f"\nResults for {model_name}:")
-            print(f"Mean IoU: {model_results['mean_iou']:.2f}%")
-            print("Class-wise IoU:")
-            for class_name, iou in model_results['class_ious'].items():
-                print(f"  {class_name}: {iou:.2f}%")
-            print(f"Single-scale inference time: {model_results['single_scale_time_ms']['mixed_precision_ms']:.2f} ms")
-            print(f"Multi-scale inference time: {model_results['inference_time_ms']['mixed_precision_ms']:.2f} ms")
-        else:
-            print(f"Evaluation failed for {model_name}")
-
-    # If we have multiple models, compare them
-    if len(results) > 0:
         # Plot class-wise IoU comparison
         plot_class_ious(results)
 
         # Save results to markdown file
         save_results(results)
+    else:
+        print(f"Evaluation failed for improved_deeplabv3plus_best")
 
 
 if __name__ == "__main__":

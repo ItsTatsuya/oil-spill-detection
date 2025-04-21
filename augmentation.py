@@ -80,88 +80,20 @@ def elastic_deform(image, label, alpha=20.0, sigma=4.0, grid_size=8):
         method='bilinear',
         antialias=True
     )[0]
-
-    # Always keep label as float32 - important fix!
     label_deformed = tf.image.resize(
         tf.expand_dims(tf.cast(label, tf.float32), 0),
         [height, width],
         method='nearest',
         antialias=False
     )[0]
-
-    # Return both as float32 (don't convert label back to uint8)
-    return tf.cast(image_deformed, tf.float32), tf.cast(label_deformed, tf.float32)
-
-@tf.function
-def ship_specific_augmentation(image, label):
-    """Special augmentation pipeline specifically for images containing ships (class 3)"""
-    # Convert label to float32 at the very beginning
-    label_float = tf.cast(label, tf.float32) / 4.0
-
-    original_shape = tf.shape(image)
-    h, w = original_shape[0], original_shape[1]
-    combined = tf.concat([image, label_float], axis=2)
-
-    # More aggressive rotation for ships (up to ±45°)
-    angle = tf.random.uniform([], minval=-0.7854, maxval=0.7854)  # ±45°
-    combined = rotate_image(combined, angle, interpolation='nearest')
-
-    # More aggressive scaling to help learn ships at various sizes
-    scale = tf.random.uniform([], minval=0.6, maxval=1.2)  # More extreme scaling
-    new_h = tf.cast(tf.cast(h, tf.float32) * scale, tf.int32)
-    new_w = tf.cast(tf.cast(w, tf.float32) * scale, tf.int32)
-    combined = tf.image.resize(combined, [new_h, new_w], method='nearest')
-    combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
-
-    # Always apply left-right flip for ships
-    combined = tf.image.flip_left_right(combined)
-
-    # Random up-down flip (ships can be oriented in any direction)
-    if tf.random.uniform(()) > 0.5:
-        combined = tf.image.flip_up_down(combined)
-
-    # Split back into image and label
-    image = combined[..., :3]
-    label_float = combined[..., 3:]
-
-    # Color augmentation for ships (more aggressive)
-    image = tf.image.random_brightness(image, max_delta=0.3)  # Increased from 0.2
-    image = tf.image.random_contrast(image, lower=0.7, upper=1.4)  # Increased range
-    image = tf.image.random_saturation(image, lower=0.7, upper=1.4)  # Increased range
-    image = tf.image.random_hue(image, max_delta=0.2)  # Increased from 0.1
-
-    # Add more noise to simulate various sea conditions
-    noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.05)  # Increased noise
-    image = image + noise
-
-    # Apply stronger elastic deformation
-    image, label_float = elastic_deform(image, label_float, alpha=30.0, sigma=5.0)  # Increased strength
-
-    # Clip values and finalize
-    image = tf.clip_by_value(image, 0, 1)
-    # Convert back to original class labels (0-4)
-    label = tf.cast(tf.round(label_float * 4.0), tf.uint8)
-
-    return image, label
+    return tf.cast(image_deformed, tf.float32), tf.cast(tf.round(label_deformed), tf.uint8)
 
 @tf.function
 def _augment_image_and_label(image, label):
     """Apply per-image augmentations with class-aware enhancements."""
-    # Check if image contains ships (class 3)
-    flat_label = tf.reshape(label, [-1])
-    has_ship = tf.reduce_any(tf.equal(flat_label, 3))
-
-    # Apply special ship augmentation with high probability if ships are present
-    if has_ship and tf.random.uniform(()) > 0.2:  # 80% chance to use special augmentation
-        return ship_specific_augmentation(image, label)
-
-    # Standard augmentation for non-ship images
-    # Convert label to float32 at the beginning
-    label_float = tf.cast(label, tf.float32) / 4.0
-
     original_shape = tf.shape(image)
     h, w = original_shape[0], original_shape[1]
-    combined = tf.concat([image, label_float], axis=2)
+    combined = tf.concat([image, tf.cast(label, tf.float32) / 4.0], axis=2)
 
     if tf.random.uniform(()) > 0.5:
         combined = tf.image.flip_left_right(combined)
@@ -178,7 +110,7 @@ def _augment_image_and_label(image, label):
         combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
 
     image = combined[..., :3]
-    label_float = combined[..., 3:]
+    label = combined[..., 3:]
 
     image = tf.image.random_brightness(image, max_delta=0.2)
     image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
@@ -189,18 +121,12 @@ def _augment_image_and_label(image, label):
         noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.02)
         image = image + noise
 
-    image, label_float = elastic_deform(image, label_float)
+    image, label = elastic_deform(image, label)
 
     # Check for rare classes using tf.isin
-    # Convert label_float back to uint8 for class checking
-    temp_label = tf.cast(tf.round(label_float * 4.0), tf.uint8)
-    flat_label = tf.reshape(temp_label, [-1])
+    flat_label = tf.reshape(label, [-1])
     has_rare = tf.reduce_any(tf_isin(flat_label, [1, 3]))
-
     if has_rare and tf.random.uniform(()) > 0.5:
-        # Create combined tensor again for additional transformations
-        combined = tf.concat([image, label_float], axis=2)
-
         if tf.random.uniform(()) > 0.5:
             combined = tf.image.flip_left_right(combined)
         if tf.random.uniform(()) > 0.5:
@@ -210,12 +136,12 @@ def _augment_image_and_label(image, label):
             combined = tf.image.resize(combined, [new_h, new_w], method='nearest')
             combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
 
-        image = combined[..., :3]
-        label_float = combined[..., 3:]
+    image = combined[..., :3]
+    label = combined[..., 3:]
 
     image = tf.clip_by_value(image, 0, 1)
-    # Convert back to original label format
-    label = tf.cast(tf.round(label_float * 4.0), tf.uint8)
+    label = label * 4.0
+    label = tf.cast(tf.round(label), tf.uint8)
 
     return image, label
 
@@ -231,25 +157,7 @@ def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
     # Identify pixels belonging to rare classes (1: Oil Spill, 3: Ship)
     # Ensure labels are integer type for comparison
     int_labels = tf.cast(labels, tf.int32)
-
-    # Modified: Prioritize Ship class (3) more highly than Oil Spill class (1)
-    # Create two separate masks for ships and oil spills
-    ship_mask = tf.equal(int_labels, 3)
-    oil_mask = tf.equal(int_labels, 1)
-
-    # Check if the batch contains ships
-    has_ships = tf.reduce_any(ship_mask)
-
-    # If ships are present, use them with higher probability (80%)
-    use_ships = tf.logical_and(has_ships, tf.random.uniform(()) < 0.8)
-
-    # Create the effective mask based on the decision
-    rare_mask = tf.cond(
-        use_ships,
-        lambda: ship_mask,  # If using ships, only consider ship pixels
-        lambda: tf.logical_or(ship_mask, oil_mask)  # Otherwise use both
-    )
-
+    rare_mask = tf.logical_or(tf.equal(int_labels, 1), tf.equal(int_labels, 3))
     # Find indices [batch_idx, y, x, channel] of rare pixels
     rare_indices = tf.where(rare_mask)
     num_rare_pixels = tf.shape(rare_indices)[0]
@@ -259,46 +167,41 @@ def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
         return images, labels
 
     # Select a random rare pixel location from the found indices
+    # Correctly use num_rare_pixels (shape[0]) as maxval
     idx = tf.random.uniform([], maxval=num_rare_pixels, dtype=tf.int32)
+    # Extract coordinates [y, x] from the selected rare pixel index
+    # rare_indices[idx] gives [batch_idx, y, x, channel]
+    y_coord = tf.cast(rare_indices[idx][1], tf.int32) # Index 1 is y
+    x_coord = tf.cast(rare_indices[idx][2], tf.int32) # Index 2 is x
 
-    # Extract coordinates [batch_idx, y, x, channel] from the selected rare pixel index
-    # Convert all indices to int32 to ensure consistent data types
-    batch_idx = tf.cast(rare_indices[idx][0], tf.int32)
-    y_coord = tf.cast(rare_indices[idx][1], tf.int32)
-    x_coord = tf.cast(rare_indices[idx][2], tf.int32)
-    channel_idx = tf.cast(0, tf.int32)  # Always use channel 0
-
-    # Get the cut size - make it larger for ships to better capture their structure
-    is_ship_pixel = tf.equal(int_labels[batch_idx, y_coord, x_coord, channel_idx], 3)
-
-    # Use different cut ratios based on class
-    lambda_param = tf.random.uniform([], 0, 1)
-    cut_ratio = tf.cond(
-        is_ship_pixel,
-        lambda: tf.math.sqrt(1.0 - lambda_param) * 1.5,  # Larger for ships
-        lambda: tf.math.sqrt(1.0 - lambda_param)  # Normal for other classes
-    )
-
+    # --- Bounding box calculation (remains the same) ---
+    # Use beta distribution for lambda, as is standard in CutMix
+    lambda_param = tf.random.uniform([], 0, 1) # Using uniform for simplicity, consider tf.random.beta(alpha, alpha)
+    cut_ratio = tf.math.sqrt(1.0 - lambda_param)
     cut_h = tf.cast(tf.cast(height, tf.float32) * cut_ratio, tf.int32)
     cut_w = tf.cast(tf.cast(width, tf.float32) * cut_ratio, tf.int32)
 
     # Center the cut box around the selected rare pixel coordinates
+    # Ensure coordinates are cast to int32 for arithmetic
     x1 = tf.maximum(0, x_coord - cut_w // 2)
     y1 = tf.maximum(0, y_coord - cut_h // 2)
-    x2 = tf.minimum(width, x_coord + (cut_w + 1) // 2)
-    y2 = tf.minimum(height, y_coord + (cut_h + 1) // 2)
+    x2 = tf.minimum(width, x_coord + (cut_w + 1) // 2) # Use ceil division for end coord
+    y2 = tf.minimum(height, y_coord + (cut_h + 1) // 2) # Use ceil division for end coord
 
     # Ensure width and height are at least 1
     actual_cut_w = x2 - x1
     actual_cut_h = y2 - y1
 
+    # --- Mask creation (remains similar, ensure correct shape) ---
     # Create a mask for the patch area
+    # Ensure mask dimensions are valid (non-negative)
     actual_cut_h = tf.maximum(0, actual_cut_h)
     actual_cut_w = tf.maximum(0, actual_cut_w)
     patch_mask = tf.zeros([actual_cut_h, actual_cut_w, 1], dtype=tf.float32)
 
     # Pad the patch mask to the full image size
     paddings = [[y1, height - y2], [x1, width - x2], [0, 0]]
+    # Ensure padding values are non-negative
     paddings = tf.maximum(0, paddings)
 
     # Inverse mask: 1s outside the patch, 0s inside
@@ -306,10 +209,11 @@ def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
     # Mask: 0s outside the patch, 1s inside
     mask = 1.0 - inverse_mask
 
-    # Mixing images and labels
+    # --- Mixing images and labels (remains the same) ---
     rand_indices = tf.random.shuffle(tf.range(batch_size))
+    # Ensure mask is broadcastable to image/label shape
     mask_img = tf.cast(mask, images.dtype)
-    mask_lbl = tf.cast(mask, tf.float32)
+    mask_lbl = tf.cast(mask, tf.float32) # Cast mask to float32 for label mixing
 
     # Cast labels to float32 for mixing calculation
     labels_float = tf.cast(labels, tf.float32)
@@ -318,7 +222,7 @@ def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
     mixed_labels_float = labels_float * (1.0 - mask_lbl) + tf.gather(labels_float, rand_indices, axis=0) * mask_lbl
 
     # Cast mixed labels back to uint8
-    mixed_labels = tf.cast(tf.clip_by_value(mixed_labels_float, 0, 4), tf.uint8)
+    mixed_labels = tf.cast(tf.clip_by_value(mixed_labels_float, 0, 4), tf.uint8) # Clip before casting
 
     mixed_images = images * (1.0 - mask_img) + tf.gather(images, rand_indices, axis=0) * mask_img
 
