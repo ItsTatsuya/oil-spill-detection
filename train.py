@@ -1,85 +1,49 @@
-"""
-Oil Spill Detection - Training Script
-
-This script trains an improved DeepLabv3+ model on the oil spill detection dataset.
-Features:
-1. Multi-scale training (50%, 75%, 100% of 320x320) with prediction fusion
-2. Data augmentation for training with Keras-CV for advanced batch augmentations
-3. Hybrid loss function
-4. EfficientNet-B4 backbone with enhanced decoder
-
-The model is trained for 600 epochs with batch size 8, learning rate 5e-5, and Adam optimizer.
-Model performance is evaluated using mIoU and class-wise IoU for the 5 classes.
-"""
-
 import os
 import numpy as np
-import tensorflow as tf
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 import time
 
-# Set TensorFlow logging level to reduce verbosity
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-tf.get_logger().setLevel('ERROR')
+def silent_tf_import():
+    import sys
+    orig_stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(orig_stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, orig_stderr_fd)
+    os.close(devnull_fd)
 
-# Try to import keras_cv for advanced augmentations
-try:
-    import keras_cv
-    KERAS_CV_AVAILABLE = True
-    print("Keras-CV available for advanced augmentations")
-except ImportError:
-    KERAS_CV_AVAILABLE = False
-    print("Keras-CV not available, using basic augmentations only")
+    import tensorflow as tf
+
+    os.dup2(saved_stderr_fd, orig_stderr_fd)
+    os.close(saved_stderr_fd)
+
+    return tf
+
+tf = silent_tf_import()
+
+# Set standard float32 precision for more stable training
+from tensorflow.keras import mixed_precision # type: ignore
+
+mixed_precision.set_global_policy('float32')  # Fixed standard policy instead of mixed precision
+policy = mixed_precision.global_policy()
+print(f"Precision policy set to {policy.name} for stable training")
 
 # Import custom modules
 from data_loader import load_dataset
 from augmentation import apply_augmentation
-from loss import hybrid_loss
+from loss import HybridSegmentationLoss
 from model import DeepLabv3Plus
 
 
-# Configure GPU memory growth to avoid OOM errors
-def configure_gpu():
-    """Configure GPU memory settings to avoid memory allocation issues."""
-    # First, check for GPU devices
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-
-    if gpus:
-        try:
-            # Only use GPU 0 if available and more than one GPU exists
-            # For multiple GPUs, can be configured to use more
-            if len(gpus) > 0:
-                tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
-
-            # Configure memory growth
-            for gpu in tf.config.experimental.get_visible_devices('GPU'):
-                tf.config.experimental.set_memory_growth(gpu, True)
-
-            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-            print(f"Available GPUs: {len(logical_gpus)}")
-
-            # Set memory limit if needed for older GPU versions
-            # Uncomment the following line if you're having OOM issues
-            # tf.config.experimental.set_virtual_device_configuration(gpus[0], [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)])
-
-            return True
-        except RuntimeError as e:
-            # Handle errors
-            print(f"GPU configuration error: {e}")
-            print("Using CPU instead")
-            return False
-    else:
-        print("No GPU found. Using CPU.")
-        return False
-
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    tf.config.experimental.set_memory_growth(gpus[0], True)
+    print(f"Using GPU: {gpus[0].name}")
+else:
+    print("No GPU found, using CPU")
 
 class ProgressCallback(tf.keras.callbacks.Callback):
-    """
-    Custom callback for detailed progress logging during training.
-    Shows epoch, step, loss, IoU, and time per step information.
-    """
     def __init__(self, total_epochs, steps_per_epoch, validation_steps=None):
         super(ProgressCallback, self).__init__()
         self.total_epochs = total_epochs
@@ -151,10 +115,6 @@ class ProgressCallback(tf.keras.callbacks.Callback):
 
 
 class MultiScalePredictor:
-    """
-    Multi-scale prediction with fusion for semantic segmentation.
-    Accepts images at multiple scales and combines predictions.
-    """
     def __init__(self, model, scales=[0.5, 0.75, 1.0]):
         self.model = model
         self.scales = scales
@@ -163,18 +123,12 @@ class MultiScalePredictor:
         self.expected_width = model.input_shape[2]
 
     def predict(self, image_batch):
-        """
-        Predict using multiple scales and fuse results.
-
-        Args:
-            image_batch: Batch of images with shape [batch_size, height, width, channels]
-
-        Returns:
-            Fused predictions with shape [batch_size, height, width, num_classes]
-        """
         batch_size = tf.shape(image_batch)[0]
         height = tf.shape(image_batch)[1]
         width = tf.shape(image_batch)[2]
+
+        # Get the compute dtype from the model
+        compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
 
         # Placeholder for all scaled predictions
         all_predictions = []
@@ -203,7 +157,8 @@ class MultiScalePredictor:
                 method='bilinear'
             )
 
-            print(f"Scale {scale}: Resized to {scaled_height}x{scaled_width}, then to model input {self.expected_height}x{self.expected_width}")
+            # Ensure proper dtype for mixed precision
+            model_input = tf.cast(model_input, compute_dtype)
 
             # Get predictions using the model's expected input size
             logits = self.model(model_input, training=False)
@@ -231,10 +186,6 @@ class MultiScalePredictor:
 
 
 class IoUMetric(tf.keras.metrics.Metric):
-    """
-    Custom IoU metric for semantic segmentation.
-    Calculates mean IoU and class-wise IoU for evaluation.
-    """
     def __init__(self, num_classes=5, name='iou_metric', **kwargs):
         super(IoUMetric, self).__init__(name=name, **kwargs)
         self.num_classes = num_classes
@@ -246,14 +197,27 @@ class IoUMetric(tf.keras.metrics.Metric):
         y_true_shape = tf.shape(y_true)
         y_pred_shape = tf.shape(y_pred)
 
-        # Use tf.cond instead of Python if statement for shape checking
+        # Make sure inputs have consistent dtypes
+        compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+
+        # Define resize function to always return the same dtype
+        def resize_fn():
+            resized = tf.image.resize(y_pred, [y_true_shape[1], y_true_shape[2]], method='bilinear')
+            # Ensure the dtype is consistent
+            return tf.cast(resized, compute_dtype)
+
+        def identity_fn():
+            # Ensure the dtype is consistent
+            return tf.cast(y_pred, compute_dtype)
+
+        # Use tf.cond with functions that return the same dtype
         y_pred = tf.cond(
             tf.logical_or(
                 tf.not_equal(y_true_shape[1], y_pred_shape[1]),
                 tf.not_equal(y_true_shape[2], y_pred_shape[2])
             ),
-            lambda: tf.image.resize(y_pred, [y_true_shape[1], y_true_shape[2]], method='bilinear'),
-            lambda: y_pred
+            resize_fn,
+            identity_fn
         )
 
         # Convert y_true to integer class indices
@@ -301,8 +265,6 @@ class IoUMetric(tf.keras.metrics.Metric):
 
 
 def create_callbacks(checkpoint_path, save_best_only=True):
-    """Create training callbacks."""
-    # Create checkpoint directory if it doesn't exist
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
 
     callbacks = [
@@ -350,8 +312,6 @@ def create_callbacks(checkpoint_path, save_best_only=True):
 
 
 def plot_training_curves(history, save_path='miou_curves.png'):
-    """Plot and save training/validation IoU curves."""
-    # Check if history object has any data
     if not history.history or len(history.history.keys()) == 0:
         print("Warning: Training history is empty. No curves to plot.")
         # Create a simple plot with a message instead
@@ -424,10 +384,9 @@ def plot_training_curves(history, save_path='miou_curves.png'):
 
 
 def train_and_evaluate():
-    """Train and evaluate the DeepLabv3+ model on the oil spill detection dataset."""
     # Define constants
     NUM_CLASSES = 5
-    BATCH_SIZE = 8  # Increased from 4 to better leverage batch augmentations
+    BATCH_SIZE = 12
     EPOCHS = 600
     LEARNING_RATE = 5e-5
     IMG_SIZE = (320, 320)
@@ -440,39 +399,23 @@ def train_and_evaluate():
     initial_epoch = 0
 
     print("Loading datasets...")
-    # Load training and validation datasets
-    train_ds = load_dataset(data_dir='dataset', split='train', batch_size=BATCH_SIZE)
-    test_ds = load_dataset(data_dir='dataset', split='test', batch_size=BATCH_SIZE)
+    # Load training and validation datasets with performance optimization
+    train_ds, class_weights_dict, train_steps = load_dataset(data_dir='dataset', split='train', batch_size=BATCH_SIZE)
+    train_ds = train_ds.prefetch(tf.data.experimental.AUTOTUNE)  # Add prefetch for better performance
 
-    # Apply data augmentation to training dataset
-    print("Applying data augmentation...")
-    if KERAS_CV_AVAILABLE:
-        print("Using Keras-CV for advanced batch augmentations (CutMix, MixUp)")
-    train_ds = apply_augmentation(train_ds, batch_size=BATCH_SIZE)
+    test_ds, _, val_steps = load_dataset(data_dir='dataset', split='test', batch_size=BATCH_SIZE)
+    test_ds = test_ds.prefetch(tf.data.experimental.AUTOTUNE)  # Add prefetch for validation dataset
 
-    # Calculate steps per epoch
-    # For finite datasets, we need to know exactly how many steps there are
-    # We'll enumerate a single epoch to count steps
-    train_steps = 0
-    for _ in train_ds:
-        train_steps += 1
+    # Apply advanced data augmentation from augmentation.py
+    print("Applying advanced data augmentation...")
+    augmented_train_ds = apply_augmentation(train_ds)
 
-    val_steps = 0
-    for _ in test_ds:
-        val_steps += 1
-
-    print(f"Dataset verification complete. Training steps: {train_steps}, Validation steps: {val_steps}")
-
+    print(f"Dataset loaded. Training steps: {train_steps}, Validation steps: {val_steps}")
     if train_steps == 0:
         raise ValueError("Training dataset is empty! Please check your data loading pipeline.")
 
     if val_steps == 0:
         raise ValueError("Validation dataset is empty! Please check your data loading pipeline.")
-
-    # Recreate datasets to reset them
-    train_ds = load_dataset(data_dir='dataset', split='train', batch_size=BATCH_SIZE)
-    train_ds = apply_augmentation(train_ds, batch_size=BATCH_SIZE)
-    test_ds = load_dataset(data_dir='dataset', split='test', batch_size=BATCH_SIZE)
 
     # Create the DeepLabv3+ model
     print("Creating model...")
@@ -501,15 +444,39 @@ def train_and_evaluate():
     # Define optimizer with gradient clipping to prevent exploding gradients
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=LEARNING_RATE,
-        clipnorm=1.0  # Add gradient clipping to prevent extreme weight updates
+        clipnorm=1.0,  # Add gradient clipping to prevent extreme weight updates
+        epsilon=1e-8,  # Increase epsilon to improve numerical stability
+        beta_1=0.9,    # Default Adam momentum parameters
+        beta_2=0.999   # Default Adam RMSprop parameter
     )
 
-    # Compile model
+    # Convert class weights dictionary to a list ordered by class index
+    class_weights_list = [class_weights_dict.get(i, 1.0) for i in range(NUM_CLASSES)]
+    print(f"Using class weights from data loader: {class_weights_list}")
+
+    # Create the loss function with the calculated class weights
+    loss_fn = HybridSegmentationLoss(
+        class_weights=class_weights_list,
+        ce_weight=0.4,
+        focal_weight=0.3,
+        dice_weight=0.3
+    )
+
+    # Use standard float32 precision for training instead of mixed precision
+    # This helps avoid issues with mixed data types during ReluGrad operations
+    print("Setting standard float32 precision for training stability")
+    tf.keras.mixed_precision.set_global_policy('float32')
+
+    # Compile model with XLA optimization enabled
     model.compile(
         optimizer=optimizer,
-        loss=hybrid_loss,
-        metrics=[IoUMetric(num_classes=NUM_CLASSES)]
+        loss=loss_fn,
+        metrics=[IoUMetric(num_classes=NUM_CLASSES)],
+        run_eagerly=False,
+        jit_compile=True,  # Enable XLA JIT compilation
     )
+
+    print("Model compiled with XLA JIT compilation enabled for training")
 
     # Set up callbacks for saving weights only, not full model
     checkpoint_path = 'checkpoints/improved_deeplabv3plus_best.weights.h5'
@@ -576,7 +543,7 @@ def train_and_evaluate():
     # Train the model with validation data
     print(f"Starting training for {EPOCHS} epochs from epoch {initial_epoch}...")
     history = model.fit(
-        train_ds,
+        augmented_train_ds,
         validation_data=test_ds,
         epochs=EPOCHS,
         callbacks=callbacks,
@@ -624,13 +591,8 @@ if __name__ == "__main__":
     # Make TensorFlow operations deterministic for reproducibility
     tf.random.set_seed(42)
     np.random.seed(42)
-
-    # Configure GPU
-    gpu_available = configure_gpu()
-
-    # Don't use mixed precision as it causes issues with the model architecture
-    # TensorFlow is trying to mix float32 and float16 in ways not supported in this model
-    print("Using default precision (float32)")
-
-    # Train and evaluate the model
-    train_and_evaluate()
+    print("____________________________________________________________________")
+    print("Starting model training with mixed precision...")
+    history = train_and_evaluate()
+    print("Training completed successfully with mixed precision")
+    print("____________________________________________________________________")

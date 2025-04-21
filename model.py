@@ -1,39 +1,25 @@
-"""
-Oil Spill Detection Model - DeepLabv3+ with EfficientNet-B4 Backbone
+def silent_tf_import():
+    import sys
+    import os
+    orig_stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(orig_stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, orig_stderr_fd)
+    os.close(devnull_fd)
 
-This module implements a DeepLabv3+ model for semantic segmentation of oil spill images.
-The model uses:
-1. EfficientNet-B4 backbone (pre-trained on ImageNet)
-2. ASPP with atrous rates [6, 12, 18] and global average pooling (256 filters each)
-3. Decoder with three 3x3 convolutions (256 filters each, ReLU activation)
+    import tensorflow as tf
 
-Input: 320x320x3 RGB images
-Output: 320x320x5 logits for 5 classes
-    0 - Sea Surface
-    1 - Oil Spill
-    2 - Look-alike
-    3 - Ship
-    4 - Land
-"""
+    os.dup2(saved_stderr_fd, orig_stderr_fd)
+    os.close(saved_stderr_fd)
 
-import tensorflow as tf
-from tensorflow.keras import layers, models, applications
+    return tf
+
+tf = silent_tf_import()
+
+from tensorflow.keras import layers, models, applications # type: ignore
 
 
-def ConvBlock(filters, kernel_size, dilation_rate=1, use_bias=False, name=None):
-    """
-    Convolution block with BatchNorm and ReLU.
-
-    Args:
-        filters: Number of output filters
-        kernel_size: Size of convolution kernel
-        dilation_rate: Dilation rate for atrous convolution
-        use_bias: Whether to use bias in the convolution
-        name: Optional name for the block
-
-    Returns:
-        A sequential model representing the conv block
-    """
+def ConvBlock(filters, kernel_size, dilation_rate=1, use_bias=False, name=None, dtype=None):
     def apply(x):
         x = layers.Conv2D(
             filters=filters,
@@ -41,101 +27,92 @@ def ConvBlock(filters, kernel_size, dilation_rate=1, use_bias=False, name=None):
             padding='same',
             use_bias=use_bias,
             dilation_rate=dilation_rate,
-            name=f"{name}_conv" if name else None
+            name=f"{name}_conv" if name else None,
+            dtype=dtype
         )(x)
         x = layers.BatchNormalization(
-            name=f"{name}_bn" if name else None
+            name=f"{name}_bn" if name else None,
+            dtype=dtype
         )(x)
+        # Ensure ReLU operation maintains the input dtype
         x = layers.ReLU(
-            name=f"{name}_relu" if name else None
+            name=f"{name}_relu" if name else None,
+            dtype=dtype
         )(x)
         return x
 
     return apply
 
 
-def ASPP(filters=256):
-    """
-    Atrous Spatial Pyramid Pooling module.
-
-    Args:
-        filters: Number of filters for each branch
-
-    Returns:
-        A function that applies ASPP to an input tensor
-    """
+def ASPP(filters=256, dtype=None):
     def apply(inputs):
         input_shape = tf.keras.backend.int_shape(inputs)
 
         # 1x1 convolution branch
-        branch1 = ConvBlock(filters, 1, name='aspp_branch1')(inputs)
+        branch1 = ConvBlock(filters, 1, name='aspp_branch1', dtype=dtype)(inputs)
 
         # 3x3 convolutions with different atrous rates
-        branch2 = ConvBlock(filters, 3, dilation_rate=6, name='aspp_branch2')(inputs)
-        branch3 = ConvBlock(filters, 3, dilation_rate=12, name='aspp_branch3')(inputs)
-        branch4 = ConvBlock(filters, 3, dilation_rate=18, name='aspp_branch4')(inputs)
+        branch2 = ConvBlock(filters, 3, dilation_rate=6, name='aspp_branch2', dtype=dtype)(inputs)
+        branch3 = ConvBlock(filters, 3, dilation_rate=12, name='aspp_branch3', dtype=dtype)(inputs)
+        branch4 = ConvBlock(filters, 3, dilation_rate=18, name='aspp_branch4', dtype=dtype)(inputs)
 
-        # Global average pooling branch
-        branch5 = layers.GlobalAveragePooling2D()(inputs)
-        branch5 = layers.Reshape((1, 1, input_shape[3]))(branch5)
-        branch5 = ConvBlock(filters, 1, name='aspp_branch5')(branch5)
+        # Global average pooling branch with dtype specified
+        branch5 = layers.GlobalAveragePooling2D(keepdims=True, dtype=dtype)(inputs)
+        branch5 = ConvBlock(filters, 1, name='aspp_branch5', dtype=dtype)(branch5)
+        branch5 = ConvBlock(filters, 1, name='aspp_branch5_up', dtype=dtype)(branch5)
         branch5 = layers.UpSampling2D(
             size=(input_shape[1], input_shape[2]),
-            interpolation='bilinear'
+            interpolation='bilinear',
+            dtype=dtype
         )(branch5)
 
-        # Concatenate all branches
-        concat = layers.Concatenate(name='aspp_concat')([branch1, branch2, branch3, branch4, branch5])
+        # Concatenate all branches with explicit dtype
+        concat = layers.Concatenate(name='aspp_concat', dtype=dtype)([branch1, branch2, branch3, branch4, branch5])
 
         # Final 1x1 convolution
-        output = ConvBlock(filters, 1, name='aspp_output')(concat)
+        output = ConvBlock(filters, 1, name='aspp_output', dtype=dtype)(concat)
 
         return output
 
     return apply
 
 
-def Decoder(filters=256, num_classes=5, output_size=(320, 320)):
-    """
-    DeepLabv3+ decoder with three 3x3 convolutions.
-
-    Args:
-        filters: Number of filters for each convolution
-        num_classes: Number of output classes
-        output_size: Final output size (height, width)
-
-    Returns:
-        A function that applies the decoder to encoder outputs
-    """
+def Decoder(filters=256, num_classes=5, output_size=(320, 320), dtype=None):
     def apply(inputs, encoder_features):
         # Get dimensions for proper upsampling
         input_shape = tf.keras.backend.int_shape(inputs)
         encoder_shape = tf.keras.backend.int_shape(encoder_features)
 
-        # Upsample ASPP output to match encoder features
+        # Upsample ASPP output to match encoder features with explicit casting
         x = layers.UpSampling2D(
             size=(encoder_shape[1] // input_shape[1], encoder_shape[2] // input_shape[2]),
             interpolation='bilinear',
-            name='decoder_upsample_to_encoder'
+            name='decoder_upsample_to_encoder',
+            dtype=dtype
         )(inputs)
 
-        # Process encoder features with 1x1 convolution
-        encoder_features = ConvBlock(48, 1, name='decoder_encoder_features')(encoder_features)
+        encoder_features_processed = layers.Lambda(
+            lambda t: tf.cast(t, dtype) if dtype else t,
+            name='encoder_features_cast'
+        )(encoder_features)
+
+        encoder_features_processed = ConvBlock(48, 1, name='decoder_encoder_features', dtype=dtype)(encoder_features_processed)
 
         # Concatenate upsampled features with encoder features
-        x = layers.Concatenate(name='decoder_concat')([x, encoder_features])
+        x = layers.Concatenate(name='decoder_concat', dtype=dtype)([x, encoder_features_processed])
 
-        # Apply three 3x3 convolutions as requested (instead of two in the original DeepLabv3+)
-        x = ConvBlock(filters, 3, name='decoder_conv1')(x)
-        x = ConvBlock(filters, 3, name='decoder_conv2')(x)
-        x = ConvBlock(filters, 3, name='decoder_conv3')(x)
+        # Apply three 3x3 convolutions with consistent dtype
+        x = ConvBlock(filters, 3, name='decoder_conv1', dtype=dtype)(x)
+        x = ConvBlock(filters, 3, name='decoder_conv2', dtype=dtype)(x)
+        x = ConvBlock(filters, 3, name='decoder_conv3', dtype=dtype)(x)
 
-        # Final convolution to get logits
+        # Final convolution to get logits with consistent dtype
         x = layers.Conv2D(
             filters=num_classes,
             kernel_size=1,
             padding='same',
-            name='decoder_output'
+            name='decoder_output',
+            dtype=dtype
         )(x)
 
         # Calculate upsampling size to reach the target output size
@@ -148,51 +125,48 @@ def Decoder(filters=256, num_classes=5, output_size=(320, 320)):
             x = layers.UpSampling2D(
                 size=(upsampling_factor_h, upsampling_factor_w),
                 interpolation='bilinear',
-                name='decoder_final_upsample'
+                name='decoder_final_upsample',
+                dtype=dtype
             )(x)
 
-        # Add a final resize operation to ensure exact output size
-        x = layers.Lambda(lambda x: tf.image.resize(x, output_size), name='exact_size_resize')(x)
-
+        # Keep using compute dtype throughout the model until the final layer
         return x
 
     return apply
 
 
 def DeepLabv3Plus(input_shape=(320, 320, 3), num_classes=5, output_stride=16):
-    """
-    DeepLabv3+ model with EfficientNet-B4 backbone.
+    # Always use float32 to avoid mixed precision issues
+    compute_dtype = tf.float32
+    print(f"Building DeepLabv3+ model with compute dtype: {compute_dtype}")
 
-    Args:
-        input_shape: Input image shape (height, width, channels)
-        num_classes: Number of output classes
-        output_stride: Output stride of the backbone (8 or 16)
-
-    Returns:
-        A tf.keras.Model instance of DeepLabv3+ model
-    """
     # Input layer
     inputs = layers.Input(shape=input_shape, name='input_image')
 
-    # EfficientNet-B4 backbone with specific output stride
+    # No need to cast inputs - they're already float32 from data_loader.py
+
+    # EfficientNet-B4 backbone
     base_model = applications.EfficientNetB4(
         include_top=False,
         weights='imagenet',
         input_tensor=inputs
     )
 
-    # Extract features from different levels of the backbone
-    # For EfficientNetB4:
-    # - Low-level features from block3b (stride 4)
-    # - High-level features from the last block (stride 16)
-    low_level_features = base_model.get_layer('block3b_add').output
+    try:
+        low_level_features = base_model.get_layer('block3b_add').output
+    except ValueError as e:
+        print("Available layers in EfficientNetB4:")
+        for l in base_model.layers:
+            print(l.name)
+        raise e
+
     high_level_features = base_model.output
 
-    # Apply ASPP to high-level features
-    aspp_output = ASPP(256)(high_level_features)
+    # Apply ASPP to high-level features with consistent dtype
+    aspp_output = ASPP(256, dtype=compute_dtype)(high_level_features)
 
-    # Apply decoder to combine features and get final predictions
-    output = Decoder(256, num_classes, output_size=(input_shape[0], input_shape[1]))(aspp_output, low_level_features)
+    # Apply decoder to combine features and get final predictions with consistent dtype
+    output = Decoder(256, num_classes, output_size=(input_shape[0], input_shape[1]), dtype=compute_dtype)(aspp_output, low_level_features)
 
     # Create model
     model = models.Model(inputs=inputs, outputs=output, name='DeepLabv3Plus_EfficientNetB4')
@@ -201,27 +175,56 @@ def DeepLabv3Plus(input_shape=(320, 320, 3), num_classes=5, output_stride=16):
 
 
 if __name__ == "__main__":
-    # Create a test model and print summary
-    model = DeepLabv3Plus()
-    model.summary()
+    # Enable mixed precision
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    print("Mixed precision policy set to mixed_float16")
 
-    # Plot the model architecture
     try:
-        from tensorflow.keras.utils import plot_model
-        plot_model(model, to_file='deeplabv3plus_model.png', show_shapes=True, show_layer_names=True)
-        print("Model architecture saved to deeplabv3plus_model.png")
-    except ImportError:
-        print("Could not import plot_model. Model architecture diagram not saved.")
+        # Create a test model with smaller size to ensure it loads quickly
+        print("Creating DeepLabv3+ model with mixed precision...")
+        model = DeepLabv3Plus(input_shape=(160, 160, 3))  # Smaller input size for faster testing
 
-    # Test the model with a sample input
-    import numpy as np
+        # Print summary to verify dtype of layers
+        print("\nModel summary with layer dtypes:")
+        model.summary()
 
-    # Create a random input image
-    test_input = np.random.random((1, 320, 320, 3)).astype(np.float32)
+        # Print the dtype of key layers to verify mixed precision setup
+        print("\nChecking compute_dtype of key layers:")
+        for layer in model.layers:
+            if hasattr(layer, 'compute_dtype'):
+                print(f"Layer {layer.name}: compute_dtype = {layer.compute_dtype}")
 
-    # Get model prediction
-    test_output = model.predict(test_input)
+        # Test the model with a small sample input
+        import numpy as np
+        print("\nTesting inference with a small batch...")
 
-    print(f"Test input shape: {test_input.shape}")
-    print(f"Test output shape: {test_output.shape}")
-    print("Model created successfully!")
+        # Create a random input image with batch_size=1
+        test_input = np.random.random((1, 160, 160, 3)).astype(np.float16)  # Using float16 for mixed precision
+        print(f"Test input shape: {test_input.shape}, dtype: {test_input.dtype}")
+
+        # Get model prediction
+        test_output = model.predict(test_input, verbose=1)
+        print(f"Test output shape: {test_output.shape}, dtype: {test_output.dtype}")
+
+        # Verify no NaN values in output
+        if np.isnan(test_output).any():
+            print("WARNING: Output contains NaN values!")
+        else:
+            print("Output validation: No NaN values detected")
+
+        # Check memory usage
+        print("\nGPU memory usage during inference:")
+        import subprocess
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+                                capture_output=True, text=True)
+        memory_used = result.stdout.strip()
+        print(f"Memory used: {memory_used} MiB")
+
+        print("\nMixed precision implementation test completed successfully!")
+
+    except Exception as e:
+        print(f"Error during model test: {str(e)}")
+    finally:
+        # Reset to default policy for other code that might run
+        tf.keras.mixed_precision.set_global_policy('float32')
+        print("Reset precision policy to float32")
