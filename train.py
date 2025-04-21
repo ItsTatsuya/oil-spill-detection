@@ -115,74 +115,105 @@ class ProgressCallback(tf.keras.callbacks.Callback):
 
 
 class MultiScalePredictor:
-    def __init__(self, model, scales=[0.5, 0.75, 1.0]):
+    def __init__(self, model, scales=[0.5, 0.75, 1.0], batch_size=1):
         self.model = model
         self.scales = scales
         # Get the expected input shape from the model
         self.expected_height = model.input_shape[1]
         self.expected_width = model.input_shape[2]
+        # Use smaller batch size for prediction to reduce memory usage
+        self.batch_size = batch_size
 
     def predict(self, image_batch):
-        batch_size = tf.shape(image_batch)[0]
+        import gc  # Import garbage collector
+
+        original_batch_size = tf.shape(image_batch)[0]
         height = tf.shape(image_batch)[1]
         width = tf.shape(image_batch)[2]
+        num_classes = self.model.output_shape[-1]
 
-        # Get the compute dtype from the model
-        compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+        # Create a placeholder for the final prediction with the correct shape
+        # This avoids storing all scale predictions in memory at once
+        final_prediction = tf.zeros([original_batch_size, height, width, num_classes],
+                                   dtype=tf.float32)
 
-        # Placeholder for all scaled predictions
-        all_predictions = []
+        # Process each image in the batch individually to reduce memory usage
+        for i in range(original_batch_size):
+            # Extract single image and add batch dimension back
+            single_image = tf.expand_dims(image_batch[i], axis=0)
 
-        # Make predictions at each scale
-        for scale in self.scales:
-            # Resize images to current scale while preserving aspect ratio
-            scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
-            scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
+            # Initialize accumulator for this single image
+            accumulated_pred = tf.zeros([1, height, width, num_classes], dtype=tf.float32)
 
-            # Ensure dimensions are multiples of 8 for better performance
-            scaled_height = tf.cast(tf.math.ceil(scaled_height / 8) * 8, tf.int32)
-            scaled_width = tf.cast(tf.math.ceil(scaled_width / 8) * 8, tf.int32)
+            # Process each scale separately and accumulate results
+            for scale in self.scales:
+                # Explicitly release memory
+                tf.keras.backend.clear_session()
+                gc.collect()
 
-            # First resize to the scaled dimensions
-            scaled_images = tf.image.resize(
-                image_batch,
-                size=(scaled_height, scaled_width),
-                method='bilinear'
+                # Resize images to current scale while preserving aspect ratio
+                scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
+                scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
+
+                # Ensure dimensions are multiples of 8 for better performance
+                scaled_height = tf.cast(tf.math.ceil(scaled_height / 8) * 8, tf.int32)
+                scaled_width = tf.cast(tf.math.ceil(scaled_width / 8) * 8, tf.int32)
+
+                # Resize to the scaled dimensions
+                scaled_image = tf.image.resize(
+                    single_image,
+                    size=(scaled_height, scaled_width),
+                    method='bilinear'
+                )
+
+                # Resize to model's expected input shape
+                model_input = tf.image.resize(
+                    scaled_image,
+                    size=(self.expected_height, self.expected_width),
+                    method='bilinear'
+                )
+
+                # Get predictions
+                with tf.device('/CPU:0'):  # Use CPU for post-processing to free GPU memory
+                    logits = self.model(model_input, training=False)
+
+                    # Resize predictions back to original size
+                    resized_preds = tf.image.resize(
+                        logits,
+                        size=(height, width),
+                        method='bilinear'
+                    )
+
+                    # Apply softmax to get probabilities
+                    probs = tf.nn.softmax(resized_preds, axis=-1)
+
+                    # Accumulate probabilities (no need to keep all scales in memory)
+                    accumulated_pred += probs
+
+                # Explicitly delete tensors to free memory
+                del scaled_image, model_input, logits, resized_preds, probs
+                gc.collect()
+
+            # Average the accumulated predictions for this image
+            average_pred = accumulated_pred / len(self.scales)
+
+            # Update the corresponding slice of the final prediction tensor
+            final_prediction = tf.tensor_scatter_nd_update(
+                final_prediction,
+                indices=[[i]],
+                updates=average_pred
             )
 
-            # Then resize to the model's expected input shape (320x320 in this case)
-            model_input = tf.image.resize(
-                scaled_images,
-                size=(self.expected_height, self.expected_width),
-                method='bilinear'
-            )
+            # Clean up
+            del single_image, accumulated_pred, average_pred
+            gc.collect()
 
-            # Ensure proper dtype for mixed precision
-            model_input = tf.cast(model_input, compute_dtype)
-
-            # Get predictions using the model's expected input size
-            logits = self.model(model_input, training=False)
-
-            # Resize predictions back to the original image size
-            resized_preds = tf.image.resize(
-                logits,
-                size=(height, width),
-                method='bilinear'
-            )
-
-            # Apply softmax to get probabilities
-            probs = tf.nn.softmax(resized_preds, axis=-1)
-            all_predictions.append(probs)
-
-        # Average predictions from all scales
-        fused_prediction = tf.reduce_mean(tf.stack(all_predictions, axis=0), axis=0)
-
-        # Convert back to logits for compatibility with loss functions
+        # Convert averaged predictions back to logits for compatibility with loss functions
         epsilon = 1e-7
-        fused_prediction = tf.clip_by_value(fused_prediction, epsilon, 1 - epsilon)
-        fused_logits = tf.math.log(fused_prediction / (1 - fused_prediction + epsilon))
+        final_prediction = tf.clip_by_value(final_prediction, epsilon, 1 - epsilon)
+        final_logits = tf.math.log(final_prediction / (1 - final_prediction + epsilon))
 
-        return fused_logits
+        return final_logits
 
 
 class IoUMetric(tf.keras.metrics.Metric):
@@ -386,7 +417,7 @@ def plot_training_curves(history, save_path='miou_curves.png'):
 def train_and_evaluate():
     # Define constants
     NUM_CLASSES = 5
-    BATCH_SIZE = 12
+    BATCH_SIZE = 8
     EPOCHS = 600
     LEARNING_RATE = 5e-5
     IMG_SIZE = (320, 320)
@@ -559,20 +590,28 @@ def train_and_evaluate():
     # Plot and save training curves
     plot_training_curves(history)
 
-    # Evaluate on test set using multi-scale prediction
-    print("\nEvaluating with multi-scale prediction...")
-    multi_scale_predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+    # Evaluate on test set using multi-scale prediction with smaller evaluation batch size
+    print("\nEvaluating with memory-efficient multi-scale prediction...")
+    # Use batch size of 1 for evaluation to minimize memory usage
+    multi_scale_predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0], batch_size=1)
 
     # Initialize IoU metric for evaluation
     test_metric = IoUMetric(num_classes=NUM_CLASSES)
 
-    # Perform evaluation
+    # Import gc for explicit garbage collection during evaluation
+    import gc
+
+    # Perform evaluation in smaller chunks to reduce memory pressure
     for images, labels in tqdm(test_ds):
         # Get multi-scale predictions
         predictions = multi_scale_predictor.predict(images)
 
         # Update metrics
         test_metric.update_state(labels, predictions)
+
+        # Force garbage collection after each batch to free memory
+        tf.keras.backend.clear_session()
+        gc.collect()
 
     # Print evaluation results
     mean_iou = test_metric.result().numpy()

@@ -145,17 +145,19 @@ def DeepLabv3Plus(input_shape=(320, 320, 3), num_classes=5, output_stride=16):
 
     # No need to cast inputs - they're already float32 from data_loader.py
 
-    # EfficientNet-B4 backbone
-    base_model = applications.EfficientNetB4(
+    # EfficientNetV2-M backbone
+    base_model = applications.EfficientNetV2M(
         include_top=False,
         weights='imagenet',
         input_tensor=inputs
     )
 
     try:
-        low_level_features = base_model.get_layer('block3b_add').output
+        # Get the appropriate low-level features from EfficientNetV2M
+        # This is different from EfficientNetB4's 'block3b_add'
+        low_level_features = base_model.get_layer('block2e_add').output
     except ValueError as e:
-        print("Available layers in EfficientNetB4:")
+        print("Available layers in EfficientNetV2M:")
         for l in base_model.layers:
             print(l.name)
         raise e
@@ -169,7 +171,7 @@ def DeepLabv3Plus(input_shape=(320, 320, 3), num_classes=5, output_stride=16):
     output = Decoder(256, num_classes, output_size=(input_shape[0], input_shape[1]), dtype=compute_dtype)(aspp_output, low_level_features)
 
     # Create model
-    model = models.Model(inputs=inputs, outputs=output, name='DeepLabv3Plus_EfficientNetB4')
+    model = models.Model(inputs=inputs, outputs=output, name='DeepLabv3Plus_EfficientNetV2M')
 
     return model
 

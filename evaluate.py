@@ -1,29 +1,27 @@
-"""
-Oil Spill Detection - Model Evaluation Script
-
-This script evaluates the trained DeepLabv3+ model on the oil spill detection test dataset.
-It computes class-wise IoU metrics, mean IoU, and inference time.
-The results are compared with a baseline model and saved as a markdown file.
-
-Features:
-- Multi-scale inference (50%, 75%, 100%)
-- Class-wise IoU measurement
-- Inference time benchmarking
-- Mixed precision evaluation support
-"""
-
 import os
 import time
 import numpy as np
-import tensorflow as tf
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import pandas as pd
 import glob
 
-# Set TensorFlow logging level to reduce verbosity
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-tf.get_logger().setLevel('ERROR')
+def silent_tf_import():
+    import sys
+    orig_stderr_fd = sys.stderr.fileno()
+    saved_stderr_fd = os.dup(orig_stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, orig_stderr_fd)
+    os.close(devnull_fd)
+
+    import tensorflow as tf
+
+    os.dup2(saved_stderr_fd, orig_stderr_fd)
+    os.close(saved_stderr_fd)
+
+    return tf
+
+tf = silent_tf_import()
 
 # Import mixed precision for faster inference
 from tensorflow.keras import mixed_precision # type: ignore
