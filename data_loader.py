@@ -20,14 +20,13 @@ def silent_tf_import():
 
 tf = silent_tf_import()
 
-# Import mixed precision and set policy for data loading
+# Import mixed precision - DO NOT set policy here, let train.py handle it.
 from tensorflow.keras import mixed_precision # type: ignore
-mixed_precision.set_global_policy('float32')
 policy = mixed_precision.global_policy()
 print(f"Data loader using mixed precision policy: {policy.name}")
 
-# Import Keras-CV for augmentations
-import keras_cv
+# Import custom per-image augmentation function
+from augmentation import _augment_image_and_label
 
 # Disable other TensorFlow warnings and messages
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
@@ -55,28 +54,70 @@ def analyze_class_distribution(label_paths):
     weights = 1.0 / (counts_float + 1e-7)  # Avoid division by zero
     total_weight = tf.reduce_sum(weights)
     raw_weights = {int(unique[i]): float(weights[i] / total_weight) for i in range(len(unique))}
-    # Cap maximum weight at 0.3 and redistribute excess
-    max_weight = 0.3
+
+    # Modified: Cap maximum weight at 0.5 instead of 0.3 and give special treatment to Ship class
+    max_weight = 0.5
+    ship_class_index = 3  # Ship class index
     adjusted_weights = {}
     weight_sum = 0.0
+
+    # First pass: set weights for all classes except Ship
     for cls in raw_weights:
-        w = min(raw_weights[cls], max_weight)
+        if cls == ship_class_index:
+            # Special treatment for Ship class - will be handled separately
+            continue
+
+        # Cap weights for non-Ship classes at 0.3
+        w = min(raw_weights[cls], 0.3)
         adjusted_weights[cls] = w
         weight_sum += w
-    # Normalize remaining weights
-    remaining_weight = 1.0 - weight_sum
-    if remaining_weight > 0:
-        num_remaining_classes = len(raw_weights) - len([cls for cls in raw_weights if raw_weights[cls] > max_weight])
+
+    # Special handling for Ship class - ensure it gets maximum allowed weight
+    if ship_class_index in raw_weights:
+        # Assign the max weight (0.5) to Ship class
+        adjusted_weights[ship_class_index] = max_weight
+        weight_sum += max_weight
+
+    # Normalize remaining weights if total exceeds 1.0
+    if weight_sum > 1.0:
+        # Scale all weights except Ship to fit
+        scale_factor = (1.0 - adjusted_weights.get(ship_class_index, 0.0)) / (weight_sum - adjusted_weights.get(ship_class_index, 0.0))
+        for cls in adjusted_weights:
+            if cls != ship_class_index:
+                adjusted_weights[cls] *= scale_factor
+    else:
+        # Distribute remaining weight to non-Ship classes
+        remaining_weight = 1.0 - weight_sum
+        num_remaining_classes = len([c for c in raw_weights if c != ship_class_index and c not in adjusted_weights])
         if num_remaining_classes > 0:
             base_weight = remaining_weight / num_remaining_classes
             for cls in raw_weights:
-                if raw_weights[cls] <= max_weight:
+                if cls != ship_class_index and cls not in adjusted_weights:
                     adjusted_weights[cls] = base_weight
-    # Fill missing classes with adjusted weight
+
+    # Fill missing classes with fallback weight
     for i in range(5):
         if i not in adjusted_weights:
-            adjusted_weights[i] = 1.0 / 5.0  # Fallback
+            # Special case for Ship class if it was missing
+            if i == ship_class_index:
+                adjusted_weights[i] = max_weight
+            else:
+                adjusted_weights[i] = 1.0 / 5.0  # Fallback
+
+    # Ensure the weights sum to 1.0
+    total = sum(adjusted_weights.values())
+    if abs(total - 1.0) > 1e-6:  # If not close to 1.0
+        # Rescale all weights except Ship
+        non_ship_weight_sum = sum(v for k, v in adjusted_weights.items() if k != ship_class_index)
+        non_ship_scale = (1.0 - adjusted_weights.get(ship_class_index, 0.0)) / (non_ship_weight_sum if non_ship_weight_sum > 0 else 1.0)
+
+        for cls in adjusted_weights:
+            if cls != ship_class_index:
+                adjusted_weights[cls] *= non_ship_scale
+
     tf.print("Adjusted class weights:", adjusted_weights)  # Debug output
+    tf.print("Ship class (index 3) weight:", adjusted_weights.get(ship_class_index, 0.0))  # Debug specific Ship weight
+
     return adjusted_weights
 
 def parse_image_label(image_path, label_path):
@@ -125,20 +166,11 @@ def load_dataset(data_dir='dataset', split='train', batch_size=8):
 
     # Configure dataset
     if split == 'train':
-        # Add Keras-CV augmentation
-        augment = keras_cv.layers.RandAugment(
-            value_range=(0, 1),
-            augmentations_per_image=2,
-            magnitude=0.5,
-            magnitude_stddev=0.2,
-            rate=0.7
-        )
+        # Apply custom per-image augmentations BEFORE casting to compute_dtype
+        dataset = dataset.map(_augment_image_and_label, num_parallel_calls=tf.data.AUTOTUNE)
 
-        # Apply augmentation first (in float32)
-        dataset = dataset.map(lambda x, y: (augment(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE)
-
-        # Convert to compute_dtype (float16) after augmentation
-        dataset = dataset.map(lambda x, y: (tf.cast(x, policy.compute_dtype), y), num_parallel_calls=tf.data.AUTOTUNE)
+        # Convert image to float32 AFTER augmentation
+        dataset = dataset.map(lambda x, y: (tf.cast(x, tf.float32), y), num_parallel_calls=tf.data.AUTOTUNE)
 
         # Disable caching to reduce VRAM usage and use larger buffer for better shuffling
         dataset = dataset.batch(batch_size)

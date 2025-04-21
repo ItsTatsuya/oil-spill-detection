@@ -267,7 +267,85 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     }
 
 
-def evaluate_model(model_path, test_dataset, batch_size=8):
+def apply_ship_enhancement(predictions, ship_class_idx=3):
+    """
+    Apply morphological operations to enhance ship detection.
+
+    Args:
+        predictions: Tensor of shape [batch_size, height, width, num_classes] with class probabilities
+        ship_class_idx: Index of the ship class (default 3)
+
+    Returns:
+        Enhanced predictions with improved ship detection
+    """
+    import cv2
+
+    # Convert to numpy for OpenCV operations
+    predictions_np = predictions.numpy()
+    batch_size = predictions_np.shape[0]
+    enhanced_predictions = np.copy(predictions_np)
+
+    # Process each image in the batch
+    for i in range(batch_size):
+        # Extract ship probabilities
+        ship_probs = predictions_np[i, :, :, ship_class_idx]
+
+        # Convert to binary mask (threshold at 0.3)
+        ship_mask = (ship_probs > 0.3).astype(np.uint8)
+
+        # Skip if no ships detected
+        if np.sum(ship_mask) == 0:
+            continue
+
+        # Apply morphological closing to connect nearby ship pixels
+        kernel = np.ones((3, 3), np.uint8)
+        closed_mask = cv2.morphologyEx(ship_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Find connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(closed_mask, connectivity=8)
+
+        # Filter out very small components (likely noise)
+        min_size = 5  # Minimum size in pixels
+        enhanced_mask = np.zeros_like(ship_mask)
+
+        for j in range(1, num_labels):  # Skip background (label 0)
+            if stats[j, cv2.CC_STAT_AREA] >= min_size:
+                component_mask = (labels == j).astype(np.uint8)
+
+                # For medium-sized components, apply slight dilation to improve connectivity
+                if stats[j, cv2.CC_STAT_AREA] < 50:
+                    component_mask = cv2.dilate(component_mask, kernel, iterations=1)
+
+                enhanced_mask = np.logical_or(enhanced_mask, component_mask)
+
+        # Convert back to uint8
+        enhanced_mask = enhanced_mask.astype(np.uint8)
+
+        # Apply the enhanced mask to the predictions
+        # Calculate the boost factor based on confidence
+        boost_factor = 1.2  # Boost ship probabilities by 20%
+
+        # Create a copy of the ship probabilities
+        enhanced_ship_probs = np.copy(ship_probs)
+
+        # Boost probabilities where the enhanced mask is 1
+        enhanced_ship_probs[enhanced_mask == 1] *= boost_factor
+
+        # Clip to ensure probabilities remain in [0, 1]
+        enhanced_ship_probs = np.clip(enhanced_ship_probs, 0, 1)
+
+        # Update ship class probabilities in the predictions
+        enhanced_predictions[i, :, :, ship_class_idx] = enhanced_ship_probs
+
+        # Renormalize the probabilities to ensure they sum to 1
+        # This maintains the probabilistic interpretation
+        sum_probs = np.sum(enhanced_predictions[i], axis=-1, keepdims=True)
+        enhanced_predictions[i] /= sum_probs
+
+    return tf.convert_to_tensor(enhanced_predictions, dtype=predictions.dtype)
+
+
+def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postprocessing=True):
     """
     Evaluate the DeepLabv3+ model on the test dataset.
 
@@ -275,13 +353,14 @@ def evaluate_model(model_path, test_dataset, batch_size=8):
         model_path: Path to the saved model
         test_dataset: The test dataset
         batch_size: Batch size for evaluation
+        apply_ship_postprocessing: Whether to apply ship-specific post-processing
 
     Returns:
         Dictionary containing evaluation results
     """
     # Import model definition
     from model import DeepLabv3Plus
-    from loss import hybrid_loss
+    from loss import HybridSegmentationLoss  # Changed from hybrid_loss to HybridSegmentationLoss
 
     # Load model from checkpointed H5 file
     print(f"Loading model from checkpoint: {model_path}")
@@ -289,7 +368,7 @@ def evaluate_model(model_path, test_dataset, batch_size=8):
         # Load model architecture and weights; compile=False since we only predict
         model = tf.keras.models.load_model(
             model_path,
-            custom_objects={'hybrid_loss': hybrid_loss},
+            custom_objects={'HybridSegmentationLoss': HybridSegmentationLoss},  # Update custom_objects
             compile=False
         )
         print("Model loaded successfully")
@@ -310,11 +389,15 @@ def evaluate_model(model_path, test_dataset, batch_size=8):
 
     # Check if the dataset is already batched
     is_already_batched = False
-    for images, labels in test_dataset.take(1):
-        print(f"Dataset element shape: images={images.shape}, labels={labels.shape}")
-        if len(images.shape) == 4 and images.shape[0] > 1:
+    try:
+        # Get the first batch to check its shape
+        sample_images, sample_labels = next(iter(test_dataset))
+        print(f"Dataset element shape: images={sample_images.shape}, labels={sample_labels.shape}")
+        if len(sample_images.shape) == 4 and sample_images.shape[0] > 1:
             is_already_batched = True
             print("Dataset appears to be already batched")
+    except:
+        print("Could not determine if dataset is batched, assuming it's not")
 
     # Prepare the test dataset
     if is_already_batched:
@@ -332,6 +415,10 @@ def evaluate_model(model_path, test_dataset, batch_size=8):
         try:
             # Get predictions using multi-scale fusion
             predictions = predictor.predict(images)
+
+            # Apply ship-specific post-processing if enabled
+            if apply_ship_postprocessing:
+                predictions = apply_ship_enhancement(predictions, ship_class_idx=3)
 
             # Store labels and predictions
             all_true_labels.append(labels)
@@ -472,21 +559,24 @@ def main():
     else:
         print("Using CPU")
 
-    # Load the test dataset
-    print("Loading test dataset...")
-    test_dataset = load_dataset(data_dir='dataset', split='test')
-
-    # Find all available checkpoint models
-    model_files = find_checkpoint_models()
-    if not model_files:
-        return
-
     # Allow specifying a specific model via command line argument
     import argparse
     parser = argparse.ArgumentParser(description='Evaluate oil spill detection models')
     parser.add_argument('--model', type=str, help='Path to specific model to evaluate')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
+    parser.add_argument('--disable_ship_postprocessing', action='store_true',
+                       help='Disable ship-specific post-processing')
     args = parser.parse_args()
+
+    # Load the test dataset
+    print("Loading test dataset...")
+    test_dataset, _, num_test_batches = load_dataset(data_dir='dataset', split='test', batch_size=args.batch_size)
+    print(f"Loaded test dataset with {num_test_batches} batches with batch_size={args.batch_size}")
+
+    # Find all available checkpoint models
+    model_files = find_checkpoint_models()
+    if not model_files:
+        return
 
     if args.model:
         if os.path.exists(args.model):
@@ -501,7 +591,13 @@ def main():
         model_name = os.path.splitext(os.path.basename(model_path))[0]
         print(f"\nEvaluating model: {model_name}")
 
-        model_results = evaluate_model(model_path, test_dataset, batch_size=args.batch_size)
+        apply_ship_postprocessing = not args.disable_ship_postprocessing
+        model_results = evaluate_model(
+            model_path,
+            test_dataset,
+            batch_size=args.batch_size,
+            apply_ship_postprocessing=apply_ship_postprocessing
+        )
 
         if model_results:
             results[model_name] = model_results
