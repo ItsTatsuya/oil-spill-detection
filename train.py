@@ -37,8 +37,11 @@ from model import DeepLabv3Plus
 
 
 gpus = tf.config.experimental.list_physical_devices('GPU')
-tf.config.experimental.set_memory_growth(gpus[0], True)
-print(f"Using GPU: {gpus[0].name}" if gpus else "No GPU found, using CPU")
+if gpus:
+    tf.config.experimental.set_memory_growth(gpus[0], True)
+    print(f"Using GPU: {gpus[0].name}")
+else:
+    print("No GPU found, using CPU")
 
 class ProgressCallback(tf.keras.callbacks.Callback):
     def __init__(self, total_epochs, steps_per_epoch, validation_steps=None):

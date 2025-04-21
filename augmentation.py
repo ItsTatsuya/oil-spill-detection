@@ -202,7 +202,7 @@ def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
     # Pad the patch mask to the full image size
     paddings = [[y1, height - y2], [x1, width - x2], [0, 0]]
     # Ensure padding values are non-negative
-    paddings = tf.maximum(0, paddings)
+    paddings = tf.maximum(0, tf.convert_to_tensor(paddings))
 
     # Inverse mask: 1s outside the patch, 0s inside
     inverse_mask = 1.0 - tf.pad(patch_mask, paddings, constant_values=1.0)
