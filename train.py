@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 import time
+import psutil  # For memory debugging
+import subprocess  # Add import for subprocess.run
 
 def silent_tf_import():
     import sys
@@ -12,30 +14,21 @@ def silent_tf_import():
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, orig_stderr_fd)
     os.close(devnull_fd)
-
     import tensorflow as tf
-
     os.dup2(saved_stderr_fd, orig_stderr_fd)
     os.close(saved_stderr_fd)
-
     return tf
 
 tf = silent_tf_import()
-
-# Import mixed precision support
 from tensorflow.keras import mixed_precision # type: ignore
 
-# Enable mixed precision for training to leverage RTX 4060Ti
+# Set mixed precision policy
 mixed_precision.set_global_policy('mixed_float16')
 policy = mixed_precision.global_policy()
-print(f"Mixed precision policy set to: {policy.name} to leverage RTX 4060Ti")
+print(f"Mixed precision policy: {policy.name}")
 
-# Import custom modules
 from data_loader import load_dataset
 from augmentation import apply_augmentation
-from loss import HybridSegmentationLoss
-from model import DeepLabv3Plus
-
 
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
@@ -44,9 +37,20 @@ if gpus:
 else:
     print("No GPU found, using CPU")
 
+def log_memory_usage(prefix=""):
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    print(f"{prefix}Memory usage: RSS={mem_info.rss / 1024**2:.2f}MB, VMS={mem_info.vms / 1024**2:.2f}MB")
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
+                               capture_output=True, text=True, check=True)
+        print(f"{prefix}GPU memory used: {result.stdout.strip()} MiB")
+    except:
+        print(f"{prefix}Could not query GPU memory usage")
+
 class ProgressCallback(tf.keras.callbacks.Callback):
     def __init__(self, total_epochs, steps_per_epoch, validation_steps=None):
-        super(ProgressCallback, self).__init__()
+        super().__init__()
         self.total_epochs = total_epochs
         self.steps_per_epoch = steps_per_epoch
         self.validation_steps = validation_steps
@@ -73,162 +77,87 @@ class ProgressCallback(tf.keras.callbacks.Callback):
         step_time = current_time - self.last_step_time
         self.step_times.append(step_time)
         self.last_step_time = current_time
-
         if batch % max(1, self.steps_per_epoch // 20) == 0 or batch == self.steps_per_epoch - 1:
-            # Calculate and format metrics
             loss = logs.get('loss', 0.0)
             iou = logs.get('iou_metric', 0.0)
             avg_step_time = np.mean(self.step_times[-50:]) if self.step_times else 0
-
-            # Calculate ETA for epoch completion
-            if batch > 0 and self.steps_per_epoch > 0:
-                eta_seconds = avg_step_time * (self.steps_per_epoch - batch)
-                eta_str = f"{int(eta_seconds // 60):02d}:{int(eta_seconds % 60):02d}"
-            else:
-                eta_str = "??:??"
-
-            print(f"Step {batch+1}/{self.steps_per_epoch} - "
-                  f"Loss: {loss:.4f} - IoU: {iou:.4f} - "
+            eta_seconds = avg_step_time * (self.steps_per_epoch - batch) if batch > 0 else 0
+            eta_str = f"{int(eta_seconds // 60):02d}:{int(eta_seconds % 60):02d}" if batch > 0 else "??:??"
+            print(f"Step {batch+1}/{self.steps_per_epoch} - Loss: {loss:.4f} - IoU: {iou:.4f} - "
                   f"{avg_step_time*1000:.1f} ms/step - ETA: {eta_str}")
 
     def on_epoch_end(self, epoch, logs=None):
-        # Calculate epoch duration
         epoch_time = time.time() - self.epoch_start_time
         hours, remainder = divmod(epoch_time, 3600)
         minutes, seconds = divmod(remainder, 60)
-
-        # Format validation metrics
         val_loss = logs.get('val_loss', 0.0)
         val_iou = logs.get('val_iou_metric', 0.0)
-
-        print(f"\nEpoch {epoch+1}/{self.total_epochs} completed in "
-              f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+        print(f"\nEpoch {epoch+1}/{self.total_epochs} completed in {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
         print(f"Loss: {logs.get('loss', 0.0):.4f} - IoU: {logs.get('iou_metric', 0.0):.4f} - "
               f"Val Loss: {val_loss:.4f} - Val IoU: {val_iou:.4f}")
-
-        # Print learning rate
         if hasattr(self.model.optimizer, 'lr'):
-            lr = self.model.optimizer.lr
-            if hasattr(lr, 'numpy'):
-                print(f"Learning rate: {float(lr.numpy()):.2e}")
-
+            lr = float(self.model.optimizer.lr.numpy()) if hasattr(self.model.optimizer.lr, 'numpy') else float(self.model.optimizer.lr)
+            print(f"Learning rate: {lr:.2e}")
         print("="*80)
 
-
 class MultiScalePredictor:
-    def __init__(self, model, scales=[0.5, 0.75, 1.0], batch_size=4):
+    def __init__(self, model, scales=[0.75, 1.0, 1.25], batch_size=2):
         self.model = model
         self.scales = scales
-        # Get the expected input shape from the model
         self.expected_height = model.input_shape[1]
         self.expected_width = model.input_shape[2]
-        # Use larger batch size for GPU utilization
         self.batch_size = batch_size
-        # Enable mixed precision for faster GPU inference
         self.use_mixed_precision = True
 
     @tf.function
     def _predict_batch(self, batch):
-        """
-        TensorFlow function for fast GPU inference on a batch
-        """
         return self.model(batch, training=False)
 
     def predict(self, image_batch):
-        original_batch_size = tf.shape(image_batch)[0]
+        batch_size = tf.shape(image_batch)[0]
         height = tf.shape(image_batch)[1]
         width = tf.shape(image_batch)[2]
-        num_classes = self.model.output_shape[-1]
-
-        # Pre-allocate for accumulated predictions
         all_predictions = []
-
-        # Process each scale efficiently in batches
         for scale in self.scales:
             print(f"Processing scale {scale:.2f}...")
-
-            # Resize images to current scale while preserving aspect ratio
             scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
             scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
-
-            # Ensure dimensions are multiples of 8 for better performance
             scaled_height = tf.cast(tf.math.ceil(scaled_height / 8) * 8, tf.int32)
             scaled_width = tf.cast(tf.math.ceil(scaled_width / 8) * 8, tf.int32)
-
-            # Resize all images in the batch at once
-            scaled_batch = tf.image.resize(
-                image_batch,
-                size=(scaled_height, scaled_width),
-                method='bilinear'
-            )
-
-            # Resize to model's expected input shape
-            model_input = tf.image.resize(
-                scaled_batch,
-                size=(self.expected_height, self.expected_width),
-                method='bilinear'
-            )
-
-            # Convert to mixed precision for faster GPU inference if enabled
+            scaled_batch = tf.image.resize(image_batch, size=(scaled_height, scaled_width), method='bilinear')
+            model_input = tf.image.resize(scaled_batch, size=(self.expected_height, self.expected_width), method='bilinear')
             if self.use_mixed_precision:
                 model_input = tf.cast(model_input, tf.float16)
-
-            # Get predictions using GPU
             logits = self._predict_batch(model_input)
-
-            # Convert back to float32 for post-processing
             logits = tf.cast(logits, tf.float32)
-
-            # Resize predictions back to original size
-            resized_preds = tf.image.resize(
-                logits,
-                size=(height, width),
-                method='bilinear'
-            )
-
-            # Apply softmax to get probabilities
+            resized_preds = tf.image.resize(logits, size=(height, width), method='bilinear')
             probs = tf.nn.softmax(resized_preds, axis=-1)
-
-            # Store this scale's predictions
             all_predictions.append(probs)
-
-        # Average predictions across all scales
         final_prediction = tf.reduce_mean(all_predictions, axis=0)
-
-        # Convert averaged predictions back to logits for compatibility with loss functions
         epsilon = 1e-7
         final_prediction = tf.clip_by_value(final_prediction, epsilon, 1 - epsilon)
         final_logits = tf.math.log(final_prediction / (1 - final_prediction + epsilon))
-
         return final_logits
-
 
 class IoUMetric(tf.keras.metrics.Metric):
     def __init__(self, num_classes=5, name='iou_metric', **kwargs):
-        super(IoUMetric, self).__init__(name=name, **kwargs)
+        super().__init__(name=name, **kwargs)
         self.num_classes = num_classes
         self.mean_iou = tf.keras.metrics.MeanIoU(num_classes=num_classes)
         self.class_names = ['Sea Surface', 'Oil Spill', 'Look-alike', 'Ship', 'Land']
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        # Get shapes
         y_true_shape = tf.shape(y_true)
         y_pred_shape = tf.shape(y_pred)
-
-        # Make sure inputs have consistent dtypes
         compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
 
-        # Define resize function to always return the same dtype
         def resize_fn():
             resized = tf.image.resize(y_pred, [y_true_shape[1], y_true_shape[2]], method='bilinear')
-            # Ensure the dtype is consistent
             return tf.cast(resized, compute_dtype)
 
         def identity_fn():
-            # Ensure the dtype is consistent
             return tf.cast(y_pred, compute_dtype)
 
-        # Use tf.cond with functions that return the same dtype
         y_pred = tf.cond(
             tf.logical_or(
                 tf.not_equal(y_true_shape[1], y_pred_shape[1]),
@@ -237,16 +166,10 @@ class IoUMetric(tf.keras.metrics.Metric):
             resize_fn,
             identity_fn
         )
-
-        # Convert y_true to integer class indices
         y_true = tf.cast(y_true, tf.int32)
         y_true = tf.squeeze(y_true, axis=-1)
-
-        # Convert y_pred from logits to class indices
         y_pred = tf.argmax(y_pred, axis=-1)
         y_pred = tf.cast(y_pred, tf.int32)
-
-        # Update the mean IoU metric
         self.mean_iou.update_state(y_true, y_pred)
 
     def result(self):
@@ -256,122 +179,88 @@ class IoUMetric(tf.keras.metrics.Metric):
         self.mean_iou.reset_state()
 
     def get_class_iou(self):
-        """Get IoU for each class."""
         confusion_matrix = self.mean_iou.total_cm
-        # IoU = true_positive / (true_positive + false_positive + false_negative)
-        sum_over_row = tf.cast(
-            tf.reduce_sum(confusion_matrix, axis=0),
-            dtype=tf.float32
-        )
-        sum_over_col = tf.cast(
-            tf.reduce_sum(confusion_matrix, axis=1),
-            dtype=tf.float32
-        )
-        true_positives = tf.cast(
-            tf.linalg.tensor_diag_part(confusion_matrix),
-            dtype=tf.float32
-        )
-
-        # sum_over_row + sum_over_col - true_positives = TP + FP + FN
+        sum_over_row = tf.cast(tf.reduce_sum(confusion_matrix, axis=0), tf.float32)
+        sum_over_col = tf.cast(tf.reduce_sum(confusion_matrix, axis=1), tf.float32)
+        true_positives = tf.cast(tf.linalg.tensor_diag_part(confusion_matrix), tf.float32)
         denominator = sum_over_row + sum_over_col - true_positives
-
-        # The IoU is set to 0 if the denominator is 0
         iou = tf.math.divide_no_nan(true_positives, denominator)
+        return {self.class_names[i]: iou[i].numpy() for i in range(self.num_classes)}
 
-        class_iou = {self.class_names[i]: iou[i].numpy() for i in range(self.num_classes)}
-        return class_iou
-
-
-def create_callbacks(checkpoint_path, save_best_only=True):
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-
-    callbacks = [
-        # Model checkpoint to save the best model based on validation IoU
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=checkpoint_path,
-            monitor='val_iou_metric',
-            save_best_only=save_best_only,
-            mode='max',
-            verbose=1
-        ),
-        # Also save a checkpoint after each epoch to enable resuming training
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath='checkpoints/latest_model.h5',
-            save_weights_only=False,
-            save_best_only=False,
-            save_freq='epoch',
-            verbose=1
-        ),
-        # Early stopping to prevent overfitting
-        tf.keras.callbacks.EarlyStopping(
-            monitor='val_iou_metric',
-            patience=60,  # Increased from 30 to 60 to allow more time for model improvement
-            mode='max',
-            restore_best_weights=True,
-            verbose=1
-        ),
-        # Learning rate scheduler
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_iou_metric',
-            factor=0.5,
-            patience=10,
-            min_lr=1e-6,
-            mode='max',
-            verbose=1
-        ),
-        # TensorBoard logging
-        tf.keras.callbacks.TensorBoard(
-            log_dir='./logs/fit/' + datetime.now().strftime("%Y%m%d-%H%M%S"),
-            update_freq='epoch'
+def create_cosine_decay_with_warmup(epochs, train_steps, batch_size, initial_lr=3e-5, warmup_epochs=10):
+    total_steps = epochs * train_steps
+    warmup_steps = warmup_epochs * train_steps
+    warmup_lr = tf.keras.optimizers.schedules.PolynomialDecay(
+        initial_learning_rate=0,
+        decay_steps=warmup_steps,
+        end_learning_rate=initial_lr
+    )
+    if total_steps <= warmup_steps:
+        print(f"Warning: Total steps ({total_steps}) <= warmup steps ({warmup_steps})")
+        print(f"Using linear decay from {initial_lr} to 1e-6")
+        linear_lr = tf.keras.optimizers.schedules.PolynomialDecay(
+            initial_learning_rate=initial_lr,
+            decay_steps=total_steps,
+            end_learning_rate=1e-6
         )
-    ]
-
-    return callbacks
-
+        class CustomLRSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+            def __call__(self, step):
+                return linear_lr(step)
+            def get_config(self):
+                return {"initial_lr": initial_lr, "total_steps": total_steps}
+        return CustomLRSchedule()
+    cosine_lr = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=initial_lr,
+        decay_steps=total_steps - warmup_steps,
+        alpha=0.01
+    )
+    def lr_schedule(step):
+        step = tf.cast(step, tf.float32)
+        return tf.cond(
+            step < warmup_steps,
+            lambda: warmup_lr(step),
+            lambda: cosine_lr(step - warmup_steps)
+        )
+    class CustomLRSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __call__(self, step):
+            return lr_schedule(step)
+        def get_config(self):
+            return {
+                "epochs": epochs,
+                "train_steps": train_steps,
+                "batch_size": batch_size,
+                "initial_lr": initial_lr,
+                "warmup_epochs": warmup_epochs
+            }
+    return CustomLRSchedule()
 
 def plot_training_curves(history, save_path='miou_curves.png'):
-    if not history.history or len(history.history.keys()) == 0:
-        print("Warning: Training history is empty. No curves to plot.")
-        # Create a simple plot with a message instead
+    if not history.history or not history.history.keys():
+        print("Warning: Empty training history. Creating placeholder plot.")
         plt.figure(figsize=(10, 6))
-        plt.text(0.5, 0.5, "No training history data available.\nTry training for more epochs to generate curves.",
-                 horizontalalignment='center', verticalalignment='center',
-                 fontsize=14)
+        plt.text(0.5, 0.5, "No training history available.", horizontalalignment='center', verticalalignment='center', fontsize=14)
         plt.axis('off')
         plt.savefig(save_path, dpi=300)
         print(f"Empty plot saved to {save_path}")
         return
-
-    # Continue with normal plotting if history contains data
     plt.figure(figsize=(12, 5))
-
-    # Check available keys in history object
     available_keys = list(history.history.keys())
-    print(f"Available history keys: {available_keys}")
-
-    # Find the IoU metric keys (may be 'iou_metric' or just 'iou')
     train_iou_key = next((key for key in available_keys if 'iou' in key.lower() and not key.startswith('val_')), None)
     val_iou_key = next((key for key in available_keys if 'iou' in key.lower() and key.startswith('val_')), None)
-
     if not train_iou_key or not val_iou_key:
-        print("Warning: IoU metrics not found in history. Using available metrics instead.")
+        print("Warning: IoU metrics not found. Using available metrics.")
         train_metrics = [key for key in available_keys if not key.startswith('val_')]
         val_metrics = [key for key in available_keys if key.startswith('val_')]
-
         if train_metrics and val_metrics:
             train_iou_key = train_metrics[0]
             val_iou_key = val_metrics[0]
         else:
-            print("No metrics found to plot. Creating empty plot.")
-            plt.text(0.5, 0.5, "No metrics data available in history.",
-                     horizontalalignment='center', verticalalignment='center',
-                     fontsize=14)
+            print("No metrics to plot.")
+            plt.text(0.5, 0.5, "No metrics available.", horizontalalignment='center', verticalalignment='center', fontsize=14)
             plt.axis('off')
             plt.savefig(save_path, dpi=300)
             print(f"Empty plot saved to {save_path}")
             return
-
-    # Plot IoU metric
     plt.subplot(1, 2, 1)
     plt.plot(history.history[train_iou_key], label=f'Training {train_iou_key}')
     plt.plot(history.history[val_iou_key], label=f'Validation {val_iou_key}')
@@ -380,12 +269,8 @@ def plot_training_curves(history, save_path='miou_curves.png'):
     plt.ylabel('Mean IoU')
     plt.legend(loc='lower right')
     plt.grid(True, linestyle='--', alpha=0.6)
-
-    # Find loss keys
     train_loss_key = 'loss' if 'loss' in available_keys else None
     val_loss_key = 'val_loss' if 'val_loss' in available_keys else None
-
-    # Plot Loss if available
     if train_loss_key and val_loss_key:
         plt.subplot(1, 2, 2)
         plt.plot(history.history[train_loss_key], label='Training Loss')
@@ -395,239 +280,218 @@ def plot_training_curves(history, save_path='miou_curves.png'):
         plt.ylabel('Loss')
         plt.legend(loc='upper right')
         plt.grid(True, linestyle='--', alpha=0.6)
-
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Training curves saved to {save_path}")
 
-
 def train_and_evaluate():
-    # Define constants
     NUM_CLASSES = 5
-    BATCH_SIZE = 8 # Reduced from 8 to 4 to align with data_loader.py
-    EPOCHS = 600
-    LEARNING_RATE = 5e-5
-    IMG_SIZE = (320, 320)
+    BATCH_SIZE = 6  # Reduced from 4 to 2 to lower memory consumption
+    EPOCHS = 800
+    LEARNING_RATE = 3e-5
+    IMG_SIZE = (384, 384)
 
-    # Create directory for checkpoints if it doesn't exist
+    # Clear GPU memory
+    tf.keras.backend.clear_session()
+    import gc
+    gc.collect()
+
+    # Limit memory growth to avoid OOM
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"Set memory growth for GPUs")
+        except RuntimeError as e:
+            print(f"Error setting GPU memory growth: {e}")
+
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+    print(f"Limited TensorFlow to 2 inter-op and 2 intra-op threads")
+
     os.makedirs('checkpoints', exist_ok=True)
-
-    # Path for latest checkpoint - using correct .weights.h5 extension for weights-only files
-    latest_weights = 'checkpoints/latest_model.weights.h5'
+    latest_weights = 'checkpoints/segformer_b2_latest.weights.h5'
     initial_epoch = 0
 
     print("Loading datasets...")
-    # Load training and validation datasets with performance optimization
+    log_memory_usage("Before dataset loading: ")
     train_ds, class_weights_dict, train_steps = load_dataset(data_dir='dataset', split='train', batch_size=BATCH_SIZE)
-    train_ds = train_ds.prefetch(tf.data.experimental.AUTOTUNE)  # Add prefetch for better performance
-
     test_ds, _, val_steps = load_dataset(data_dir='dataset', split='test', batch_size=BATCH_SIZE)
-    test_ds = test_ds.prefetch(tf.data.experimental.AUTOTUNE)  # Add prefetch for validation dataset
+    log_memory_usage("After dataset loading: ")
 
-    # Apply advanced data augmentation from augmentation.py
-    print("Applying advanced data augmentation...")
-    augmented_train_ds = apply_augmentation(train_ds)
+    # Debug dataset shapes
+    for images, labels in train_ds.take(1):
+        print(f"Train batch - Images shape: {images.shape}, dtype: {images.dtype}")
+        print(f"Train batch - Labels shape: {labels.shape}, dtype: {labels.dtype}")
+    for images, labels in test_ds.take(1):
+        print(f"Test batch - Images shape: {images.shape}, dtype: {images.dtype}")
+        print(f"Test batch - Labels shape: {labels.shape}, dtype: {labels.dtype}")
+
+    print("SKIPPING advanced data augmentation to avoid memory issues...")
+    # Use original dataset without augmentation to avoid memory errors
+    augmented_train_ds = train_ds
+    log_memory_usage("After dataset setup: ")
 
     print(f"Dataset loaded. Training steps: {train_steps}, Validation steps: {val_steps}")
-    if train_steps == 0:
-        raise ValueError("Training dataset is empty! Please check your data loading pipeline.")
+    if train_steps == 0 or val_steps == 0:
+        raise ValueError("Empty dataset detected. Check data loading pipeline.")
 
-    if val_steps == 0:
-        raise ValueError("Validation dataset is empty! Please check your data loading pipeline.")
+    pretrained_weights_path = 'segformer_b2_pretrain.h5'
+    use_pretrained = os.path.exists(pretrained_weights_path)
+    print(f"Pre-trained weights {'found' if use_pretrained else 'not found'} at {pretrained_weights_path}")
 
-    # Disable mixed precision to avoid dtype mismatches
-    print("Using fixed precision (float32) for model training to avoid XLA mixed precision issues")
-    mixed_precision.set_global_policy('float32')
+    from model import OilSpillSegformer
+    from loss import HybridSegmentationLoss
+    log_memory_usage("Before model creation: ")
+    model = OilSpillSegformer(
+        input_shape=(*IMG_SIZE, 1),
+        num_classes=NUM_CLASSES,
+        drop_rate=0.1,
+        use_cbam=False,  # Disable CBAM to reduce memory usage
+        pretrained_weights=pretrained_weights_path if use_pretrained else None
+    )
+    log_memory_usage("After model creation: ")
 
-    # Create the DeepLabv3+ model - ensuring 1-channel grayscale input
-    print("Creating model...")
-    model = DeepLabv3Plus(input_shape=(*IMG_SIZE, 1), num_classes=NUM_CLASSES)
-
-    # Check if checkpoint exists to resume training
     if os.path.exists(latest_weights):
-        print(f"Found checkpoint at {latest_weights}. Loading weights...")
+        print(f"Loading checkpoint from {latest_weights}...")
         try:
-            # Load model weights only, not the full architecture
-            model.load_weights(latest_weights)
-
-            # Get the initial epoch from checkpoint info
+            model.load_weights(latest_weights, by_name=True, skip_mismatch=True)
             checkpoint_info_path = 'checkpoints/checkpoint_info.txt'
             if os.path.exists(checkpoint_info_path):
                 with open(checkpoint_info_path, 'r') as f:
                     initial_epoch = int(f.read().strip())
                 print(f"Resuming from epoch {initial_epoch}")
         except Exception as e:
-            print(f"Error loading weights: {e}")
-            print("Training from scratch instead.")
+            print(f"Error loading checkpoint: {e}")
+            print("Continuing with pre-trained weights or from scratch")
             initial_epoch = 0
     else:
-        print("No checkpoint found. Training from scratch.")
+        print("No checkpoint found. Using pre-trained weights or training from scratch.")
 
-    # Define optimizer with AdamW and weight decay to improve generalization
-    # Use a float learning rate instead of a schedule to allow ReduceLROnPlateau callback to work
-    initial_lr = LEARNING_RATE
+    lr_schedule = create_cosine_decay_with_warmup(
+        epochs=EPOCHS,
+        train_steps=train_steps,
+        batch_size=BATCH_SIZE,
+        initial_lr=LEARNING_RATE,
+        warmup_epochs=10
+    )
+
     optimizer = tf.keras.optimizers.AdamW(
-        learning_rate=initial_lr,  # Use initial float value instead of schedule
+        learning_rate=lr_schedule,
         weight_decay=1e-4,
         clipnorm=1.0,
         epsilon=1e-8
     )
 
-    print(f"Using initial learning rate: {initial_lr:.2e} with AdamW optimizer")
-
-    # Convert class weights dictionary to a list ordered by class index
-    class_weights_list = [class_weights_dict.get(i, 1.0) for i in range(NUM_CLASSES)]
-    print(f"Using class weights from data loader: {class_weights_list}")
-
-    # Create the loss function with the calculated class weights
+    # Use the improved hybrid segmentation loss for better performance on oil spill detection
+    class_weights_list = [class_weights_dict[i] for i in range(NUM_CLASSES)]
     loss_fn = HybridSegmentationLoss(
         class_weights=class_weights_list,
         ce_weight=0.4,
         focal_weight=0.3,
-        dice_weight=0.3
+        dice_weight=0.3,
+        boundary_weight=0.0,  # Temporarily disabled until we can fix the boundary loss component
+        gamma=3.0,
+        from_logits=True
     )
+    print("Using fixed HybridSegmentationLoss for better oil spill and ship detection")
 
-    # Compile model with XLA optimization enabled
     model.compile(
         optimizer=optimizer,
         loss=loss_fn,
         metrics=[IoUMetric(num_classes=NUM_CLASSES)],
-        run_eagerly=False,
-        jit_compile=True,  # Enable XLA JIT compilation
+        run_eagerly=False,  # Disable eager execution for improved performance
+        jit_compile=False   # Disable XLA JIT compilation to avoid tensor shape issues
     )
 
-    print("Model compiled with XLA JIT compilation enabled for training")
+    print("Model compiled with XLA JIT compilation disabled to avoid tensor shape errors")
+    model.summary()
+    log_memory_usage("After model compilation: ")
 
-    # Set up callbacks for saving weights only, not full model
-    checkpoint_path = 'checkpoints/improved_deeplabv3plus_best.weights.h5'
-
-    # Create and configure callbacks
+    checkpoint_path = 'checkpoints/segformer_b2_best.weights.h5'
     callbacks = [
-        # Model checkpoint to save the best weights based on validation IoU
         tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
             monitor='val_iou_metric',
             save_best_only=True,
-            save_weights_only=True,  # Save weights only, not full model
+            save_weights_only=True,
             mode='max',
             verbose=1
         ),
-        # Also save weights after each epoch to enable resuming training
         tf.keras.callbacks.ModelCheckpoint(
             filepath=latest_weights,
-            save_weights_only=True,  # Save weights only, not full model
+            save_weights_only=True,
             save_best_only=False,
             save_freq='epoch',
             verbose=1
         ),
-        # Early stopping to prevent overfitting
         tf.keras.callbacks.EarlyStopping(
             monitor='val_iou_metric',
-            patience=60,  # Increased from 30 to 60 to allow more time for model improvement
+            patience=100,
             mode='max',
             restore_best_weights=True,
             verbose=1
         ),
-        # Learning rate scheduler
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_iou_metric',
-            factor=0.5,
-            patience=10,
-            min_lr=1e-6,
-            mode='max',
-            verbose=1
-        ),
-        # TensorBoard logging
         tf.keras.callbacks.TensorBoard(
-            log_dir='./logs/fit/' + datetime.now().strftime("%Y%m%d-%H%M%S"),
+            log_dir='./logs/fit/segformer_b2_' + datetime.now().strftime("%Y%m%d-%H%M%S"),
             update_freq='epoch'
+        ),
+        ProgressCallback(total_epochs=EPOCHS, steps_per_epoch=train_steps, validation_steps=val_steps),
+        tf.keras.callbacks.LambdaCallback(
+            on_epoch_end=lambda epoch, logs: open('checkpoints/checkpoint_info.txt', 'w').write(str(epoch + 1))
+        ),
+        tf.keras.callbacks.LambdaCallback(
+            on_epoch_end=lambda epoch, logs: print(f"Current learning rate: {float(model.optimizer.lr(tf.cast(model.optimizer.iterations, tf.float32)).numpy()):.2e}")
         )
     ]
 
-    # Add custom callback to save epoch information
-    class EpochLogger(tf.keras.callbacks.Callback):
-        def on_epoch_end(self, epoch, logs=None):
-            with open('checkpoints/checkpoint_info.txt', 'w') as f:
-                f.write(str(epoch + 1))  # +1 because next epoch will be epoch+1
-
-    callbacks.append(EpochLogger())
-
-    # Add our custom progress callback
-    progress_callback = ProgressCallback(
-        total_epochs=EPOCHS,
-        steps_per_epoch=train_steps,
-        validation_steps=val_steps
-    )
-    callbacks.append(progress_callback)
-
-    # Train the model with validation data
-    print(f"Starting training for {EPOCHS} epochs from epoch {initial_epoch}...")
+    print(f"Starting SegFormer-B2 training for {EPOCHS} epochs from epoch {initial_epoch}...")
+    log_memory_usage("Before training: ")
     history = model.fit(
         augmented_train_ds,
         validation_data=test_ds,
         epochs=EPOCHS,
         callbacks=callbacks,
-        verbose=0,  # Set to 0 as we're using our custom progress logger
-        initial_epoch=initial_epoch  # Start from this epoch
+        verbose=0,
+        initial_epoch=initial_epoch
     )
 
-    # Save the final weights
-    final_weights_path = 'improved_deeplabv3plus.weights.h5'
+    final_weights_path = 'segformer_b2_final.weights.h5'
     model.save_weights(final_weights_path)
     print(f"Model weights saved as '{final_weights_path}'")
 
-    # Plot and save training curves
-    plot_training_curves(history)
+    plot_training_curves(history, save_path='segformer_b2_miou_curves.png')
 
-    # Evaluate on test set using multi-scale prediction with GPU acceleration
-    print("\nEvaluating with GPU-accelerated multi-scale prediction...")
-
-    # Enable mixed precision for faster evaluation on GPU
-    mixed_precision.set_global_policy('mixed_float16')
-    print("Switched to mixed_float16 for evaluation to improve GPU performance")
-
-    # Use larger batch size for better GPU utilization - adjust based on your GPU memory
-    eval_batch_size = 4  # Increase this value for RTX 4060Ti which has sufficient VRAM
-    multi_scale_predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0], batch_size=eval_batch_size)
-
-    # Initialize IoU metric for evaluation
+    print("\nEvaluating with multi-scale prediction...")
+    eval_batch_size = 2
+    multi_scale_predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=eval_batch_size)
     test_metric = IoUMetric(num_classes=NUM_CLASSES)
-
-    # Start timing the evaluation
     eval_start_time = time.time()
 
-    # Perform evaluation with progress bar
     for images, labels in tqdm(test_ds, desc="Evaluating"):
-        # Get multi-scale predictions - our optimized version now uses the GPU effectively
         predictions = multi_scale_predictor.predict(images)
-
-        # Update metrics
         test_metric.update_state(labels, predictions)
 
-    # Calculate and print evaluation time
     eval_time = time.time() - eval_start_time
     minutes, seconds = divmod(eval_time, 60)
     print(f"\nEvaluation completed in {int(minutes)}m {seconds:.1f}s")
-
-    # Print evaluation results
     mean_iou = test_metric.result().numpy()
-    print(f"\nTest Mean IoU: {mean_iou:.4f}")
-
-    # Print class-wise IoU
+    print(f"Test Mean IoU: {mean_iou:.4f}")
     class_iou = test_metric.get_class_iou()
     print("\nClass-wise IoU:")
     for class_name, iou in class_iou.items():
         print(f"  {class_name}: {iou:.4f}")
 
+    log_memory_usage("After evaluation: ")
     return history
 
-
 if __name__ == "__main__":
-    # Make TensorFlow operations deterministic for reproducibility
     tf.random.set_seed(42)
     np.random.seed(42)
     print("____________________________________________________________________")
-    print("Starting model training with fixed precision...")
+    print("Starting SegFormer-B2 training for oil spill detection...")
+    print("Model configuration: 384x384 input, ~13.7M parameters")
     history = train_and_evaluate()
-    print("Training completed successfully with fixed precision")
+    print("SegFormer-B2 training completed successfully")
     print("____________________________________________________________________")

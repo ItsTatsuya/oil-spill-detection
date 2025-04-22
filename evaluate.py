@@ -81,21 +81,51 @@ def apply_crf(images, predictions):
 
 
 class MultiScalePredictor:
-    """Multi-scale prediction for semantic segmentation."""
+    """
+    Enhanced Multi-scale prediction for semantic segmentation.
+    Now includes Test-Time Augmentation (TTA) for improved boundary detection
+    and rare class (oil spills, ships) accuracy.
+    """
 
-    def __init__(self, model, scales=[0.75, 1.0]):
+    def __init__(self, model, scales=[0.75, 1.0, 1.25], batch_size=4, use_tta=True):
+        """
+        Initialize with optimized scales for SAR imagery and TTA support.
+
+        Args:
+            model: The model to use for prediction
+            scales: List of scales for multi-scale prediction (optimized for 384x384)
+            batch_size: Batch size for prediction (reduced to 4 for 8GB VRAM)
+            use_tta: Whether to use Test-Time Augmentation
+        """
         self.model = model
         self.scales = scales
+        self.batch_size = batch_size
+        self.use_tta = use_tta
+
+        # Initialize TTA if needed
+        if self.use_tta:
+            from test_time_augmentation import TestTimeAugmentation
+            self.tta = TestTimeAugmentation(
+                model,
+                num_augmentations=5,  # Use 5 augmentations by default
+                use_flips=True,       # Use horizontal/vertical flips
+                use_scales=False,     # Scales are handled by multi-scale prediction
+                use_rotations=True,   # Use rotations (helps with ship orientation)
+                include_original=True # Always include original image
+            )
+            print(f"TTA enabled with 5 augmentations for improved rare class detection")
+
+        print(f"MultiScalePredictor initialized with scales {scales}, batch_size={batch_size}")
 
     def predict(self, image_batch):
         """
-        Predict using multiple scales and fuse results.
+        Predict using multiple scales and TTA for optimal accuracy.
 
         Args:
             image_batch: Batch of images with shape [batch_size, height, width, channels]
 
         Returns:
-            Fused predictions with shape [batch_size, height, width, num_classes]
+            Enhanced predictions with shape [batch_size, height, width, num_classes]
         """
         batch_size = tf.shape(image_batch)[0]
         height = tf.shape(image_batch)[1]
@@ -103,7 +133,6 @@ class MultiScalePredictor:
 
         # Cast input to the policy's compute dtype (float16 for mixed precision)
         image_batch = tf.cast(image_batch, policy.compute_dtype)
-        print(f"Input cast to {policy.compute_dtype} for mixed precision inference")
 
         # Store original size for later use
         original_size = (height, width)
@@ -114,37 +143,36 @@ class MultiScalePredictor:
         # Make predictions at each scale
         for scale in self.scales:
             try:
-                # For input to the model, always use the original image
-                model_input = tf.identity(image_batch)
+                # Calculate scaled dimensions
+                scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
+                scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
 
-                # Run prediction
-                print(f"Running prediction at scale {scale} with input shape {model_input.shape}, dtype={model_input.dtype}")
-                logits = self.model(model_input, training=False)
+                # Resize the input images to the scaled dimensions
+                resized_images = tf.image.resize(
+                    image_batch,
+                    size=(scaled_height, scaled_width),
+                    method='bilinear'
+                )
 
-                # For fusion, we'll scale the outputs
-                if scale != 1.0:
-                    # Calculate scaled dimensions for the output
-                    scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
-                    scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
+                # For each scale, use TTA if enabled
+                if self.use_tta:
+                    # Apply TTA - this will handle multiple augmentations internally
+                    logits = self.tta.predict(resized_images)
+                else:
+                    # Regular prediction without TTA
+                    logits = self.model(resized_images, training=False)
 
-                    # Scale the logits (output) to the scaled size
-                    scaled_logits = tf.image.resize(
-                        logits,
-                        size=(scaled_height, scaled_width),
-                        method='bilinear'
-                    )
-
-                    # Then scale back to original size for fusion
+                # Resize prediction back to original size
+                if scale != 1.0 or tf.shape(logits)[1] != height or tf.shape(logits)[2] != width:
                     resized_logits = tf.image.resize(
-                        scaled_logits,
+                        logits,
                         size=original_size,
                         method='bilinear'
                     )
                 else:
-                    # For scale 1.0, use the output directly
                     resized_logits = logits
 
-                # Apply softmax to get probabilities
+                # Convert to probabilities
                 probs = tf.nn.softmax(resized_logits, axis=-1)
                 all_predictions.append(probs)
 
@@ -160,7 +188,12 @@ class MultiScalePredictor:
         # Average predictions from all scales
         fused_prediction = tf.reduce_mean(tf.stack(all_predictions, axis=0), axis=0)
 
-        return fused_prediction
+        # Convert back to logits for consistency with model output
+        epsilon = 1e-7
+        fused_prediction = tf.clip_by_value(fused_prediction, epsilon, 1.0 - epsilon)
+        logits = tf.math.log(fused_prediction)
+
+        return logits
 
 
 def compute_iou(y_true, y_pred, num_classes=5):
@@ -221,7 +254,7 @@ def compute_iou(y_true, y_pred, num_classes=5):
     return mean_iou.numpy(), class_ious.numpy()
 
 
-def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
+def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False, use_tta=False):
     """
     Measure average inference time for a model.
 
@@ -230,6 +263,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
         num_runs: Number of inference runs to average over
         batch_size: Batch size for inference
         multi_scale: Whether to use multi-scale prediction
+        use_tta: Whether to use Test-Time Augmentation
 
     Returns:
         Average inference time in milliseconds and comparison results
@@ -244,10 +278,11 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     # Cast input to mixed precision dtype
     mp_input = tf.cast(dummy_input, policy.compute_dtype)
 
-    # Warmup
+    # Warmpup
     for _ in range(3):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
+            # Use optimized scales [0.75, 1.0, 1.25] for better context
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=batch_size, use_tta=use_tta)
             _ = predictor.predict(mp_input)
         else:
             _ = model(mp_input, training=False)
@@ -256,7 +291,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     start_time = time.time()
     for _ in range(num_runs):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=batch_size, use_tta=use_tta)
             _ = predictor.predict(mp_input)
         else:
             _ = model(mp_input, training=False)
@@ -279,7 +314,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     # Warmup with float32
     for _ in range(3):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=batch_size, use_tta=use_tta)
             _ = predictor.predict(fp32_input)
         else:
             _ = model(fp32_input, training=False)
@@ -288,7 +323,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     start_time = time.time()
     for _ in range(num_runs):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=batch_size, use_tta=use_tta)
             _ = predictor.predict(fp32_input)
         else:
             _ = model(fp32_input, training=False)
@@ -391,47 +426,75 @@ def apply_ship_enhancement(predictions, ship_class_idx=3):
     return tf.convert_to_tensor(enhanced_predictions, dtype=predictions.dtype)
 
 
-def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postprocessing=True):
+def evaluate_model(model_path, test_dataset, batch_size=4, apply_ship_postprocessing=True,
+                use_tta=True, tta_num_augs=5):
     """
-    Evaluate the DeepLabv3+ model on the test dataset.
+    Evaluate the SegFormer-B2 model on the test dataset.
 
     Args:
-        model_path: Path to the saved model
+        model_path: Path to the saved model weights
         test_dataset: The test dataset
-        batch_size: Batch size for evaluation
+        batch_size: Batch size for evaluation (reduced for larger model)
         apply_ship_postprocessing: Whether to apply ship-specific post-processing
+        use_tta: Whether to use Test-Time Augmentation
+        tta_num_augs: Number of TTA augmentations to use
 
     Returns:
         Dictionary containing evaluation results
     """
     # Import model definition
-    from model import DeepLabv3Plus
-    from loss import HybridSegmentationLoss  # Changed from hybrid_loss to HybridSegmentationLoss
+    from model import OilSpillSegformer
+    from loss import HybridSegmentationLoss
+    from test_time_augmentation import TestTimeAugmentation
 
-    # Load model from checkpointed H5 file
+    # Configure TensorFlow to use less CPU
+    tf.config.threading.set_inter_op_parallelism_threads(4)
+    tf.config.threading.set_intra_op_parallelism_threads(4)
+    print(f"Limited TensorFlow to 4 threads to reduce CPU usage")
+
+    # Optimize GPU memory usage
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Configure TensorFlow to use less GPU memory initially and grow as needed
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"GPU memory growth enabled for {len(gpus)} GPUs")
+        except Exception as e:
+            print(f"Error configuring GPU: {e}")
+
+    # Load model from checkpointed weights file
     print(f"Loading model from checkpoint: {model_path}")
     try:
-        # Load model architecture and weights; compile=False since we only predict
-        model = tf.keras.models.load_model(
-            model_path,
-            custom_objects={'HybridSegmentationLoss': HybridSegmentationLoss},  # Update custom_objects
-            compile=False
+        # Create a new SegFormer-B2 model with the appropriate configuration
+        model = OilSpillSegformer(
+            input_shape=(384, 384, 1),  # 384x384 input size
+            num_classes=5,              # 5 classes (Sea Surface, Oil Spill, Look-alike, Ship, Land)
+            drop_rate=0.0,              # Disable dropout for inference
+            use_cbam=True,              # Use CBAM with reduction_ratio=4
+            pretrained_weights=None     # No need for pretrained weights since we're loading checkpoint
         )
-        print("Model loaded successfully")
-    except Exception as e:
-        print(f"Failed to load model directly: {e}")
-        print("Falling back to weight loading")
-        # Create a new model instance and load weights
-        model = DeepLabv3Plus(input_shape=(320, 320, 3), num_classes=5)
-        try:
-            model.load_weights(model_path)
-            print("Weights loaded successfully")
-        except Exception as e2:
-            print(f"Error loading weights: {e2}")
-            return None
 
-    # Create a multi-scale predictor
-    predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
+        # Load weights
+        model.load_weights(model_path)
+        print("Weights loaded successfully into SegFormer-B2 model")
+    except Exception as e:
+        print(f"Error loading SegFormer-B2 model: {e}")
+        return None
+
+    # Create predictor according to evaluation settings
+    if use_tta:
+        print(f"Using Test-Time Augmentation with {tta_num_augs} augmentations for better mIoU")
+        predictor = TestTimeAugmentation(
+            model,
+            num_augmentations=tta_num_augs,
+            use_flips=True,
+            use_scales=True,
+            use_rotations=True
+        )
+    else:
+        # Use multi-scale predictor if not using TTA
+        predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
 
     # Check if the dataset is already batched
     is_already_batched = False
@@ -456,10 +519,10 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
     all_predictions = []
 
     # Process each batch
-    print("Evaluating on test dataset...")
+    print("Evaluating on test dataset with SegFormer-B2 model...")
     for images, labels in tqdm(test_batches):
         try:
-            # Get predictions using multi-scale fusion
+            # Get predictions using the predictor
             predictions = predictor.predict(images)
 
             # Apply ship-specific post-processing if enabled
@@ -489,8 +552,8 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
     mean_iou, class_ious = compute_iou(true_labels, predictions, num_classes=5)
 
     # Compute inference time
-    inference_time_results = measure_inference_time(model, multi_scale=True)
-    single_scale_time_results = measure_inference_time(model, multi_scale=False)
+    inference_time_results = measure_inference_time(model, multi_scale=True, use_tta=use_tta)
+    single_scale_time_results = measure_inference_time(model, multi_scale=False, use_tta=use_tta)
 
     # Prepare results
     class_names = ['Sea Surface', 'Oil Spill', 'Look-alike', 'Ship', 'Land']
@@ -611,33 +674,43 @@ def main():
     # Allow specifying a specific model via command line argument
     import argparse
     parser = argparse.ArgumentParser(description='Evaluate oil spill detection models')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for evaluation (reduced for larger model)')
     parser.add_argument('--disable_ship_postprocessing', action='store_true',
                        help='Disable ship-specific post-processing')
+    parser.add_argument('--model_path', type=str, default='checkpoints/segformer_b2_best.weights.h5',
+                       help='Path to model weights file')
+    parser.add_argument('--disable_tta', action='store_true', help='Disable Test-Time Augmentation')
+    parser.add_argument('--tta_num_augs', type=int, default=5, help='Number of TTA augmentations to use')
     args = parser.parse_args()
 
-    # Load the test dataset
+    # Load the test dataset with 384x384 input size
     print("Loading test dataset...")
     test_dataset, _, num_test_batches = load_dataset(data_dir='dataset', split='test', batch_size=args.batch_size)
     print(f"Loaded test dataset with {num_test_batches} batches with batch_size={args.batch_size}")
 
-    # Evaluate the model
-    model_path = 'checkpoints/improved_deeplabv3plus_best.weights.h5'
-    print(f"\nEvaluating model: improved_deeplabv3plus_best")
+    # Update the model name and path for SegFormer-B2
+    model_path = args.model_path
+    model_name = 'SegFormer-B2'
+    print(f"\nEvaluating model: {model_name} from {model_path}")
 
     apply_ship_postprocessing = not args.disable_ship_postprocessing
+    use_tta = not args.disable_tta
+    tta_num_augs = args.tta_num_augs
+
     model_results = evaluate_model(
         model_path,
         test_dataset,
         batch_size=args.batch_size,
-        apply_ship_postprocessing=apply_ship_postprocessing
+        apply_ship_postprocessing=apply_ship_postprocessing,
+        use_tta=use_tta,
+        tta_num_augs=tta_num_augs
     )
 
     if model_results:
-        results = {'improved_deeplabv3plus_best': model_results}
+        results = {model_name: model_results}
 
         # Print results
-        print(f"\nResults for improved_deeplabv3plus_best:")
+        print(f"\nResults for {model_name}:")
         print(f"Mean IoU: {model_results['mean_iou']:.2f}%")
         print("Class-wise IoU:")
         for class_name, iou in model_results['class_ious'].items():
@@ -651,7 +724,7 @@ def main():
         # Save results to markdown file
         save_results(results)
     else:
-        print(f"Evaluation failed for improved_deeplabv3plus_best")
+        print(f"Evaluation failed for {model_name}")
 
 
 if __name__ == "__main__":
