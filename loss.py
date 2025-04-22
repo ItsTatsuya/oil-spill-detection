@@ -38,6 +38,10 @@ def weighted_cross_entropy(class_weights=None, from_logits=True, epsilon=1e-7):
             y_true = tf.one_hot(tf.cast(y_true, tf.int32), depth=tf.shape(y_pred)[-1])
 
         y_true = tf.cast(y_true, tf.float32)
+
+        # Apply label smoothing to stabilize training
+        y_true = y_true * 0.9 + 0.1 / tf.cast(tf.shape(y_pred)[-1], tf.float32)
+
         y_pred = tf.cast(y_pred, tf.float32)
 
         if from_logits:
@@ -164,9 +168,9 @@ hybrid_loss = weighted_cross_entropy()
 class HybridSegmentationLoss(tf.keras.losses.Loss):
     def __init__(self,
                  class_weights=None,
-                 ce_weight=0.4,  # Default weight for cross entropy
-                 focal_weight=0.3,  # Default weight for focal loss
-                 dice_weight=0.3,  # Default weight for dice loss
+                 ce_weight=0.3,  # Reduced from 0.4 to 0.3
+                 focal_weight=0.4,  # Increased from 0.3 to 0.4
+                 dice_weight=0.3,  # Unchanged
                  gamma=2.0,  # Gamma parameter for focal loss
                  epsilon=1e-7,
                  from_logits=True,

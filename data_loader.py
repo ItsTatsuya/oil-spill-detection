@@ -36,53 +36,71 @@ absl.logging.set_verbosity(absl.logging.ERROR)
 
 def analyze_class_distribution(label_paths):
     """Analyze class distribution from a sample of label files and return class weights."""
-    sample_size = min(200, len(label_paths))
-    sample_paths = label_paths[:sample_size] if sample_size > 0 else label_paths
-    if not sample_paths:
-        return {i: 1.0 / 5.0 for i in range(5)}  # Uniform weights as fallback
-    labels = []
-    for path in sample_paths:
-        label = tf.io.read_file(path)
-        label = tf.image.decode_png(label, channels=1)
-        label = tf.image.resize(label, [320, 320], method='nearest')
-        label = tf.cast(label, tf.uint8)
-        labels.append(tf.reshape(label, [-1]))
-    labels = tf.concat(labels, axis=0)
-    unique, _, counts = tf.unique_with_counts(labels)
-    counts_float = tf.cast(counts, tf.float32)
-    tf.print("Class counts:", counts_float)  # Debug output
-    weights = 1.0 / (counts_float + 1e-7)  # Avoid division by zero
-    total_weight = tf.reduce_sum(weights)
-    raw_weights = {int(unique[i]): float(weights[i] / total_weight) for i in range(len(unique))}
-    # Cap maximum weight at 0.3 and redistribute excess
-    max_weight = 0.3
-    adjusted_weights = {}
-    weight_sum = 0.0
-    for cls in raw_weights:
-        w = min(raw_weights[cls], max_weight)
-        adjusted_weights[cls] = w
-        weight_sum += w
-    # Normalize remaining weights
-    remaining_weight = 1.0 - weight_sum
-    if remaining_weight > 0:
-        num_remaining_classes = len(raw_weights) - len([cls for cls in raw_weights if raw_weights[cls] > max_weight])
-        if num_remaining_classes > 0:
-            base_weight = remaining_weight / num_remaining_classes
-            for cls in raw_weights:
-                if raw_weights[cls] <= max_weight:
-                    adjusted_weights[cls] = base_weight
-    # Fill missing classes with adjusted weight
-    for i in range(5):
-        if i not in adjusted_weights:
-            adjusted_weights[i] = 1.0 / 5.0  # Fallback
-    tf.print("Adjusted class weights:", adjusted_weights)  # Debug output
+    # Use fixed class weights based on domain knowledge instead of calculating from data
+    weights = tf.constant([0.05, 0.4, 0.1, 0.35, 0.1], dtype=tf.float32)
+    adjusted_weights = {i: float(weights[i]) for i in range(5)}
+    tf.print("Using predefined class weights:", adjusted_weights)
     return adjusted_weights
+
+@tf.function
+def sample_patches(image, label, patch_size=320):
+    """
+    Sample patches centered on ships or oil spills to boost rare class exposure.
+
+    Args:
+        image: Input image tensor
+        label: Label tensor with class values (0-4)
+        patch_size: Size of output patch
+
+    Returns:
+        Tuple of (image_patch, label_patch) tensors
+    """
+    # Get image dimensions
+    image_height = tf.shape(image)[0]
+    image_width = tf.shape(image)[1]
+
+    # Ensure consistent output size by using resize if needed
+    def ensure_size(img, lbl):
+        img = tf.image.resize_with_crop_or_pad(img, patch_size, patch_size)
+        lbl = tf.image.resize_with_crop_or_pad(lbl, patch_size, patch_size)
+        return img, lbl
+
+    ship_coords = tf.where(label == 3)  # Ship class
+    oil_coords = tf.where(label == 1)   # Oil spill
+    coords = tf.concat([ship_coords, oil_coords], axis=0)
+
+    if tf.shape(coords)[0] > 0:
+        idx = tf.random.uniform((), 0, tf.shape(coords)[0], dtype=tf.int32)
+        y, x = coords[idx][0], coords[idx][1]
+
+        # Convert to int32 to match the type of patch_size // 2
+        y = tf.cast(y, tf.int32)
+        x = tf.cast(x, tf.int32)
+
+        # Calculate patch boundaries
+        y_start = tf.maximum(0, y - patch_size // 2)
+        x_start = tf.maximum(0, x - patch_size // 2)
+
+        # Ensure we don't exceed image dimensions
+        y_end = tf.minimum(image_height, y_start + patch_size)
+        x_end = tf.minimum(image_width, x_start + patch_size)
+
+        # Extract patches
+        img_patch = image[y_start:y_end, x_start:x_end, :]
+        lbl_patch = label[y_start:y_end, x_start:x_end, :]
+
+        # Ensure patches are exactly patch_size x patch_size by resizing if needed
+        return ensure_size(img_patch, lbl_patch)
+
+    # For images with no ship/oil, take a random crop
+    return tf.image.resize_with_crop_or_pad(image, patch_size, patch_size), tf.image.resize_with_crop_or_pad(label, patch_size, patch_size)
+
 
 def parse_image_label(image_path, label_path):
     """Load and preprocess an image and its corresponding label."""
-    # Read and preprocess image
+    # Read and preprocess image - load as grayscale (1-channel)
     image = tf.io.read_file(image_path)
-    image = tf.image.decode_jpeg(image, channels=3)
+    image = tf.image.decode_jpeg(image, channels=1)  # Changed to 1 channel for grayscale SAR images
     image = tf.image.resize(image, [320, 320])
     image = tf.cast(image, tf.float32) / 255.0  # Use float32 for preprocessing
 
@@ -97,7 +115,7 @@ def parse_image_label(image_path, label_path):
 
     return image, label
 
-def load_dataset(data_dir='dataset', split='train', batch_size=8):
+def load_dataset(data_dir='dataset', split='train', batch_size=4):
     """Load the oil spill detection dataset and return dataset with class weights and number of batches."""
     if split not in ['train', 'test']:
         raise ValueError(f"Invalid split: {split}. Must be 'train' or 'test'.")
@@ -124,7 +142,10 @@ def load_dataset(data_dir='dataset', split='train', batch_size=8):
 
     # Configure dataset
     if split == 'train':
-        # Apply custom per-image augmentations BEFORE casting to compute_dtype
+        # Apply sample patches centered on ships and oil spills (for training only)
+        dataset = dataset.map(sample_patches, num_parallel_calls=tf.data.AUTOTUNE)
+
+        # Apply custom per-image augmentations AFTER patch sampling
         dataset = dataset.map(_augment_image_and_label, num_parallel_calls=tf.data.AUTOTUNE)
 
         # Convert image to float32 AFTER augmentation
@@ -132,7 +153,6 @@ def load_dataset(data_dir='dataset', split='train', batch_size=8):
 
         # Disable caching to reduce VRAM usage and use larger buffer for better shuffling
         dataset = dataset.batch(batch_size)
-        print(f"Caching disabled to conserve VRAM. Processing {num_samples} samples with batch_size={batch_size}")
 
         # Increase shuffle buffer for better randomization
         dataset = dataset.shuffle(buffer_size=min(1000, num_samples // 2), reshuffle_each_iteration=True)

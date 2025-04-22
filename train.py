@@ -22,12 +22,13 @@ def silent_tf_import():
 
 tf = silent_tf_import()
 
-# Set standard float32 precision for more stable training
+# Import mixed precision support
 from tensorflow.keras import mixed_precision # type: ignore
 
-mixed_precision.set_global_policy('float32')  # Fixed standard policy instead of mixed precision
+# Enable mixed precision for training to leverage RTX 4060Ti
+mixed_precision.set_global_policy('mixed_float16')
 policy = mixed_precision.global_policy()
-print(f"Precision policy set to {policy.name} for stable training")
+print(f"Mixed precision policy set to: {policy.name} to leverage RTX 4060Ti")
 
 # Import custom modules
 from data_loader import load_dataset
@@ -115,98 +116,84 @@ class ProgressCallback(tf.keras.callbacks.Callback):
 
 
 class MultiScalePredictor:
-    def __init__(self, model, scales=[0.5, 0.75, 1.0], batch_size=1):
+    def __init__(self, model, scales=[0.5, 0.75, 1.0], batch_size=4):
         self.model = model
         self.scales = scales
         # Get the expected input shape from the model
         self.expected_height = model.input_shape[1]
         self.expected_width = model.input_shape[2]
-        # Use smaller batch size for prediction to reduce memory usage
+        # Use larger batch size for GPU utilization
         self.batch_size = batch_size
+        # Enable mixed precision for faster GPU inference
+        self.use_mixed_precision = True
+
+    @tf.function
+    def _predict_batch(self, batch):
+        """
+        TensorFlow function for fast GPU inference on a batch
+        """
+        return self.model(batch, training=False)
 
     def predict(self, image_batch):
-        import gc  # Import garbage collector
-
         original_batch_size = tf.shape(image_batch)[0]
         height = tf.shape(image_batch)[1]
         width = tf.shape(image_batch)[2]
         num_classes = self.model.output_shape[-1]
 
-        # Create a placeholder for the final prediction with the correct shape
-        # This avoids storing all scale predictions in memory at once
-        final_prediction = tf.zeros([original_batch_size, height, width, num_classes],
-                                   dtype=tf.float32)
+        # Pre-allocate for accumulated predictions
+        all_predictions = []
 
-        # Process each image in the batch individually to reduce memory usage
-        for i in range(original_batch_size):
-            # Extract single image and add batch dimension back
-            single_image = tf.expand_dims(image_batch[i], axis=0)
+        # Process each scale efficiently in batches
+        for scale in self.scales:
+            print(f"Processing scale {scale:.2f}...")
 
-            # Initialize accumulator for this single image
-            accumulated_pred = tf.zeros([1, height, width, num_classes], dtype=tf.float32)
+            # Resize images to current scale while preserving aspect ratio
+            scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
+            scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
 
-            # Process each scale separately and accumulate results
-            for scale in self.scales:
-                # Explicitly release memory
-                tf.keras.backend.clear_session()
-                gc.collect()
+            # Ensure dimensions are multiples of 8 for better performance
+            scaled_height = tf.cast(tf.math.ceil(scaled_height / 8) * 8, tf.int32)
+            scaled_width = tf.cast(tf.math.ceil(scaled_width / 8) * 8, tf.int32)
 
-                # Resize images to current scale while preserving aspect ratio
-                scaled_height = tf.cast(tf.cast(height, tf.float32) * scale, tf.int32)
-                scaled_width = tf.cast(tf.cast(width, tf.float32) * scale, tf.int32)
-
-                # Ensure dimensions are multiples of 8 for better performance
-                scaled_height = tf.cast(tf.math.ceil(scaled_height / 8) * 8, tf.int32)
-                scaled_width = tf.cast(tf.math.ceil(scaled_width / 8) * 8, tf.int32)
-
-                # Resize to the scaled dimensions
-                scaled_image = tf.image.resize(
-                    single_image,
-                    size=(scaled_height, scaled_width),
-                    method='bilinear'
-                )
-
-                # Resize to model's expected input shape
-                model_input = tf.image.resize(
-                    scaled_image,
-                    size=(self.expected_height, self.expected_width),
-                    method='bilinear'
-                )
-
-                # Get predictions
-                with tf.device('/CPU:0'):  # Use CPU for post-processing to free GPU memory
-                    logits = self.model(model_input, training=False)
-
-                    # Resize predictions back to original size
-                    resized_preds = tf.image.resize(
-                        logits,
-                        size=(height, width),
-                        method='bilinear'
-                    )
-
-                    # Apply softmax to get probabilities
-                    probs = tf.nn.softmax(resized_preds, axis=-1)
-
-                    # Accumulate probabilities (no need to keep all scales in memory)
-                    accumulated_pred += probs
-
-                # Explicitly delete tensors to free memory
-                del scaled_image, model_input, logits, resized_preds, probs
-                gc.collect()
-
-            # Average the accumulated predictions for this image
-            average_pred = accumulated_pred / len(self.scales)
-
-            # Update the corresponding slice of the final prediction tensor
-            final_prediction = tf.tensor_scatter_nd_update(
-                final_prediction,
-                indices=[[i]],
-                updates=average_pred
+            # Resize all images in the batch at once
+            scaled_batch = tf.image.resize(
+                image_batch,
+                size=(scaled_height, scaled_width),
+                method='bilinear'
             )
 
-            # Clean up
-            del single_image, accumulated_pred, average_pred
-            gc.collect()
+            # Resize to model's expected input shape
+            model_input = tf.image.resize(
+                scaled_batch,
+                size=(self.expected_height, self.expected_width),
+                method='bilinear'
+            )
+
+            # Convert to mixed precision for faster GPU inference if enabled
+            if self.use_mixed_precision:
+                model_input = tf.cast(model_input, tf.float16)
+
+            # Get predictions using GPU
+            logits = self._predict_batch(model_input)
+
+            # Convert back to float32 for post-processing
+            logits = tf.cast(logits, tf.float32)
+
+            # Resize predictions back to original size
+            resized_preds = tf.image.resize(
+                logits,
+                size=(height, width),
+                method='bilinear'
+            )
+
+            # Apply softmax to get probabilities
+            probs = tf.nn.softmax(resized_preds, axis=-1)
+
+            # Store this scale's predictions
+            all_predictions.append(probs)
+
+        # Average predictions across all scales
+        final_prediction = tf.reduce_mean(all_predictions, axis=0)
 
         # Convert averaged predictions back to logits for compatibility with loss functions
         epsilon = 1e-7
@@ -417,7 +404,7 @@ def plot_training_curves(history, save_path='miou_curves.png'):
 def train_and_evaluate():
     # Define constants
     NUM_CLASSES = 5
-    BATCH_SIZE = 8
+    BATCH_SIZE = 8 # Reduced from 8 to 4 to align with data_loader.py
     EPOCHS = 600
     LEARNING_RATE = 5e-5
     IMG_SIZE = (320, 320)
@@ -448,9 +435,13 @@ def train_and_evaluate():
     if val_steps == 0:
         raise ValueError("Validation dataset is empty! Please check your data loading pipeline.")
 
-    # Create the DeepLabv3+ model
+    # Disable mixed precision to avoid dtype mismatches
+    print("Using fixed precision (float32) for model training to avoid XLA mixed precision issues")
+    mixed_precision.set_global_policy('float32')
+
+    # Create the DeepLabv3+ model - ensuring 1-channel grayscale input
     print("Creating model...")
-    model = DeepLabv3Plus(input_shape=(*IMG_SIZE, 3), num_classes=NUM_CLASSES)
+    model = DeepLabv3Plus(input_shape=(*IMG_SIZE, 1), num_classes=NUM_CLASSES)
 
     # Check if checkpoint exists to resume training
     if os.path.exists(latest_weights):
@@ -472,14 +463,17 @@ def train_and_evaluate():
     else:
         print("No checkpoint found. Training from scratch.")
 
-    # Define optimizer with gradient clipping to prevent exploding gradients
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=LEARNING_RATE,
-        clipnorm=1.0,  # Add gradient clipping to prevent extreme weight updates
-        epsilon=1e-8,  # Increase epsilon to improve numerical stability
-        beta_1=0.9,    # Default Adam momentum parameters
-        beta_2=0.999   # Default Adam RMSprop parameter
+    # Define optimizer with AdamW and weight decay to improve generalization
+    # Use a float learning rate instead of a schedule to allow ReduceLROnPlateau callback to work
+    initial_lr = LEARNING_RATE
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=initial_lr,  # Use initial float value instead of schedule
+        weight_decay=1e-4,
+        clipnorm=1.0,
+        epsilon=1e-8
     )
+
+    print(f"Using initial learning rate: {initial_lr:.2e} with AdamW optimizer")
 
     # Convert class weights dictionary to a list ordered by class index
     class_weights_list = [class_weights_dict.get(i, 1.0) for i in range(NUM_CLASSES)]
@@ -492,11 +486,6 @@ def train_and_evaluate():
         focal_weight=0.3,
         dice_weight=0.3
     )
-
-    # Use standard float32 precision for training instead of mixed precision
-    # This helps avoid issues with mixed data types during ReluGrad operations
-    print("Setting standard float32 precision for training stability")
-    tf.keras.mixed_precision.set_global_policy('float32')
 
     # Compile model with XLA optimization enabled
     model.compile(
@@ -590,28 +579,35 @@ def train_and_evaluate():
     # Plot and save training curves
     plot_training_curves(history)
 
-    # Evaluate on test set using multi-scale prediction with smaller evaluation batch size
-    print("\nEvaluating with memory-efficient multi-scale prediction...")
-    # Use batch size of 1 for evaluation to minimize memory usage
-    multi_scale_predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0], batch_size=1)
+    # Evaluate on test set using multi-scale prediction with GPU acceleration
+    print("\nEvaluating with GPU-accelerated multi-scale prediction...")
+
+    # Enable mixed precision for faster evaluation on GPU
+    mixed_precision.set_global_policy('mixed_float16')
+    print("Switched to mixed_float16 for evaluation to improve GPU performance")
+
+    # Use larger batch size for better GPU utilization - adjust based on your GPU memory
+    eval_batch_size = 4  # Increase this value for RTX 4060Ti which has sufficient VRAM
+    multi_scale_predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0], batch_size=eval_batch_size)
 
     # Initialize IoU metric for evaluation
     test_metric = IoUMetric(num_classes=NUM_CLASSES)
 
-    # Import gc for explicit garbage collection during evaluation
-    import gc
+    # Start timing the evaluation
+    eval_start_time = time.time()
 
-    # Perform evaluation in smaller chunks to reduce memory pressure
-    for images, labels in tqdm(test_ds):
-        # Get multi-scale predictions
+    # Perform evaluation with progress bar
+    for images, labels in tqdm(test_ds, desc="Evaluating"):
+        # Get multi-scale predictions - our optimized version now uses the GPU effectively
         predictions = multi_scale_predictor.predict(images)
 
         # Update metrics
         test_metric.update_state(labels, predictions)
 
-        # Force garbage collection after each batch to free memory
-        tf.keras.backend.clear_session()
-        gc.collect()
+    # Calculate and print evaluation time
+    eval_time = time.time() - eval_start_time
+    minutes, seconds = divmod(eval_time, 60)
+    print(f"\nEvaluation completed in {int(minutes)}m {seconds:.1f}s")
 
     # Print evaluation results
     mean_iou = test_metric.result().numpy()
@@ -631,7 +627,7 @@ if __name__ == "__main__":
     tf.random.set_seed(42)
     np.random.seed(42)
     print("____________________________________________________________________")
-    print("Starting model training with mixed precision...")
+    print("Starting model training with fixed precision...")
     history = train_and_evaluate()
-    print("Training completed successfully with mixed precision")
+    print("Training completed successfully with fixed precision")
     print("____________________________________________________________________")

@@ -43,11 +43,47 @@ BASELINE_RESULTS = {
     }
 }
 
+import pydensecrf.densecrf as dcrf
+from pydensecrf.utils import unary_from_softmax
+
+def apply_crf(images, predictions):
+    """
+    Apply Conditional Random Field to refine boundaries for oil spills and ships.
+
+    Args:
+        images: Batch of input images with shape [batch_size, height, width, channels]
+        predictions: Tensor of shape [batch_size, height, width, num_classes] with class probabilities
+
+    Returns:
+        Enhanced predictions with refined boundaries
+    """
+    batch_size = tf.shape(predictions)[0]
+    height, width = tf.shape(predictions)[1], tf.shape(predictions)[2]
+    enhanced_preds = tf.zeros_like(predictions)
+
+    for i in range(batch_size):
+        img = (images[i].numpy() * 255).astype(np.uint8).squeeze()
+        probs = predictions[i].numpy().transpose(2, 0, 1)
+
+        d = dcrf.DenseCRF2D(width, height, 5)
+        U = unary_from_softmax(probs)
+        d.setUnaryEnergy(U)
+
+        # Add pairwise terms (appearance and smoothness)
+        d.addPairwiseGaussian(sxy=3, compat=3)
+        d.addPairwiseBilateral(sxy=80, srgb=13, rgbim=img, compat=10)
+
+        # Perform inference
+        Q = d.inference(5)
+        enhanced_preds[i] = tf.convert_to_tensor(np.array(Q).reshape(5, height, width).transpose(1, 2, 0))
+
+    return enhanced_preds
+
 
 class MultiScalePredictor:
     """Multi-scale prediction for semantic segmentation."""
 
-    def __init__(self, model, scales=[0.5, 0.75, 1.0]):
+    def __init__(self, model, scales=[0.75, 1.0]):
         self.model = model
         self.scales = scales
 
@@ -211,7 +247,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     # Warmup
     for _ in range(3):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
             _ = predictor.predict(mp_input)
         else:
             _ = model(mp_input, training=False)
@@ -220,7 +256,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     start_time = time.time()
     for _ in range(num_runs):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
             _ = predictor.predict(mp_input)
         else:
             _ = model(mp_input, training=False)
@@ -243,7 +279,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     # Warmup with float32
     for _ in range(3):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
             _ = predictor.predict(fp32_input)
         else:
             _ = model(fp32_input, training=False)
@@ -252,7 +288,7 @@ def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False):
     start_time = time.time()
     for _ in range(num_runs):
         if multi_scale:
-            predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+            predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
             _ = predictor.predict(fp32_input)
         else:
             _ = model(fp32_input, training=False)
@@ -395,7 +431,7 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
             return None
 
     # Create a multi-scale predictor
-    predictor = MultiScalePredictor(model, scales=[0.5, 0.75, 1.0])
+    predictor = MultiScalePredictor(model, scales=[0.75, 1.0])
 
     # Check if the dataset is already batched
     is_already_batched = False
@@ -429,6 +465,9 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
             # Apply ship-specific post-processing if enabled
             if apply_ship_postprocessing:
                 predictions = apply_ship_enhancement(predictions, ship_class_idx=3)
+
+            # Apply CRF refinement
+            predictions = apply_crf(images, predictions)
 
             # Store labels and predictions
             all_true_labels.append(labels)

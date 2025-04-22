@@ -91,16 +91,35 @@ def elastic_deform(image, label, alpha=20.0, sigma=4.0, grid_size=8):
 @tf.function
 def _augment_image_and_label(image, label):
     """Apply per-image augmentations with class-aware enhancements."""
+    # Get the original number of channels
     original_shape = tf.shape(image)
     h, w = original_shape[0], original_shape[1]
+    num_channels = original_shape[2]
+
+    # Ensure label is always uint8 at the beginning
+    label = tf.cast(label, tf.uint8)
+
+    # Combine image and label for joint transformation
     combined = tf.concat([image, tf.cast(label, tf.float32) / 4.0], axis=2)
 
     if tf.random.uniform(()) > 0.5:
         combined = tf.image.flip_left_right(combined)
 
     if tf.random.uniform(()) > 0.5:
-        angle = tf.random.uniform([], minval=-0.5236, maxval=0.5236)  # ±30°
+        angle = tf.random.uniform([], minval=-1.0472, maxval=1.0472)  # ±60°
         combined = rotate_image(combined, angle, interpolation='nearest')
+
+    if tf.random.uniform(()) > 0.5:
+        shear = tf.random.uniform([], minval=-0.2, maxval=0.2)
+        transform = [1.0, shear, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+        combined = tf.raw_ops.ImageProjectiveTransformV3(
+            images=tf.expand_dims(combined, 0),
+            transforms=[transform],
+            output_shape=[h, w],
+            interpolation='NEAREST',
+            fill_mode='CONSTANT',
+            fill_value=0.0
+        )[0]
 
     if tf.random.uniform(()) > 0.5:
         scale = tf.random.uniform([], minval=0.8, maxval=1.0)
@@ -109,44 +128,71 @@ def _augment_image_and_label(image, label):
         combined = tf.image.resize(combined, [new_h, new_w], method='nearest')
         combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
 
-    image = combined[..., :3]
-    label = combined[..., 3:]
+    # Separate image and label - extract only the original number of channels
+    image = combined[..., :num_channels]  # Keep only original image channels
+    label = combined[..., num_channels:]  # Get the label channels - this is float32
 
+    # Apply color transforms only to the image channels
     image = tf.image.random_brightness(image, max_delta=0.2)
     image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
-    image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
-    image = tf.image.random_hue(image, max_delta=0.1)
+
+    # Only apply saturation and hue if we have 3 channels (not for grayscale)
+    if num_channels >= 3:
+        image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
+        image = tf.image.random_hue(image, max_delta=0.1)
 
     if tf.random.uniform(()) > 0.5:
         noise = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.02)
         image = image + noise
 
-    image, label = elastic_deform(image, label)
+    if tf.random.uniform(()) > 0.5:
+        speckle = tf.random.normal(tf.shape(image), mean=0.0, stddev=0.05)
+        image = tf.clip_by_value(image + speckle, 0, 1)
+
+    # Apply elastic deformation - this returns label as uint8
+    image, label_deformed = elastic_deform(image, tf.cast(label * 4.0, tf.uint8))
+
+    # Keep label consistently as float32 to avoid type mismatches
+    label = tf.cast(label_deformed, tf.float32) / 4.0
 
     # Check for rare classes using tf.isin
-    flat_label = tf.reshape(label, [-1])
+    flat_label = tf.reshape(label_deformed, [-1])  # Use uint8 version for comparison
     has_rare = tf.reduce_any(tf_isin(flat_label, [1, 3]))
-    if has_rare and tf.random.uniform(()) > 0.5:
+
+    # Create a constant tensor of the same shape as label to control flow
+    label_shape = tf.shape(label)
+
+    # Define a conditional function to ensure type consistency
+    def apply_rare_augmentation():
+        # Recombine for additional transformations if rare classes are present
+        combined_rare = tf.concat([image, label], axis=2)
+
         if tf.random.uniform(()) > 0.5:
-            combined = tf.image.flip_left_right(combined)
+            combined_rare = tf.image.flip_left_right(combined_rare)
         if tf.random.uniform(()) > 0.5:
             scale = tf.random.uniform([], minval=0.8, maxval=1.0)
             new_h = tf.cast(tf.cast(h, tf.float32) * scale, tf.int32)
             new_w = tf.cast(tf.cast(w, tf.float32) * scale, tf.int32)
-            combined = tf.image.resize(combined, [new_h, new_w], method='nearest')
-            combined = tf.image.resize_with_pad(combined, h, w, method='nearest')
+            combined_rare = tf.image.resize(combined_rare, [new_h, new_w], method='nearest')
+            combined_rare = tf.image.resize_with_pad(combined_rare, h, w, method='nearest')
 
-    image = combined[..., :3]
-    label = combined[..., 3:]
+        # Re-separate the image and label again
+        return (combined_rare[..., :num_channels],
+                combined_rare[..., num_channels:])
 
+    # Apply rare class augmentation conditionally, maintaining type consistency
+    if has_rare and tf.random.uniform(()) > 0.5:
+        image, label = apply_rare_augmentation()
+
+    # Final processing - ensure consistent types
     image = tf.clip_by_value(image, 0, 1)
-    label = label * 4.0
-    label = tf.cast(tf.round(label), tf.uint8)
+    # Convert label back to uint8 at the end
+    label = tf.cast(tf.round(label * 4.0), tf.uint8)
 
     return image, label
 
 @tf.function
-def apply_cutmix(images, labels, alpha=0.3, prob=0.5):
+def apply_cutmix(images, labels, alpha=0.3, prob=0.7):
     """Apply CutMix targeting rare class regions."""
     if tf.random.uniform(()) > prob:
         return images, labels
@@ -276,7 +322,7 @@ def apply_augmentation(dataset):
 
     # Apply batch-level augmentations
     augmented_ds = dataset.with_options(options).map(
-        lambda x, y: apply_cutmix(x, y, alpha=0.3, prob=0.5),
+        lambda x, y: apply_cutmix(x, y, alpha=0.3, prob=0.7),
         num_parallel_calls=parallel_calls
     )
     augmented_ds = augmented_ds.map(
