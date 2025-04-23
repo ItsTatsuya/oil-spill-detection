@@ -4,8 +4,24 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 import time
-import psutil  # For memory debugging
-import subprocess  # Add import for subprocess.run
+import sys  # For colored terminal output
+
+# ANSI color codes for terminal highlighting
+class TermColors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def colored_print(text, color=TermColors.BLUE, bold=False):
+    """Print colored text to terminal"""
+    prefix = TermColors.BOLD if bold else ""
+    print(f"{prefix}{color}{text}{TermColors.ENDC}")
 
 def silent_tf_import():
     import sys
@@ -33,20 +49,8 @@ from augmentation import apply_augmentation
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     tf.config.experimental.set_memory_growth(gpus[0], True)
-    print(f"Using GPU: {gpus[0].name}")
 else:
     print("No GPU found, using CPU")
-
-def log_memory_usage(prefix=""):
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    print(f"{prefix}Memory usage: RSS={mem_info.rss / 1024**2:.2f}MB, VMS={mem_info.vms / 1024**2:.2f}MB")
-    try:
-        result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
-                               capture_output=True, text=True, check=True)
-        print(f"{prefix}GPU memory used: {result.stdout.strip()} MiB")
-    except:
-        print(f"{prefix}Could not query GPU memory usage")
 
 class ProgressCallback(tf.keras.callbacks.Callback):
     def __init__(self, total_epochs, steps_per_epoch, validation_steps=None):
@@ -234,6 +238,33 @@ def create_cosine_decay_with_warmup(epochs, train_steps, batch_size, initial_lr=
             }
     return CustomLRSchedule()
 
+def _get_current_lr(optimizer):
+    """Helper function to get the current learning rate from different optimizer types."""
+    try:
+        # For Keras 3 optimizers with LearningRateSchedule
+        if hasattr(optimizer, 'learning_rate'):
+            lr = optimizer.learning_rate
+            if hasattr(lr, 'numpy'):
+                return float(lr.numpy())
+            elif callable(getattr(lr, '__call__', None)):
+                return float(lr(optimizer.iterations).numpy())
+            else:
+                return float(lr)
+        # For older optimizers
+        elif hasattr(optimizer, 'lr'):
+            lr = optimizer.lr
+            if hasattr(lr, 'numpy'):
+                return float(lr.numpy())
+            elif callable(getattr(lr, '__call__', None)):
+                return float(lr(optimizer.iterations).numpy())
+            else:
+                return float(lr)
+        else:
+            return 0.0
+    except Exception as e:
+        print(f"Error getting learning rate: {e}")
+        return 0.0
+
 def plot_training_curves(history, save_path='miou_curves.png'):
     if not history.history or not history.history.keys():
         print("Warning: Empty training history. Creating placeholder plot.")
@@ -286,39 +317,38 @@ def plot_training_curves(history, save_path='miou_curves.png'):
 
 def train_and_evaluate():
     NUM_CLASSES = 5
-    BATCH_SIZE = 6  # Reduced from 4 to 2 to lower memory consumption
+    BATCH_SIZE = 2  # Reduced batch size for memory efficiency with augmentations
     EPOCHS = 800
     LEARNING_RATE = 3e-5
     IMG_SIZE = (384, 384)
 
-    # Clear GPU memory
+    # Clear GPU memory before starting
     tf.keras.backend.clear_session()
     import gc
     gc.collect()
 
-    # Limit memory growth to avoid OOM
+    # Set GPU memory growth and optimization settings
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Set memory growth for GPUs")
+            print(f"Enabled memory growth for GPUs to prevent OOM errors")
         except RuntimeError as e:
             print(f"Error setting GPU memory growth: {e}")
 
+    # Set TensorFlow to use fewer threads to reduce memory pressure
     tf.config.threading.set_inter_op_parallelism_threads(2)
     tf.config.threading.set_intra_op_parallelism_threads(2)
-    print(f"Limited TensorFlow to 2 inter-op and 2 intra-op threads")
+    print(f"Limited TensorFlow to 2 threads per operation for better memory management")
 
     os.makedirs('checkpoints', exist_ok=True)
     latest_weights = 'checkpoints/segformer_b2_latest.weights.h5'
     initial_epoch = 0
 
     print("Loading datasets...")
-    log_memory_usage("Before dataset loading: ")
     train_ds, class_weights_dict, train_steps = load_dataset(data_dir='dataset', split='train', batch_size=BATCH_SIZE)
     test_ds, _, val_steps = load_dataset(data_dir='dataset', split='test', batch_size=BATCH_SIZE)
-    log_memory_usage("After dataset loading: ")
 
     # Debug dataset shapes
     for images, labels in train_ds.take(1):
@@ -328,22 +358,69 @@ def train_and_evaluate():
         print(f"Test batch - Images shape: {images.shape}, dtype: {images.dtype}")
         print(f"Test batch - Labels shape: {labels.shape}, dtype: {labels.dtype}")
 
-    print("SKIPPING advanced data augmentation to avoid memory issues...")
-    # Use original dataset without augmentation to avoid memory errors
-    augmented_train_ds = train_ds
-    log_memory_usage("After dataset setup: ")
+    colored_print("Applying advanced augmentation with explicit shape checking...", color=TermColors.YELLOW, bold=True)
+    augmented_train_ds = apply_augmentation(train_ds, batch_size=BATCH_SIZE)
+
+    # Debug dataset shapes
+    for images, labels in augmented_train_ds.take(1):
+        print(f"Augmented train batch - Images shape: {images.shape}, dtype: {images.dtype}")
+        print(f"Augmented train batch - Labels shape: {labels.shape}, dtype: {labels.dtype}")
+
+    # Add extra validation to ensure model compatibility
+    @tf.function
+    def ensure_shapes(images, labels):
+        """Ensure images and labels have correct shapes for model input."""
+        # Get rank and shape dynamically
+        images_rank = tf.rank(images)
+        labels_rank = tf.rank(labels)
+        images_shape = tf.shape(images)
+        labels_shape = tf.shape(labels)
+
+        # Define expected shape
+        expected_height = 384
+        expected_width = 384
+        expected_channels = 1
+
+        # Handle rank 4 or 5 tensors
+        def reshape_if_rank_5(tensor, tensor_name):
+            rank = tf.rank(tensor)
+            shape = tf.shape(tensor)
+            return tf.cond(
+                tf.equal(rank, 5),
+                lambda: tf.reshape(tensor, [shape[0] * shape[1], expected_height, expected_width, expected_channels]),
+                lambda: tensor
+            )
+
+        images = reshape_if_rank_5(images, "images")
+        labels = reshape_if_rank_5(labels, "labels")
+
+        # Verify rank 4 and channels
+        tf.assert_equal(tf.rank(images), 4, message="Images must be rank 4 after reshaping")
+        tf.assert_equal(tf.rank(labels), 4, message="Labels must be rank 4 after reshaping")
+        tf.assert_equal(images_shape[-1], expected_channels, message="Images must have 1 channel")
+        tf.assert_equal(labels_shape[-1], expected_channels, message="Labels must have 1 channel")
+
+        # Ensure height and width
+        tf.assert_equal(images_shape[1], expected_height, message="Images height must be 384")
+        tf.assert_equal(images_shape[2], expected_width, message="Images width must be 384")
+        tf.assert_equal(labels_shape[1], expected_height, message="Labels height must be 384")
+        tf.assert_equal(labels_shape[2], expected_width, message="Labels width must be 384")
+
+        return images, labels
+    # Apply shape validation to both datasets
+    augmented_train_ds = augmented_train_ds.map(ensure_shapes)
+    test_ds = test_ds.map(ensure_shapes)
 
     print(f"Dataset loaded. Training steps: {train_steps}, Validation steps: {val_steps}")
     if train_steps == 0 or val_steps == 0:
         raise ValueError("Empty dataset detected. Check data loading pipeline.")
 
-    pretrained_weights_path = 'segformer_b2_pretrain.h5'
+    pretrained_weights_path = 'pretrained_weights/segformer_b2_pretrain.weights.h5'
     use_pretrained = os.path.exists(pretrained_weights_path)
     print(f"Pre-trained weights {'found' if use_pretrained else 'not found'} at {pretrained_weights_path}")
 
     from model import OilSpillSegformer
     from loss import HybridSegmentationLoss
-    log_memory_usage("Before model creation: ")
     model = OilSpillSegformer(
         input_shape=(*IMG_SIZE, 1),
         num_classes=NUM_CLASSES,
@@ -351,7 +428,6 @@ def train_and_evaluate():
         use_cbam=False,  # Disable CBAM to reduce memory usage
         pretrained_weights=pretrained_weights_path if use_pretrained else None
     )
-    log_memory_usage("After model creation: ")
 
     if os.path.exists(latest_weights):
         print(f"Loading checkpoint from {latest_weights}...")
@@ -377,12 +453,83 @@ def train_and_evaluate():
         warmup_epochs=10
     )
 
-    optimizer = tf.keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=1e-4,
-        clipnorm=1.0,
-        epsilon=1e-8
-    )
+    # Check TensorFlow/Keras version and use appropriate optimizer
+    # Detect if we're using Keras 3 (which has built-in weight decay for Adam)
+    using_keras3 = hasattr(tf.keras, '__version__') and tf.keras.__version__.startswith('3')
+    print(f"Using Keras version: {tf.keras.__version__}")
+
+    # Create optimizer based on Keras version
+    if using_keras3:
+        # For Keras 3, use Adam with built-in weight decay parameter
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=lr_schedule,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7,  # Increased for better numerical stability
+            amsgrad=True,  # Enable AMSGrad for more stable training
+            weight_decay=1e-4,  # Built-in weight decay in Keras 3
+            clipnorm=1.0,  # Gradient clipping to prevent exploding gradients
+            name="adam_optimizer"
+        )
+        print("Using Keras 3 Adam optimizer with built-in weight decay")
+        use_weight_decay_callback = False
+    else:
+        # For older Keras versions, fall back to AdamW or Adam + custom weight decay callback
+        try:
+            optimizer = tf.keras.optimizers.AdamW(
+                learning_rate=lr_schedule,
+                weight_decay=1e-4,
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-7,
+                clipnorm=1.0
+            )
+            use_weight_decay_callback = False
+            print("Using AdamW optimizer")
+        except (ImportError, AttributeError):
+            # Fall back to standard Adam + weight decay callback
+            optimizer = tf.keras.optimizers.Adam(
+                learning_rate=lr_schedule,
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-7,
+                clipnorm=1.0
+            )
+            use_weight_decay_callback = True
+            print("Using Adam optimizer with weight decay callback")
+
+    # Keep the weight decay callback definition for compatibility with older Keras versions
+    weight_decay_rate = 1e-4
+
+    class WeightDecayCallback(tf.keras.callbacks.Callback):
+        def __init__(self, weight_decay=1e-4):
+            super().__init__()
+            self.weight_decay = weight_decay
+
+        def on_train_batch_begin(self, batch, logs=None):
+            # Apply weight decay to all trainable weights except biases and normalization layers
+            for var in self.model.trainable_weights:
+                # Skip biases, normalization layers, and embeddings
+                if (len(var.shape) <= 1 or
+                    'bias' in var.name or
+                    'gamma' in var.name or
+                    'beta' in var.name or
+                    'norm' in var.name.lower() or
+                    'embedding' in var.name.lower()):
+                    continue
+
+                # Get the current learning rate
+                lr = self.model.optimizer.lr
+                if hasattr(lr, '__call__'):
+                    lr = lr(self.model.optimizer.iterations)
+
+                # Apply weight decay using assign_sub
+                var.assign_sub(
+                    self.weight_decay * lr * var,
+                    use_locking=True
+                )
+
+    print(f"Using {'standard Adam with weight decay callback' if use_weight_decay_callback else 'AdamW optimizer'}")
 
     # Use the improved hybrid segmentation loss for better performance on oil spill detection
     class_weights_list = [class_weights_dict[i] for i in range(NUM_CLASSES)]
@@ -402,12 +549,11 @@ def train_and_evaluate():
         loss=loss_fn,
         metrics=[IoUMetric(num_classes=NUM_CLASSES)],
         run_eagerly=False,  # Disable eager execution for improved performance
-        jit_compile=False   # Disable XLA JIT compilation to avoid tensor shape issues
+        jit_compile=True    # Enable XLA JIT compilation for faster training now that loss function is compatible
     )
 
-    print("Model compiled with XLA JIT compilation disabled to avoid tensor shape errors")
+    print("Model compiled with XLA JIT compilation enabled for faster training with the XLA-compatible loss function")
     model.summary()
-    log_memory_usage("After model compilation: ")
 
     checkpoint_path = 'checkpoints/segformer_b2_best.weights.h5'
     callbacks = [
@@ -441,13 +587,17 @@ def train_and_evaluate():
         tf.keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: open('checkpoints/checkpoint_info.txt', 'w').write(str(epoch + 1))
         ),
+        # Learning rate reporting callback that works with Keras 3
         tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: print(f"Current learning rate: {float(model.optimizer.lr(tf.cast(model.optimizer.iterations, tf.float32)).numpy()):.2e}")
+            on_epoch_end=lambda epoch, logs: print(f"Current learning rate: {_get_current_lr(optimizer):.2e}")
         )
     ]
 
+    # Add weight decay callback if using standard Adam
+    if use_weight_decay_callback:
+        callbacks.append(WeightDecayCallback(weight_decay=weight_decay_rate))
+
     print(f"Starting SegFormer-B2 training for {EPOCHS} epochs from epoch {initial_epoch}...")
-    log_memory_usage("Before training: ")
     history = model.fit(
         augmented_train_ds,
         validation_data=test_ds,
@@ -483,7 +633,6 @@ def train_and_evaluate():
     for class_name, iou in class_iou.items():
         print(f"  {class_name}: {iou:.4f}")
 
-    log_memory_usage("After evaluation: ")
     return history
 
 if __name__ == "__main__":
@@ -491,7 +640,6 @@ if __name__ == "__main__":
     np.random.seed(42)
     print("____________________________________________________________________")
     print("Starting SegFormer-B2 training for oil spill detection...")
-    print("Model configuration: 384x384 input, ~13.7M parameters")
     history = train_and_evaluate()
     print("SegFormer-B2 training completed successfully")
     print("____________________________________________________________________")

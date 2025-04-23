@@ -340,6 +340,7 @@ class HybridSegmentationLoss(tf.keras.losses.Loss):
                  name="hybrid_segmentation_loss"):
         """
         Enhanced hybrid loss optimized for oil spill and ship detection.
+        XLA-compatible version with consistent tensor shapes.
 
         Args:
             class_weights: List of weights for each class
@@ -365,7 +366,10 @@ class HybridSegmentationLoss(tf.keras.losses.Loss):
         self.from_logits = from_logits
 
     def call(self, y_true, y_pred):
-        # Handle tensor shapes statically to avoid rank issues
+        # XLA-compatible implementation with consistent tensor ranks
+        compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+
+        # Convert logits to probabilities if needed
         if self.from_logits:
             probs = tf.nn.softmax(y_pred, axis=-1)
         else:
@@ -374,56 +378,65 @@ class HybridSegmentationLoss(tf.keras.losses.Loss):
         # Add epsilon for numerical stability
         probs = tf.clip_by_value(probs, self.epsilon, 1.0 - self.epsilon)
 
-        # Handle y_true by checking if it needs to be squeezed
-        y_true_squeezed = tf.cond(
-            tf.equal(tf.shape(y_true)[-1], 1),
-            lambda: tf.squeeze(y_true, axis=-1),
-            lambda: y_true
-        )
-
         # Get the number of classes from the prediction tensor
         num_classes = tf.shape(y_pred)[-1]
 
-        # Compute the cross-entropy loss
-        y_true_one_hot = tf.one_hot(tf.cast(y_true_squeezed, tf.int32), depth=num_classes)
+        # Ensure y_true has consistent shape - always use squeeze with a static dimension
+        # to avoid conditionals that create different tensor ranks
+        y_true_processed = tf.reshape(y_true, [-1, tf.shape(y_true)[1], tf.shape(y_true)[2]])
+
+        # Convert to one-hot with same rank as probs
+        y_true_one_hot = tf.one_hot(tf.cast(y_true_processed, tf.int32), depth=num_classes)
+
+        # Cross-entropy loss (shape-consistent)
         ce_loss = -tf.reduce_sum(y_true_one_hot * tf.math.log(probs), axis=-1)
 
-        # Apply class weights if provided
+        # Class weights with consistent shape handling
         if self.class_weights is not None:
-            class_weights_tensor = tf.constant(self.class_weights, dtype=tf.float32)
+            # Cast to compute dtype for mixed precision compatibility
+            class_weights_tensor = tf.cast(tf.constant(self.class_weights), compute_dtype)
+            # Create a per-pixel weight map (consistent shape)
             weights = tf.reduce_sum(y_true_one_hot * class_weights_tensor, axis=-1)
             ce_loss = ce_loss * weights
 
-        # Compute focal loss component if needed
+        # Focal loss component with consistent shapes
         if self.focal_weight > 0:
-            # Get the predicted probability for each true class
+            # Calculate per-pixel focal weights (same shape as ce_loss)
             true_class_probs = tf.reduce_sum(y_true_one_hot * probs, axis=-1)
-            # Calculate focal weight
             focal_weight = tf.pow(1.0 - true_class_probs, self.gamma)
             focal_loss = ce_loss * focal_weight
         else:
-            focal_loss = tf.zeros_like(ce_loss)
+            # Ensure consistent shape even when not used
+            focal_loss = ce_loss * 0
 
-        # Compute dice loss component if needed
+        # Dice loss component with consistent tensor ranks
         if self.dice_weight > 0:
-            # Calculate dice coefficient for each class
-            intersection = tf.reduce_sum(y_true_one_hot * probs, axis=[1, 2])
-            union = tf.reduce_sum(y_true_one_hot, axis=[1, 2]) + tf.reduce_sum(probs, axis=[1, 2])
+            # Flatten spatial dimensions for consistent handling
+            y_true_flat = tf.reshape(y_true_one_hot, [-1, tf.shape(y_true_one_hot)[1] * tf.shape(y_true_one_hot)[2], num_classes])
+            probs_flat = tf.reshape(probs, [-1, tf.shape(probs)[1] * tf.shape(probs)[2], num_classes])
 
-            # Calculate dice coefficient
-            dice = (2.0 * intersection + self.epsilon) / (union + self.epsilon)
+            # Calculate dice coefficient (consistent shape)
+            intersection = tf.reduce_sum(y_true_flat * probs_flat, axis=1)
+            sum_y_true = tf.reduce_sum(y_true_flat, axis=1)
+            sum_y_pred = tf.reduce_sum(probs_flat, axis=1)
 
-            # Apply class weights if provided
+            # Dice coefficient with epsilon for stability
+            dice = (2.0 * intersection + self.epsilon) / (sum_y_true + sum_y_pred + self.epsilon)
+
+            # Apply class weights if provided (consistent shape)
             if self.class_weights is not None:
-                class_weights_tensor = tf.constant(self.class_weights, dtype=tf.float32)
+                # Cast to compute dtype
+                class_weights_tensor = tf.cast(tf.constant(self.class_weights), compute_dtype)
+                # Apply class weights (same rank as dice)
                 dice = dice * class_weights_tensor
                 dice_loss = 1.0 - tf.reduce_sum(dice) / tf.reduce_sum(class_weights_tensor)
             else:
                 dice_loss = 1.0 - tf.reduce_mean(dice)
         else:
-            dice_loss = tf.constant(0.0)
+            # Use consistent scalar type even when not computing dice loss
+            dice_loss = tf.constant(0.0, dtype=compute_dtype)
 
-        # Combine all loss components
+        # Combine all loss components (maintain consistent dtype)
         total_loss = (
             self.ce_weight * tf.reduce_mean(ce_loss) +
             self.focal_weight * tf.reduce_mean(focal_loss) +

@@ -32,7 +32,6 @@ checkpoints/
 *.h5
 *.weights.h5
 pretrained_weights/
-segtransformer_b2.weights.h5
 
 # Keep README images
 !readme_images/*.png

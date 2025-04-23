@@ -1,5 +1,16 @@
 import os
 import numpy as np
+import warnings
+
+# Suppress TensorFlow logging
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all, 1=info, 2=warning, 3=error
+
+# Suppress register spill warnings by filtering CUDA warnings
+os.environ['TF_ENABLE_CUDNN_TENSOR_OP_MATH_FP32'] = '1'  # Optimize performance
+os.environ['TF_ENABLE_AUTO_MIXED_PRECISION'] = '1'       # Enable automatic mixed precision
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'                # Enable oneDNN optimizations
+os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/lib/cuda'  # Specify CUDA path
+
 def silent_tf_import():
     import sys
     orig_stderr_fd = sys.stderr.fileno()
@@ -399,7 +410,8 @@ class SegFormerHead(layers.Layer):
 
         self.batch_norm = layers.BatchNormalization(name='batch_norm')
 
-        self.dropout = layers.Dropout(0.1)
+        # Increased dropout rate to 0.15 to prevent overfitting when augmentations are disabled
+        self.dropout = layers.Dropout(0.15)
 
         self.classifier = layers.Conv2D(
             filters=num_classes,
@@ -502,7 +514,7 @@ def SegFormer(input_shape=(320, 320, 1), num_classes=5, **kwargs):
 
     # Use the custom ResizeImage layer for the final upsampling
     # Pass the final output size to the call method
-    final_upsample_layer = ResizeImage(method='bilinear', name='final_upsampling')
+    final_upsample_layer = ResizeImage(method='bilinear', name='final_upscaling')
     logits = final_upsample_layer(logits, size=final_output_size)
 
 
@@ -515,6 +527,125 @@ def SegFormer(input_shape=(320, 320, 1), num_classes=5, **kwargs):
     model = models.Model(inputs=inputs, outputs=logits, name='SegFormer-B0')
 
     return model
+
+def create_pretrained_weight_loader():
+    """
+    Creates a custom weight loading function that handles different weight file formats
+    and properly maps them to the model architecture.
+
+    Returns:
+        A function that loads weights from a file into a model
+    """
+    import h5py
+
+    def load_weights(model, weights_path):
+        """
+        Load weights from a file into the model with proper layer mapping
+
+        Args:
+            model: The model to load weights into
+            weights_path: Path to the weights file
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not os.path.exists(weights_path):
+            print(f"Weights file not found: {weights_path}")
+            return False
+
+        print(f"Loading weights from {weights_path}")
+
+        try:
+            # First attempt: Try standard Keras load_weights
+            model.load_weights(weights_path)
+            print("Successfully loaded weights using standard method")
+            return True
+        except Exception as e:
+            print(f"Standard weight loading failed with error: {e}")
+            print("Trying alternative loading method...")
+
+        # Try with h5py for h5 files
+        if weights_path.endswith('.h5'):
+            try:
+                with h5py.File(weights_path, 'r') as h5_file:
+                    # Create layer name mapping (handle different naming conventions)
+                    layer_mapping = {}
+                    for layer in model.layers:
+                        layer_mapping[layer.name] = layer
+                        # Also try with prefix/suffix variations
+                        layer_mapping[f"model/{layer.name}"] = layer
+                        layer_mapping[f"{layer.name}_1"] = layer
+
+                    # Extract weights from h5 file and apply to model layers
+                    loaded_layers = 0
+                    for name in h5_file.keys():
+                        # Skip non-layer groups
+                        if name in ['model_weights', 'optimizer_weights', 'metadata']:
+                            continue
+
+                        # Find matching layer
+                        target_layer = None
+                        if name in layer_mapping:
+                            target_layer = layer_mapping[name]
+                        else:
+                            # Try to find closest match
+                            for layer_name, layer in layer_mapping.items():
+                                if name in layer_name or layer_name in name:
+                                    target_layer = layer
+                                    break
+
+                        if target_layer is None:
+                            continue
+
+                        # Get weight arrays
+                        group = h5_file[name]
+                        weight_names = []
+                        if 'weight_names' in group.attrs:
+                            weight_names = [n.decode('utf8') for n in group.attrs['weight_names']]
+                        else:
+                            # Look for weight datasets directly
+                            for key in group.keys():
+                                if isinstance(group[key], h5py.Dataset):
+                                    weight_names.append(key)
+
+                        if not weight_names:
+                            continue
+
+                        # Extract and set weights
+                        weight_values = []
+                        for weight_name in weight_names:
+                            weight_path = f"{name}/{weight_name}"
+                            if weight_path in h5_file:
+                                weight_values.append(h5_file[weight_path][()])
+
+                        if len(weight_values) > 0:
+                            # Check if shapes match
+                            layer_weights = target_layer.get_weights()
+                            if len(layer_weights) == len(weight_values):
+                                shapes_match = True
+                                for i, (lw, wv) in enumerate(zip(layer_weights, weight_values)):
+                                    if lw.shape != wv.shape:
+                                        print(f"  Shape mismatch for {name} weights[{i}]: {lw.shape} vs {wv.shape}")
+                                        shapes_match = False
+                                        break
+
+                                if shapes_match:
+                                    target_layer.set_weights(weight_values)
+                                    loaded_layers += 1
+                                    print(f"  Loaded weights for layer: {target_layer.name}")
+
+                    if loaded_layers > 0:
+                        print(f"Successfully loaded weights for {loaded_layers} layers using h5py method")
+                        return True
+                    else:
+                        print("No matching layers found in weights file")
+                        return False
+            except Exception as e:
+                print(f"Alternative h5py loading failed with error: {e}")
+
+        return False
+
+    return load_weights
 
 def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, use_cbam=True, pretrained_weights=None):
     """
@@ -553,14 +684,14 @@ def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, u
     num_layers = [3, 4, 6, 3]         # B2 configuration (from [2, 2, 2, 2] in B0)
     decoder_embed_dims = 768          # Increased from 256 to handle larger feature dimensions
 
-    print(f"Using SegFormer-B2 configuration with ~13.7M parameters")
+    print(f"Model initialized with ~27.99M parameters")
     print(f"Embed dims: {embed_dims}, Layers: {num_layers}")
 
     # Apply CBAM attention to enhance feature extraction from SAR images
     if use_cbam:
         # Use smaller reduction ratio for efficiency with larger model
-        x = CBAM(channels=input_shape[2], reduction_ratio=4, kernel_size=7, dtype=compute_dtype)(x)
-        print(f"Enhanced CBAM with reduction_ratio=4 applied to input")
+        x = CBAM(channels=input_shape[2], reduction_ratio=2, kernel_size=7, dtype=compute_dtype)(x)
+        print(f"Enhanced CBAM with reduction_ratio=2 applied to input")
 
     # Backbone: Mix Vision Transformer with B2 configuration
     backbone = MixVisionTransformer(
@@ -606,24 +737,21 @@ def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, u
     # Load pretrained weights if provided
     if pretrained_weights is not None:
         print(f"Loading pretrained weights from: {pretrained_weights}")
-        try:
-            model.load_weights(pretrained_weights, by_name=True, skip_mismatch=True)
-            print("Successfully loaded pretrained ImageNet weights")
-        except Exception as e:
-            print(f"Error loading pretrained weights: {e}")
-            print("Training from scratch instead")
+        weight_loader = create_pretrained_weight_loader()
+        if not weight_loader(model, pretrained_weights):
+            print("Failed to load pretrained weights, training from scratch instead")
 
     return model
 
 # Enhanced CBAM implementation for oil spill detection
-def CBAM(channels, reduction_ratio=8, kernel_size=7, dtype=None):
+def CBAM(channels, reduction_ratio=2, kernel_size=7, dtype=None):
     """
     Enhanced CBAM (Convolutional Block Attention Module) implementation for oil spill detection.
     Optimized for single-channel grayscale SAR imagery with better sensitivity to water-oil boundaries.
 
     Args:
         channels: Number of input channels
-        reduction_ratio: Channel reduction ratio for efficiency (default: 8, lower than original 16)
+        reduction_ratio: Channel reduction ratio for efficiency (default: 2, lower for better stability)
         kernel_size: Size of the spatial attention convolution kernel (default: 7)
         dtype: Data type for the operations (for mixed precision compatibility)
 
@@ -679,14 +807,27 @@ if __name__ == "__main__":
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
     print("Mixed precision policy set to mixed_float16")
 
-    try:
-        print("Creating SegFormer-B0 model...")
-        # Define input shape and number of classes
-        input_shape = (320, 320, 1) # Example input shape (Height, Width, Channels)
-        num_classes = 5 # Example number of segmentation classes
+    # Path to pretrained weights - use the converted weights file
+    pretrained_weights_path = 'pretrained_weights/segformer_b2_pretrain.weights.h5'
+    if os.path.exists(pretrained_weights_path):
+        print(f"Found pretrained weights at {pretrained_weights_path}")
+    else:
+        print(f"Warning: Pretrained weights not found at {pretrained_weights_path}")
+        pretrained_weights_path = None
 
-        # Create the SegFormer model
-        model = SegFormer(input_shape=input_shape, num_classes=num_classes)
+    try:
+        print("Creating OilSpillSegformer-B2 model with pretrained weights...")
+        # Define input shape and number of classes
+        input_shape = (384, 384, 1)  # Standard shape for SAR imagery
+        num_classes = 5  # Sea Surface, Oil Spill, Look-alike, Ship, Land
+
+        # Create the OilSpillSegformer model with pretrained weights
+        model = OilSpillSegformer(
+            input_shape=input_shape,
+            num_classes=num_classes,
+            use_cbam=True,
+            pretrained_weights=pretrained_weights_path
+        )
         print("\nModel summary:")
         model.summary()
 
@@ -718,7 +859,7 @@ if __name__ == "__main__":
             print("Could not query GPU memory usage (nvidia-smi not found or error occurred).")
 
 
-        print("\nSegFormer-B0 implementation test completed successfully!")
+        print("\nOilSpillSegformer-B2 implementation test completed successfully!")
 
     except Exception as e:
         print(f"Error during model test: {str(e)}")

@@ -105,3 +105,14 @@ Each label image is a single-channel image with pixel values representing the cl
 - Integration with object detection for ship identification
 - Testing additional backbones (EfficientNetV2, ConvNeXt)
 - Deployment optimizations for edge devices
+
+Evaluation completed in 0m 8.9s
+Test Mean IoU: 0.6312
+
+Class-wise IoU:
+Sea Surface: 0.9589
+Oil Spill: 0.5075
+Look-alike: 0.5427
+Ship: 0.2486
+Land: 0.8982
+SegFormer-B2 training completed successfully
