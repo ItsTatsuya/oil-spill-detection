@@ -191,6 +191,62 @@ class IoUMetric(tf.keras.metrics.Metric):
         iou = tf.math.divide_no_nan(true_positives, denominator)
         return {self.class_names[i]: iou[i].numpy() for i in range(self.num_classes)}
 
+class ClassWiseIoUCallback(tf.keras.callbacks.Callback):
+    """
+    Custom callback to track class-wise IoU metrics during training.
+    This ensures the confusion matrix is properly accumulated for accurate class-wise IoU calculation.
+    """
+    def __init__(self, validation_data, steps, num_classes=5, class_names=None):
+        super().__init__()
+        self.validation_data = validation_data
+        self.steps = steps
+        self.num_classes = num_classes
+        self.class_names = class_names or ['Sea Surface', 'Oil Spill', 'Look-alike', 'Ship', 'Land']
+        # Create a dedicated IoU metric for this callback
+        self.iou_metric = IoUMetric(num_classes=num_classes)
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Reset the metric state at the start of each evaluation
+        self.iou_metric.reset_state()
+
+        # Process the validation dataset to fill the confusion matrix
+        for i, (images, labels) in enumerate(self.validation_data):
+            if i >= self.steps:
+                break
+
+            # Get predictions from the model
+            predictions = self.model(images, training=False)
+
+            # Update the IoU metric
+            self.iou_metric.update_state(labels, predictions)
+
+        # Calculate the overall IoU
+        mean_iou = self.iou_metric.result().numpy()
+
+        # Calculate class-wise IoUs
+        class_ious = self.iou_metric.get_class_iou()
+
+        # Print class-wise IoUs
+        print("\nClass-wise IoU for epoch {}:".format(epoch + 1))
+        for class_name, iou_val in class_ious.items():
+            print(f"  {class_name}: {iou_val:.4f}")
+
+        # Add to logs if needed (optional, for tensorboard)
+        if logs is not None:
+            for i, class_name in enumerate(self.class_names):
+                logs[f'val_iou_{class_name.replace(" ", "_").lower()}'] = class_ious[class_name]
+
+        # Save class-wise IoU to file
+        if not os.path.exists('logs/class_ious'):
+            os.makedirs('logs/class_ious')
+
+        # Save to CSV
+        with open(f'logs/class_ious/epoch_{epoch+1}_class_ious.csv', 'w') as f:
+            f.write("Class,IoU\n")
+            for class_name, iou_val in class_ious.items():
+                f.write(f"{class_name},{iou_val}\n")
+            f.write(f"Mean,{mean_iou}\n")
+
 def create_cosine_decay_with_warmup(epochs, train_steps, batch_size, initial_lr=3e-5, warmup_epochs=10):
     total_steps = epochs * train_steps
     warmup_steps = warmup_epochs * train_steps
@@ -318,7 +374,7 @@ def plot_training_curves(history, save_path='miou_curves.png'):
 def train_and_evaluate():
     NUM_CLASSES = 5
     BATCH_SIZE = 2  # Reduced batch size for memory efficiency with augmentations
-    EPOCHS = 800
+    EPOCHS = 2
     LEARNING_RATE = 3e-5
     IMG_SIZE = (384, 384)
 
@@ -415,36 +471,69 @@ def train_and_evaluate():
     if train_steps == 0 or val_steps == 0:
         raise ValueError("Empty dataset detected. Check data loading pipeline.")
 
+    # Determine pretrained weights path
     pretrained_weights_path = 'pretrained_weights/segformer_b2_pretrain.weights.h5'
-    use_pretrained = os.path.exists(pretrained_weights_path)
-    print(f"Pre-trained weights {'found' if use_pretrained else 'not found'} at {pretrained_weights_path}")
+    checkpoint_weights_path = latest_weights if os.path.exists(latest_weights) else None
 
+    # Import the model and weight loader
     from model import OilSpillSegformer
+    from improved_converter import create_improved_weight_mapper
     from loss import HybridSegmentationLoss
+
+    # Create the model without specifying pretrained weights initially
+    colored_print("Creating OilSpillSegformer model...", color=TermColors.CYAN, bold=True)
     model = OilSpillSegformer(
         input_shape=(*IMG_SIZE, 1),
         num_classes=NUM_CLASSES,
         drop_rate=0.1,
         use_cbam=False,  # Disable CBAM to reduce memory usage
-        pretrained_weights=pretrained_weights_path if use_pretrained else None
+        pretrained_weights=None  # Don't load weights yet
     )
 
-    if os.path.exists(latest_weights):
-        print(f"Loading checkpoint from {latest_weights}...")
-        try:
-            model.load_weights(latest_weights, by_name=True, skip_mismatch=True)
+    # Get the improved weight loader function - this is our enhanced loader from improved_converter.py
+    weight_loader = create_improved_weight_mapper()
+
+    # First check if we can resume from checkpoint
+    if checkpoint_weights_path:
+        colored_print(f"Attempting to load checkpoint weights from {checkpoint_weights_path}...",
+                     color=TermColors.CYAN, bold=True)
+
+        success = weight_loader(model, checkpoint_weights_path)
+        if success:
+            # Get the initial epoch if checkpoint info exists
             checkpoint_info_path = 'checkpoints/checkpoint_info.txt'
             if os.path.exists(checkpoint_info_path):
                 with open(checkpoint_info_path, 'r') as f:
                     initial_epoch = int(f.read().strip())
-                print(f"Resuming from epoch {initial_epoch}")
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            print("Continuing with pre-trained weights or from scratch")
-            initial_epoch = 0
-    else:
-        print("No checkpoint found. Using pre-trained weights or training from scratch.")
+                colored_print(f"Successfully resumed from epoch {initial_epoch}",
+                             color=TermColors.GREEN, bold=True)
+        else:
+            colored_print(f"Failed to load checkpoint weights. Will try pretrained weights.",
+                         color=TermColors.YELLOW, bold=True)
+            # Reset the model since weight loading may have partially succeeded
+            tf.keras.backend.clear_session()
+            model = OilSpillSegformer(
+                input_shape=(*IMG_SIZE, 1),
+                num_classes=NUM_CLASSES,
+                drop_rate=0.1,
+                use_cbam=False,
+                pretrained_weights=None
+            )
 
+    # If we're starting from epoch 0 (not resuming), try using pretrained weights
+    if initial_epoch == 0 and os.path.exists(pretrained_weights_path):
+        colored_print(f"Loading pretrained weights from {pretrained_weights_path}...",
+                     color=TermColors.CYAN, bold=True)
+
+        success = weight_loader(model, pretrained_weights_path)
+        if success:
+            colored_print("Successfully loaded pretrained weights",
+                         color=TermColors.GREEN, bold=True)
+        else:
+            colored_print("Failed to load pretrained weights. Training from scratch.",
+                         color=TermColors.YELLOW, bold=True)
+
+    # Set up the learning rate schedule and optimizer
     lr_schedule = create_cosine_decay_with_warmup(
         epochs=EPOCHS,
         train_steps=train_steps,
@@ -453,185 +542,145 @@ def train_and_evaluate():
         warmup_epochs=10
     )
 
-    # Check TensorFlow/Keras version and use appropriate optimizer
-    # Detect if we're using Keras 3 (which has built-in weight decay for Adam)
-    using_keras3 = hasattr(tf.keras, '__version__') and tf.keras.__version__.startswith('3')
-    print(f"Using Keras version: {tf.keras.__version__}")
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
-    # Create optimizer based on Keras version
-    if using_keras3:
-        # For Keras 3, use Adam with built-in weight decay parameter
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=lr_schedule,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-7,  # Increased for better numerical stability
-            amsgrad=True,  # Enable AMSGrad for more stable training
-            weight_decay=1e-4,  # Built-in weight decay in Keras 3
-            clipnorm=1.0,  # Gradient clipping to prevent exploding gradients
-            name="adam_optimizer"
-        )
-        print("Using Keras 3 Adam optimizer with built-in weight decay")
-        use_weight_decay_callback = False
-    else:
-        # For older Keras versions, fall back to AdamW or Adam + custom weight decay callback
-        try:
-            optimizer = tf.keras.optimizers.AdamW(
-                learning_rate=lr_schedule,
-                weight_decay=1e-4,
-                beta_1=0.9,
-                beta_2=0.999,
-                epsilon=1e-7,
-                clipnorm=1.0
-            )
-            use_weight_decay_callback = False
-            print("Using AdamW optimizer")
-        except (ImportError, AttributeError):
-            # Fall back to standard Adam + weight decay callback
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=lr_schedule,
-                beta_1=0.9,
-                beta_2=0.999,
-                epsilon=1e-7,
-                clipnorm=1.0
-            )
-            use_weight_decay_callback = True
-            print("Using Adam optimizer with weight decay callback")
-
-    # Keep the weight decay callback definition for compatibility with older Keras versions
-    weight_decay_rate = 1e-4
-
-    class WeightDecayCallback(tf.keras.callbacks.Callback):
-        def __init__(self, weight_decay=1e-4):
-            super().__init__()
-            self.weight_decay = weight_decay
-
-        def on_train_batch_begin(self, batch, logs=None):
-            # Apply weight decay to all trainable weights except biases and normalization layers
-            for var in self.model.trainable_weights:
-                # Skip biases, normalization layers, and embeddings
-                if (len(var.shape) <= 1 or
-                    'bias' in var.name or
-                    'gamma' in var.name or
-                    'beta' in var.name or
-                    'norm' in var.name.lower() or
-                    'embedding' in var.name.lower()):
-                    continue
-
-                # Get the current learning rate
-                lr = self.model.optimizer.lr
-                if hasattr(lr, '__call__'):
-                    lr = lr(self.model.optimizer.iterations)
-
-                # Apply weight decay using assign_sub
-                var.assign_sub(
-                    self.weight_decay * lr * var,
-                    use_locking=True
-                )
-
-    print(f"Using {'standard Adam with weight decay callback' if use_weight_decay_callback else 'AdamW optimizer'}")
-
-    # Use the improved hybrid segmentation loss for better performance on oil spill detection
-    class_weights_list = [class_weights_dict[i] for i in range(NUM_CLASSES)]
+    # Set up the loss function
     loss_fn = HybridSegmentationLoss(
-        class_weights=class_weights_list,
-        ce_weight=0.4,
-        focal_weight=0.3,
-        dice_weight=0.3,
-        boundary_weight=0.0,  # Temporarily disabled until we can fix the boundary loss component
-        gamma=3.0,
+        class_weights=class_weights_dict,
+        ce_weight=0.4,     # Cross-entropy weight (equivalent to alpha)
+        focal_weight=0.3,  # Focal loss weight (equivalent to beta)
+        dice_weight=0.3,   # Dice loss weight
         from_logits=True
     )
-    print("Using fixed HybridSegmentationLoss for better oil spill and ship detection")
 
+    # Compile the model with optimized settings for SAR imagery
+    colored_print("Compiling model with HybridSegmentationLoss...", color=TermColors.CYAN, bold=True)
     model.compile(
         optimizer=optimizer,
         loss=loss_fn,
-        metrics=[IoUMetric(num_classes=NUM_CLASSES)],
-        run_eagerly=False,  # Disable eager execution for improved performance
-        jit_compile=True    # Enable XLA JIT compilation for faster training now that loss function is compatible
+        metrics=[IoUMetric(num_classes=NUM_CLASSES)]
     )
 
-    print("Model compiled with XLA JIT compilation enabled for faster training with the XLA-compatible loss function")
-    model.summary()
+    # Set up callbacks for training
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = os.path.join("logs", "fit", f"segformer_b2_{timestamp}")
+    os.makedirs(log_dir, exist_ok=True)
 
-    checkpoint_path = 'checkpoints/segformer_b2_best.weights.h5'
+    # Instantiate the ClassWiseIoUCallback so we can access it later
+    class_iou_callback = ClassWiseIoUCallback(
+        validation_data=test_ds,
+        steps=val_steps,
+        num_classes=NUM_CLASSES
+    )
+
     callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=checkpoint_path,
-            monitor='val_iou_metric',
-            save_best_only=True,
-            save_weights_only=True,
-            mode='max',
-            verbose=1
+        tf.keras.callbacks.TensorBoard(
+            log_dir=log_dir,
+            histogram_freq=1,
+            update_freq='epoch'
         ),
         tf.keras.callbacks.ModelCheckpoint(
             filepath=latest_weights,
             save_weights_only=True,
-            save_best_only=False,
-            save_freq='epoch',
+            save_best_only=True,
+            monitor='val_iou_metric',
+            mode='max',
             verbose=1
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor='val_iou_metric',
-            patience=100,
+            patience=30,
+            verbose=1,
             mode='max',
-            restore_best_weights=True,
-            verbose=1
+            restore_best_weights=True
         ),
-        tf.keras.callbacks.TensorBoard(
-            log_dir='./logs/fit/segformer_b2_' + datetime.now().strftime("%Y%m%d-%H%M%S"),
-            update_freq='epoch'
+        ProgressCallback(
+            total_epochs=EPOCHS,
+            steps_per_epoch=train_steps,
+            validation_steps=val_steps
         ),
-        ProgressCallback(total_epochs=EPOCHS, steps_per_epoch=train_steps, validation_steps=val_steps),
-        tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: open('checkpoints/checkpoint_info.txt', 'w').write(str(epoch + 1))
-        ),
-        # Learning rate reporting callback that works with Keras 3
-        tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: print(f"Current learning rate: {_get_current_lr(optimizer):.2e}")
-        )
+        class_iou_callback  # Add the instance to the list
     ]
 
-    # Add weight decay callback if using standard Adam
-    if use_weight_decay_callback:
-        callbacks.append(WeightDecayCallback(weight_decay=weight_decay_rate))
-
-    print(f"Starting SegFormer-B2 training for {EPOCHS} epochs from epoch {initial_epoch}...")
+    # Train the model
+    colored_print(f"Starting model training for {EPOCHS} epochs from epoch {initial_epoch}...",
+                 color=TermColors.GREEN, bold=True)
     history = model.fit(
         augmented_train_ds,
-        validation_data=test_ds,
         epochs=EPOCHS,
+        initial_epoch=initial_epoch,
+        steps_per_epoch=train_steps,
+        validation_data=test_ds,
+        validation_steps=val_steps,
         callbacks=callbacks,
-        verbose=0,
-        initial_epoch=initial_epoch
+        verbose=0  # Let our custom callback handle the outputs
     )
 
-    final_weights_path = 'segformer_b2_final.weights.h5'
-    model.save_weights(final_weights_path)
-    print(f"Model weights saved as '{final_weights_path}'")
+    # Save training curves
+    plot_training_curves(history, save_path=f'logs/fit/segformer_b2_{timestamp}/training_curves.png')
 
-    plot_training_curves(history, save_path='segformer_b2_miou_curves.png')
+    # Save the final epoch number for resuming later
+    with open('checkpoints/checkpoint_info.txt', 'w') as f:
+        f.write(str(initial_epoch + len(history.history.get('loss', []))))
 
-    print("\nEvaluating with multi-scale prediction...")
-    eval_batch_size = 2
-    multi_scale_predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=eval_batch_size)
-    test_metric = IoUMetric(num_classes=NUM_CLASSES)
-    eval_start_time = time.time()
+    # Evaluate the model on validation set
+    colored_print("Evaluating final model performance...", color=TermColors.CYAN, bold=True)
 
-    for images, labels in tqdm(test_ds, desc="Evaluating"):
-        predictions = multi_scale_predictor.predict(images)
-        test_metric.update_state(labels, predictions)
+    # Run model.evaluate to get the standard final loss and mean IoU reported by Keras
+    results = model.evaluate(test_ds, steps=val_steps, verbose=1)
+    loss, mean_iou_keras = results  # Get loss and mean IoU from Keras evaluation
+    colored_print(f"Final Keras Metrics - Loss: {loss:.4f}, Mean IoU: {mean_iou_keras:.4f}",
+                 color=TermColors.GREEN, bold=True)
 
-    eval_time = time.time() - eval_start_time
-    minutes, seconds = divmod(eval_time, 60)
-    print(f"\nEvaluation completed in {int(minutes)}m {seconds:.1f}s")
-    mean_iou = test_metric.result().numpy()
-    print(f"Test Mean IoU: {mean_iou:.4f}")
-    class_iou = test_metric.get_class_iou()
-    print("\nClass-wise IoU:")
-    for class_name, iou in class_iou.items():
-        print(f"  {class_name}: {iou:.4f}")
+    # Get the final class-wise IoU results directly from the callback's metric instance
+    # This uses the confusion matrix accumulated by the callback during the last epoch's evaluation
+    colored_print("Final Class-wise IoU (from callback):", color=TermColors.CYAN, bold=True)
+    try:
+        # Access the iou_metric instance within the callback
+        final_class_ious = class_iou_callback.iou_metric.get_class_iou()
+        final_mean_iou_callback = class_iou_callback.iou_metric.result().numpy()
+
+        for class_name, iou_val in final_class_ious.items():
+            print(f"  {class_name}: {iou_val:.4f}")
+        print(f"  Mean IoU (Callback): {final_mean_iou_callback:.4f}")
+
+        # Save the final class IoUs to a file
+        if not os.path.exists('logs/class_ious'):
+            os.makedirs('logs/class_ious')
+
+        with open(f'logs/class_ious/final_class_ious.csv', 'w') as f:
+            f.write("Class,IoU\n")
+            for class_name, iou_val in final_class_ious.items():
+                f.write(f"{class_name},{iou_val}\n")
+            f.write(f"Mean,{final_mean_iou_callback}\n")
+        colored_print("Final class-wise IoU saved to logs/class_ious/final_class_ious.csv",
+                     color=TermColors.GREEN)
+
+    except Exception as e:
+        colored_print(f"Could not retrieve final class-wise IoU from callback: {e}",
+                     color=TermColors.RED, bold=True)
+        # Fallback: Try getting from model.metrics again, though likely won't work well
+        iou_metric_keras = None
+        for metric in model.metrics:
+            if isinstance(metric, IoUMetric):
+                iou_metric_keras = metric
+                break
+        if iou_metric_keras:
+            try:
+                class_ious_keras = iou_metric_keras.get_class_iou()
+                colored_print("Class-wise IoU (from Keras metric - may be inaccurate):", color=TermColors.YELLOW, bold=True)
+                for class_name, iou_val in class_ious_keras.items():
+                    print(f"  {class_name}: {iou_val:.4f}")
+            except Exception as inner_e:
+                colored_print(f"Could not retrieve class-wise IoU from Keras metric either: {inner_e}",
+                             color=TermColors.RED, bold=True)
+        else:
+            colored_print("IoUMetric not found in model.metrics.", color=TermColors.RED, bold=True)
+
+    # Save the final model
+    model.save_weights('checkpoints/segformer_b2_final.weights.h5')
+    colored_print("Training complete. Final weights saved to checkpoints/segformer_b2_final.weights.h5",
+                 color=TermColors.GREEN, bold=True)
 
     return history
 

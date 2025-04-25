@@ -343,7 +343,7 @@ class HybridSegmentationLoss(tf.keras.losses.Loss):
         XLA-compatible version with consistent tensor shapes.
 
         Args:
-            class_weights: List of weights for each class
+            class_weights: List of weights for each class or dictionary {class_idx: weight}
             ce_weight: Weight for cross-entropy component
             focal_weight: Weight for focal loss component
             dice_weight: Weight for dice loss component
@@ -355,7 +355,20 @@ class HybridSegmentationLoss(tf.keras.losses.Loss):
             name: Name of the loss function
         """
         super().__init__(name=name)
-        self.class_weights = class_weights
+
+        # Convert class weights dictionary to list if needed
+        if class_weights is not None and isinstance(class_weights, dict):
+            # Find the highest class index
+            max_class = max(class_weights.keys())
+            # Initialize weights list with zeros
+            weights_list = [0.0] * (max_class + 1)
+            # Fill in weights from dictionary
+            for class_idx, weight in class_weights.items():
+                weights_list[class_idx] = weight
+            self.class_weights = weights_list
+        else:
+            self.class_weights = class_weights
+
         self.ce_weight = ce_weight
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
