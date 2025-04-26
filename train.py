@@ -1,6 +1,8 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import glob
+import shutil # Import shutil for file copying
 from tqdm import tqdm
 from datetime import datetime
 import time
@@ -24,7 +26,6 @@ def colored_print(text, color=TermColors.BLUE, bold=False):
     print(f"{prefix}{color}{text}{TermColors.ENDC}")
 
 def silent_tf_import():
-    import sys
     orig_stderr_fd = sys.stderr.fileno()
     saved_stderr_fd = os.dup(orig_stderr_fd)
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -371,10 +372,151 @@ def plot_training_curves(history, save_path='miou_curves.png'):
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Training curves saved to {save_path}")
 
+def save_checkpoint(model, epoch, is_best=False):
+    """
+    Save simplified checkpoint: latest weights, best weights, and epoch number.
+
+    Args:
+        model: The Keras model to save weights from.
+        epoch: Current epoch number (1-indexed).
+        is_best: Whether this is the best model so far (based on validation metric).
+    """
+    # Ensure the main checkpoints directory exists
+    os.makedirs('checkpoints', exist_ok=True)
+
+    # 1. Save latest weights directly to the root checkpoints directory
+    latest_weights_path = 'checkpoints/segformer_b2_latest.weights.h5'
+    model.save_weights(latest_weights_path)
+
+    # 2. If this is the best model, save weights to the best path
+    if is_best:
+        best_weights_path = 'checkpoints/segformer_b2_best.weights.h5'
+        model.save_weights(best_weights_path)
+
+    # 3. Save only the epoch number to checkpoint_info.txt
+    try:
+        with open('checkpoints/checkpoint_info.txt', 'w') as f:
+            f.write(str(epoch))
+    except Exception as e:
+        colored_print(f"Warning: Failed to save epoch number: {e}", color=TermColors.YELLOW, bold=True)
+
+    return latest_weights_path # Return the path to the latest saved weights file
+
+def load_checkpoint(model, optimizer=None, checkpoint_path=None):
+    """
+    Load a saved checkpoint (weights only) and epoch number.
+    Optimizer state is no longer loaded.
+
+    Args:
+        model: The Keras model to load weights into.
+        optimizer: No longer used, kept for compatibility.
+        checkpoint_path: Path to the checkpoint weights file (if None, will use latest).
+
+    Returns:
+        tuple: (success, initial_epoch, history={})
+    """
+    if checkpoint_path is None or not os.path.exists(checkpoint_path):
+        # Try the conventional location
+        checkpoint_path = 'checkpoints/segformer_b2_latest.weights.h5'
+        if not os.path.exists(checkpoint_path):
+            # Try the best model
+            checkpoint_path = 'checkpoints/segformer_b2_best.weights.h5'
+            if not os.path.exists(checkpoint_path):
+                colored_print("No checkpoint found", color=TermColors.YELLOW, bold=True)
+                return False, 0, {}
+
+    # Get the weight loader function from improved_converter
+    from improved_converter import create_improved_weight_mapper
+    weight_loader = create_improved_weight_mapper()
+
+    # Load the model weights
+    colored_print(f"Loading checkpoint weights from {checkpoint_path}", color=TermColors.CYAN, bold=True)
+    success = weight_loader(model, checkpoint_path)
+
+    if not success:
+        colored_print(f"Failed to load checkpoint weights", color=TermColors.RED, bold=True)
+        return False, 0, {}
+
+    # Load only the epoch number from checkpoint_info.txt
+    epoch = 0
+    history = {} # Return empty history as it's no longer saved
+    info_path = 'checkpoints/checkpoint_info.txt'
+    if os.path.exists(info_path):
+        try:
+            with open(info_path, 'r') as f:
+                epoch = int(f.read().strip())
+        except Exception as e:
+            colored_print(f"Warning: Failed to parse epoch from {info_path}: {e}", color=TermColors.YELLOW, bold=True)
+            epoch = 0 # Reset to 0 if parsing fails
+
+    colored_print(f"Successfully loaded checkpoint weights. Resuming from epoch {epoch}", color=TermColors.GREEN, bold=True)
+    return True, epoch, history
+
+class ModelCheckpointWithHistory(tf.keras.callbacks.Callback):
+    """Custom ModelCheckpoint callback that saves comprehensive checkpoints including history."""
+
+    def __init__(self, timestamp, monitor='val_loss', mode='min', verbose=0, save_freq='epoch'):
+        super().__init__()
+        self.timestamp = timestamp
+        self.monitor = monitor
+        self.verbose = verbose
+        self.save_freq = save_freq
+        self.best_value = float('inf') if mode == 'min' else -float('inf')
+        self.mode = mode
+        self.epochs_since_improvement = 0
+        self.max_patience = 30  # Match early stopping patience
+
+    def on_epoch_end(self, epoch, logs=None):
+        if self.save_freq != 'epoch':
+            return
+
+        logs = logs or {}
+        current_value = logs.get(self.monitor)
+
+        if current_value is None:
+            if self.verbose > 0:
+                colored_print(f"Warning: Metric '{self.monitor}' not found in logs",
+                             color=TermColors.YELLOW)
+            return
+
+        is_improvement = False
+        if self.mode == 'min' and current_value < self.best_value:
+            self.best_value = current_value
+            is_improvement = True
+        elif self.mode == 'max' and current_value > self.best_value:
+            self.best_value = current_value
+            is_improvement = True
+
+        # Update patience counter
+        if is_improvement:
+            self.epochs_since_improvement = 0
+        else:
+            self.epochs_since_improvement += 1
+
+        # Calculate metrics for checkpoint
+        metrics = {key: float(value) for key, value in logs.items()}
+
+        # Save checkpoint
+        weights_path = save_checkpoint(
+            model=self.model,
+            epoch=epoch + 1,  # epoch is 0-indexed, but we store as 1-indexed
+            is_best=is_improvement
+        )
+
+        if self.verbose > 0:
+            if is_improvement:
+                colored_print(f"Epoch {epoch+1}: {self.monitor} improved to {current_value:.4f}, saving model to {weights_path}",
+                            color=TermColors.GREEN)
+            else:
+                msg = f"Epoch {epoch+1}: {self.monitor} did not improve from {self.best_value:.4f}"
+                if self.epochs_since_improvement > 0:
+                    msg += f" (no improvement for {self.epochs_since_improvement} epochs)"
+                colored_print(msg, color=TermColors.YELLOW)
+
 def train_and_evaluate():
     NUM_CLASSES = 5
     BATCH_SIZE = 2  # Reduced batch size for memory efficiency with augmentations
-    EPOCHS = 2
+    EPOCHS = 600
     LEARNING_RATE = 3e-5
     IMG_SIZE = (384, 384)
 
@@ -415,57 +557,21 @@ def train_and_evaluate():
         print(f"Test batch - Labels shape: {labels.shape}, dtype: {labels.dtype}")
 
     colored_print("Applying advanced augmentation with explicit shape checking...", color=TermColors.YELLOW, bold=True)
-    augmented_train_ds = apply_augmentation(train_ds, batch_size=BATCH_SIZE)
+    augmented_train_ds = apply_augmentation(train_ds, batch_size=BATCH_SIZE, cutmix_prob=0.3)
 
-    # Debug dataset shapes
+    # Debug dataset shapes after augmentation
     for images, labels in augmented_train_ds.take(1):
         print(f"Augmented train batch - Images shape: {images.shape}, dtype: {images.dtype}")
         print(f"Augmented train batch - Labels shape: {labels.shape}, dtype: {labels.dtype}")
 
-    # Add extra validation to ensure model compatibility
+    # Ensure shapes are valid for training
     @tf.function
     def ensure_shapes(images, labels):
-        """Ensure images and labels have correct shapes for model input."""
-        # Get rank and shape dynamically
-        images_rank = tf.rank(images)
-        labels_rank = tf.rank(labels)
-        images_shape = tf.shape(images)
-        labels_shape = tf.shape(labels)
-
-        # Define expected shape
-        expected_height = 384
-        expected_width = 384
-        expected_channels = 1
-
-        # Handle rank 4 or 5 tensors
-        def reshape_if_rank_5(tensor, tensor_name):
-            rank = tf.rank(tensor)
-            shape = tf.shape(tensor)
-            return tf.cond(
-                tf.equal(rank, 5),
-                lambda: tf.reshape(tensor, [shape[0] * shape[1], expected_height, expected_width, expected_channels]),
-                lambda: tensor
-            )
-
-        images = reshape_if_rank_5(images, "images")
-        labels = reshape_if_rank_5(labels, "labels")
-
-        # Verify rank 4 and channels
-        tf.assert_equal(tf.rank(images), 4, message="Images must be rank 4 after reshaping")
-        tf.assert_equal(tf.rank(labels), 4, message="Labels must be rank 4 after reshaping")
-        tf.assert_equal(images_shape[-1], expected_channels, message="Images must have 1 channel")
-        tf.assert_equal(labels_shape[-1], expected_channels, message="Labels must have 1 channel")
-
-        # Ensure height and width
-        tf.assert_equal(images_shape[1], expected_height, message="Images height must be 384")
-        tf.assert_equal(images_shape[2], expected_width, message="Images width must be 384")
-        tf.assert_equal(labels_shape[1], expected_height, message="Labels height must be 384")
-        tf.assert_equal(labels_shape[2], expected_width, message="Labels width must be 384")
-
+        images = tf.ensure_shape(images, [None, 384, 384, 1])
+        labels = tf.ensure_shape(labels, [None, 384, 384, 1])
         return images, labels
-    # Apply shape validation to both datasets
-    augmented_train_ds = augmented_train_ds.map(ensure_shapes)
-    test_ds = test_ds.map(ensure_shapes)
+
+    augmented_train_ds = augmented_train_ds.map(ensure_shapes, num_parallel_calls=tf.data.AUTOTUNE)
 
     print(f"Dataset loaded. Training steps: {train_steps}, Validation steps: {val_steps}")
     if train_steps == 0 or val_steps == 0:
@@ -490,49 +596,6 @@ def train_and_evaluate():
         pretrained_weights=None  # Don't load weights yet
     )
 
-    # Get the improved weight loader function - this is our enhanced loader from improved_converter.py
-    weight_loader = create_improved_weight_mapper()
-
-    # First check if we can resume from checkpoint
-    if checkpoint_weights_path:
-        colored_print(f"Attempting to load checkpoint weights from {checkpoint_weights_path}...",
-                     color=TermColors.CYAN, bold=True)
-
-        success = weight_loader(model, checkpoint_weights_path)
-        if success:
-            # Get the initial epoch if checkpoint info exists
-            checkpoint_info_path = 'checkpoints/checkpoint_info.txt'
-            if os.path.exists(checkpoint_info_path):
-                with open(checkpoint_info_path, 'r') as f:
-                    initial_epoch = int(f.read().strip())
-                colored_print(f"Successfully resumed from epoch {initial_epoch}",
-                             color=TermColors.GREEN, bold=True)
-        else:
-            colored_print(f"Failed to load checkpoint weights. Will try pretrained weights.",
-                         color=TermColors.YELLOW, bold=True)
-            # Reset the model since weight loading may have partially succeeded
-            tf.keras.backend.clear_session()
-            model = OilSpillSegformer(
-                input_shape=(*IMG_SIZE, 1),
-                num_classes=NUM_CLASSES,
-                drop_rate=0.1,
-                use_cbam=False,
-                pretrained_weights=None
-            )
-
-    # If we're starting from epoch 0 (not resuming), try using pretrained weights
-    if initial_epoch == 0 and os.path.exists(pretrained_weights_path):
-        colored_print(f"Loading pretrained weights from {pretrained_weights_path}...",
-                     color=TermColors.CYAN, bold=True)
-
-        success = weight_loader(model, pretrained_weights_path)
-        if success:
-            colored_print("Successfully loaded pretrained weights",
-                         color=TermColors.GREEN, bold=True)
-        else:
-            colored_print("Failed to load pretrained weights. Training from scratch.",
-                         color=TermColors.YELLOW, bold=True)
-
     # Set up the learning rate schedule and optimizer
     lr_schedule = create_cosine_decay_with_warmup(
         epochs=EPOCHS,
@@ -543,6 +606,40 @@ def train_and_evaluate():
     )
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    # Try to load checkpoint using the improved loader
+    checkpoint_path = latest_weights if os.path.exists(latest_weights) else None
+    if checkpoint_path:
+        colored_print(f"Attempting to load checkpoint from {checkpoint_path}...",
+                     color=TermColors.CYAN, bold=True)
+        success, initial_epoch, checkpoint_history = load_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=checkpoint_path
+        )
+
+        if not success and os.path.exists(pretrained_weights_path):
+            colored_print(f"Failed to load checkpoint. Trying pretrained weights instead...",
+                         color=TermColors.YELLOW, bold=True)
+            from improved_converter import create_improved_weight_mapper
+            weight_loader = create_improved_weight_mapper()
+            success = weight_loader(model, pretrained_weights_path)
+            if success:
+                colored_print("Successfully loaded pretrained weights",
+                             color=TermColors.GREEN, bold=True)
+    elif os.path.exists(pretrained_weights_path):
+        # If no checkpoint but pretrained weights exist, use those
+        colored_print(f"No checkpoints found. Loading pretrained weights...",
+                     color=TermColors.CYAN, bold=True)
+        from improved_converter import create_improved_weight_mapper
+        weight_loader = create_improved_weight_mapper()
+        success = weight_loader(model, pretrained_weights_path)
+        if success:
+            colored_print("Successfully loaded pretrained weights",
+                         color=TermColors.GREEN, bold=True)
+        else:
+            colored_print("Failed to load pretrained weights. Training from scratch.",
+                         color=TermColors.YELLOW, bold=True)
 
     # Set up the loss function
     loss_fn = HybridSegmentationLoss(
@@ -579,13 +676,12 @@ def train_and_evaluate():
             histogram_freq=1,
             update_freq='epoch'
         ),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=latest_weights,
-            save_weights_only=True,
-            save_best_only=True,
+        ModelCheckpointWithHistory(
+            timestamp=timestamp,
             monitor='val_iou_metric',
             mode='max',
-            verbose=1
+            verbose=1,
+            save_freq='epoch'
         ),
         tf.keras.callbacks.EarlyStopping(
             monitor='val_iou_metric',

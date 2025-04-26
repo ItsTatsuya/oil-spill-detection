@@ -71,93 +71,57 @@ def rotate_image(image, angle, interpolation='nearest'):
     return tf.squeeze(rotated_image, 0)
 
 @tf.function(reduce_retracing=True)
-def _augment_image_and_label(image, label):
-    """Augment a single image-label pair (unbatched)."""
-    image = tf.ensure_shape(image, [384, 384, 1])
-    label = tf.ensure_shape(label, [384, 384, 1])
-    image = tf.cast(image, tf.float32)
-    label = tf.cast(label, tf.uint8)
-
-    # Flip
-    if tf.random.uniform(()) > 0.5:
+def random_flip(image, label, p_horizontal=0.5, p_vertical=0.3):
+    """Apply random horizontal and vertical flips to image and label."""
+    if tf.random.uniform(()) < p_horizontal:
         image = tf.image.flip_left_right(image)
         label = tf.image.flip_left_right(label)
+    if tf.random.uniform(()) < p_vertical:
+        image = tf.image.flip_up_down(image)
+        label = tf.image.flip_up_down(label)
+    return image, label
 
-    # Rotate
-    if tf.random.uniform(()) > 0.5:
-        angle = tf.random.uniform([], minval=-0.1745, maxval=0.1745)  # ±10°
+@tf.function(reduce_retracing=True)
+def random_rotation(image, label, max_angle=15.0, p_90deg=0.2):
+    """Apply random rotation to image and label."""
+    max_angle_rad = max_angle * (np.pi / 180.0)
+    if tf.random.uniform(()) < p_90deg:
+        k = tf.random.uniform([], minval=1, maxval=4, dtype=tf.int32)
+        image = tf.image.rot90(image, k=k)
+        label = tf.image.rot90(label, k=k)
+    else:
+        angle = tf.random.uniform([], minval=-max_angle_rad, maxval=max_angle_rad)
         image = rotate_image(image, angle, interpolation='bilinear')
         label = rotate_image(label, angle, interpolation='nearest')
+    return image, label
 
-    # Photometric augmentations
-    image = tf.image.random_brightness(image, max_delta=0.05)
-    image = tf.image.random_contrast(image, lower=0.95, upper=1.05)
+@tf.function(reduce_retracing=True)
+def add_speckle_noise(image, label, mean=0.0, stddev=0.1, p=0.7):
+    """Add speckle noise to SAR imagery."""
+    if tf.random.uniform(()) < p:
+        noise = tf.random.normal(tf.shape(image), mean=mean, stddev=stddev, dtype=image.dtype)
+        noisy_image = image * (1 + noise)
+        noisy_image = tf.clip_by_value(noisy_image, 0.0, 1.0)
+        return noisy_image, label
+    else:
+        return image, label
 
-    # Clip values
+@tf.function(reduce_retracing=True)
+def augment_single_sample(image, label):
+    """Apply augmentations to a single image-label pair."""
+    image, label = random_flip(image, label)
+    image, label = random_rotation(image, label, max_angle=15.0, p_90deg=0.2)
+    image, label = add_speckle_noise(image, label, stddev=0.15)
     image = tf.clip_by_value(image, 0.0, 1.0)
-
     return tf.cast(image, tf.float16), tf.cast(label, tf.uint8)
 
 @tf.function(reduce_retracing=True)
-def apply_augmentation(dataset, batch_size=2):
-    """Augmentation pipeline for batched dataset."""
-    # Optimize dataset
-    options = tf.data.Options()
-    options.experimental_deterministic = False
-    dataset = dataset.with_options(options)
-
-    # Unbatch to apply augmentations to individual samples
+def apply_augmentation(dataset, batch_size=2, cutmix_prob=0.3):
+    """Apply the complete augmentation pipeline to a dataset."""
     dataset = dataset.unbatch()
-
-    # Apply augmentations to individual samples
-    dataset = dataset.map(
-        _augment_image_and_label,
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-
-    # Re-batch
+    dataset = dataset.map(augment_single_sample, num_parallel_calls=tf.data.AUTOTUNE)
     dataset = dataset.batch(batch_size, drop_remainder=True)
-
-    # Simplified CutMix
-    @tf.function
-    def simplified_cutmix(images, labels):
-        batch_size = tf.shape(images)[0]
-        height, width = 384, 384
-        should_apply = tf.random.uniform(()) < 0.2
-
-        def apply_mix():
-            patch_size = 96
-            y_pos = tf.random.uniform([], 0, height - patch_size, dtype=tf.int32)
-            x_pos = tf.random.uniform([], 0, width - patch_size, dtype=tf.int32)
-            mask = tf.zeros([height, width, 1], dtype=images.dtype)
-            patch = tf.ones([patch_size, patch_size, 1], dtype=images.dtype)
-            paddings = [[y_pos, height - y_pos - patch_size], [x_pos, width - x_pos - patch_size], [0, 0]]
-            mask = tf.pad(patch, paddings)
-            mask = tf.expand_dims(mask, 0)
-            mask = tf.tile(mask, [batch_size, 1, 1, 1])
-            indices = tf.random.shuffle(tf.range(batch_size))
-            shuffled_images = tf.gather(images, indices)
-            shuffled_labels = tf.gather(labels, indices)
-            mixed_images = images * (1 - mask) + shuffled_images * mask
-            mixed_labels = labels * tf.cast(1 - mask, tf.uint8) + shuffled_labels * tf.cast(mask, tf.uint8)
-            return mixed_images, mixed_labels
-
-        return tf.cond(should_apply, apply_mix, lambda: (images, labels))
-
-    dataset = dataset.map(simplified_cutmix, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # Ensure final shapes
-    dataset = dataset.map(
-        lambda images, labels: (
-            tf.ensure_shape(images, [None, 384, 384, 1]),
-            tf.ensure_shape(labels, [None, 384, 384, 1])
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-
-    # Cache and prefetch
-    dataset = dataset.cache().prefetch(tf.data.AUTOTUNE)
-
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
     return dataset
 
 # Main block unchanged
@@ -182,7 +146,7 @@ if __name__ == "__main__":
         plt.imshow(original_label[:,:,0], cmap='jet', vmin=0, vmax=4)
         for i in range(2):
             img_tensor = tf.cast(original_image, compute_dtype)
-            aug_image, aug_label = _augment_image_and_label(img_tensor, original_label)
+            aug_image, aug_label = augment_single_sample(img_tensor, original_label)
             plt.subplot(2, 3, i+2)
             plt.title(f"Augmented Image {i+1}")
             plt.imshow(aug_image.numpy())

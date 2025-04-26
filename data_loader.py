@@ -19,12 +19,9 @@ def silent_tf_import():
 tf = silent_tf_import()
 
 # Import mixed precision
-from tensorflow.keras import mixed_precision
+from tensorflow.keras import mixed_precision # type: ignore
 policy = mixed_precision.global_policy()
 print(f"Data loader using mixed precision policy: {policy.name}")
-
-# Import custom augmentation
-from augmentation import _augment_image_and_label
 
 # Suppress TensorFlow warnings
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
