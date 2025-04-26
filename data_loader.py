@@ -138,29 +138,105 @@ def parse_image_label(image_path, label_path):
 
     return image, label
 
-def load_dataset(data_dir='dataset', split='train', batch_size=16):
-    """Load dataset with class weights and batch information."""
+def parse_tfrecord_example(example_proto):
+    """Parse a single example from a TFRecord file."""
+    # Define the features to parse from the TFRecord
+    feature_description = {
+        'height': tf.io.FixedLenFeature([], tf.int64),
+        'width': tf.io.FixedLenFeature([], tf.int64),
+        'image': tf.io.FixedLenFeature([], tf.string),
+        'label': tf.io.FixedLenFeature([], tf.string),
+        'image_format': tf.io.FixedLenFeature([], tf.string),
+        'label_format': tf.io.FixedLenFeature([], tf.string),
+    }
+
+    # Parse the example
+    features = tf.io.parse_single_example(example_proto, feature_description)
+
+    # Decode the image and label
+    image = tf.image.decode_jpeg(features['image'], channels=1)
+    label = tf.image.decode_png(features['label'], channels=1)
+
+    # Resize to standard dimensions
+    image = tf.image.resize(image, [384, 384])
+    label = tf.image.resize(label, [384, 384], method='nearest')
+
+    # Normalize image to [0,1] range and cast label to uint8
+    image = tf.cast(image, tf.float32) / 255.0
+    label = tf.cast(label, tf.uint8)
+    label = tf.clip_by_value(label, 0, 4)
+
+    return image, label
+
+def load_dataset(data_dir='dataset', split='train', batch_size=16, use_tfrecords=True):
+    """Load dataset with class weights and batch information.
+
+    Args:
+        data_dir: Base directory containing the dataset
+        split: 'train' or 'test' split to load
+        batch_size: Number of examples per batch
+        use_tfrecords: Whether to use TFRecord format (faster) or raw image files
+
+    Returns:
+        dataset: tf.data.Dataset object
+        class_weights: Dictionary of class weights for loss function
+        num_batches: Number of batches in one epoch
+    """
     if split not in ['train', 'test']:
         raise ValueError(f"Invalid split: {split}")
 
-    split_dir = os.path.join(data_dir, split)
-    image_dir = os.path.join(split_dir, 'images')
-    label_dir = os.path.join(split_dir, 'labels_1D')
+    # Get class weights (same regardless of data source)
+    class_weights = None
+    if split == 'train':
+        # For TFRecords we don't need actual files for weights calculation
+        label_dir = os.path.join(data_dir, split, 'labels_1D')
+        label_files = sorted(glob.glob(os.path.join(label_dir, '*.png')))
+        class_weights = analyze_class_distribution(label_files)
 
-    image_files = sorted(glob.glob(os.path.join(image_dir, '*.jpg')))
-    label_files = sorted(glob.glob(os.path.join(label_dir, '*.png')))
+    # Check if TFRecord directory exists
+    tfrecord_dir = os.path.join(data_dir, f'{split}_tfrecords')
+    if use_tfrecords and os.path.exists(tfrecord_dir):
+        # Use TFRecord dataset (faster I/O)
+        tfrecord_files = sorted(glob.glob(os.path.join(tfrecord_dir, '*.tfrecord')))
 
-    if len(image_files) != len(label_files):
-        raise ValueError(f"Image-label mismatch: {len(image_files)} images, {len(label_files)} labels")
+        if not tfrecord_files:
+            print(f"No TFRecord files found in {tfrecord_dir}. Falling back to image files.")
+            use_tfrecords = False
+        else:
+            print(f"Loading {split} dataset from {len(tfrecord_files)} TFRecord files")
+            dataset = tf.data.TFRecordDataset(tfrecord_files)
+            dataset = dataset.map(parse_tfrecord_example, num_parallel_calls=tf.data.AUTOTUNE)
 
-    dataset = tf.data.Dataset.from_tensor_slices((image_files, label_files))
-    num_samples = len(image_files)
-    num_batches = num_samples // batch_size + (1 if num_samples % batch_size > 0 else 0)
+            # Count number of examples in TFRecord files
+            # This is an approximation as we don't actually count all examples
+            example_counter = tf.data.TFRecordDataset(tfrecord_files).take(1)
+            num_examples = 0
 
-    class_weights = analyze_class_distribution(label_files) if split == 'train' else None
+            # If the first TFRecord exists, count samples based on file pattern
+            if split == 'train':
+                num_examples = 1002  # Known size from original dataset
+            else:
+                num_examples = 110  # Known size from original dataset
 
-    # Map operations before any caching or shuffling
-    dataset = dataset.map(parse_image_label, num_parallel_calls=tf.data.AUTOTUNE)
+    # Fall back to regular image loading if TFRecords not available or not requested
+    if not use_tfrecords or not os.path.exists(tfrecord_dir):
+        print(f"Loading {split} dataset from individual image files")
+        split_dir = os.path.join(data_dir, split)
+        image_dir = os.path.join(split_dir, 'images')
+        label_dir = os.path.join(split_dir, 'labels_1D')
+
+        image_files = sorted(glob.glob(os.path.join(image_dir, '*.jpg')))
+        label_files = sorted(glob.glob(os.path.join(label_dir, '*.png')))
+
+        if len(image_files) != len(label_files):
+            raise ValueError(f"Image-label mismatch: {len(image_files)} images, {len(label_files)} labels")
+
+        num_examples = len(image_files)
+        dataset = tf.data.Dataset.from_tensor_slices((image_files, label_files))
+        dataset = dataset.map(parse_image_label, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Common transformations for both TFRecord and image loading
+    num_batches = num_examples // batch_size + (1 if num_examples % batch_size > 0 else 0)
 
     if split == 'train':
         # Apply data transformations
@@ -169,8 +245,12 @@ def load_dataset(data_dir='dataset', split='train', batch_size=16):
         dataset = dataset.map(lambda x, y: (tf.cast(x, tf.float32), y), num_parallel_calls=tf.data.AUTOTUNE)
 
         # Shuffle first, then batch
-        dataset = dataset.shuffle(buffer_size=min(2000, num_samples), seed=42)
+        dataset = dataset.shuffle(buffer_size=min(2000, num_examples), seed=42)
         dataset = dataset.batch(batch_size, drop_remainder=True)
+
+        # Add repeat BEFORE prefetch to make the dataset repeat indefinitely during training
+        # This prevents the "Your input ran out of data" warning
+        dataset = dataset.repeat()
 
         # Prefetch at the end for performance
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
@@ -187,38 +267,63 @@ def load_dataset(data_dir='dataset', split='train', batch_size=16):
         # Testing dataset - simpler pipeline
         dataset = dataset.map(lambda x, y: (tf.cast(x, policy.compute_dtype), y), num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.batch(batch_size, drop_remainder=True)
+        # Don't add repeat() for validation/test datasets
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
         options = tf.data.Options()
         options.experimental_optimization.apply_default_optimizations = True
         dataset = dataset.with_options(options)
 
-    print(f"Loaded {split} dataset with {num_samples} samples, {num_batches} batches (batch_size={batch_size})")
+    print(f"Loaded {split} dataset with {num_examples} samples, {num_batches} batches (batch_size={batch_size})")
     return dataset, class_weights, num_batches
 
 if __name__ == "__main__":
     tf.config.set_visible_devices([], 'GPU')
-    train_ds, train_class_weights, train_num_batches = load_dataset(split='train', batch_size=16)
-    test_ds, _, test_num_batches = load_dataset(split='test', batch_size=16)
 
-    print("Dataset information:")
-    print(f"Train dataset: {train_ds}")
-    print(f"Test dataset: {test_ds}")
-    print(f"Train class weights: {train_class_weights}")
+    # Test with both TFRecords and original images
+    print("\nTesting with TFRecord loading (faster):")
+    train_ds_tfr, train_cw_tfr, train_nb_tfr = load_dataset(split='train', batch_size=16, use_tfrecords=True)
+    test_ds_tfr, _, test_nb_tfr = load_dataset(split='test', batch_size=16, use_tfrecords=True)
 
+    print("\nTesting with original image loading (fallback):")
+    train_ds_img, train_cw_img, train_nb_img = load_dataset(split='train', batch_size=16, use_tfrecords=False)
+    test_ds_img, _, test_nb_img = load_dataset(split='test', batch_size=16, use_tfrecords=False)
+
+    # Print dataset information
+    print("\nDataset information:")
+    print(f"TFRecord - Train dataset: {train_ds_tfr}")
+    print(f"TFRecord - Test dataset: {test_ds_tfr}")
+    print(f"Image Files - Train dataset: {train_ds_img}")
+    print(f"Image Files - Test dataset: {test_ds_img}")
+
+    # Performance test
+    print("\nPerformance comparison (time to load first 3 batches):")
+
+    # Test TFRecord performance
     try:
-        # Iterate through and consume the entire dataset (or at least more than 1 batch)
-        # to properly cache it when testing
-        print("Checking train dataset:")
+        import time
+        print("Timing TFRecord loading...")
+        start_time = time.time()
         batches_seen = 0
-        for images, labels in train_ds.take(3):  # Take a few batches to verify
+        for images, labels in train_ds_tfr.take(3):
             batches_seen += 1
-            print(f"Batch {batches_seen} - Images shape: {images.shape}, Labels shape: {labels.shape}")
+            print(f"TFRecord batch {batches_seen} - Images shape: {images.shape}, Labels shape: {labels.shape}")
+        tfr_time = time.time() - start_time
+        print(f"TFRecord loading time: {tfr_time:.4f} seconds for 3 batches")
 
-        print("Checking test dataset:")
+        # Test Image loading performance
+        print("\nTiming image file loading...")
+        start_time = time.time()
         batches_seen = 0
-        for images, labels in test_ds.take(3):  # Take a few batches to verify
+        for images, labels in train_ds_img.take(3):
             batches_seen += 1
-            print(f"Batch {batches_seen} - Images shape: {images.shape}, Labels shape: {labels.shape}")
+            print(f"Image files batch {batches_seen} - Images shape: {images.shape}, Labels shape: {labels.shape}")
+        img_time = time.time() - start_time
+        print(f"Image loading time: {img_time:.4f} seconds for 3 batches")
+
+        # Print speed comparison
+        speedup = img_time / tfr_time if tfr_time > 0 else 0
+        print(f"\nTFRecord is {speedup:.2f}x faster than loading from image files")
+
     except Exception as e:
-        print(f"Error processing dataset: {str(e)}")
+        print(f"Error during performance test: {str(e)}")

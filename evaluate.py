@@ -176,7 +176,6 @@ class MultiScalePredictor:
 
         # Ensure input has the correct number of channels for the model
         if image_batch.shape[-1] != self.expected_channels:
-            print(f"Input shape after channel adjustment: {image_batch.shape}, dtype: {image_batch.dtype}")
             if self.expected_channels == 1 and image_batch.shape[-1] > 1:
                 # Convert multi-channel to single channel
                 image_batch = tf.expand_dims(tf.reduce_mean(image_batch, axis=-1), axis=-1)
@@ -220,7 +219,14 @@ class MultiScalePredictor:
                     method='bilinear'
                 )
 
-                print(f"Resized images at scale {scale}: shape={model_input.shape}, dtype={model_input.dtype}")
+                # Ensure correct dtype for the model
+                compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+                if compute_dtype == 'mixed_float16':
+                    compute_dtype = tf.float16
+                else:
+                    compute_dtype = tf.float32
+
+                model_input = tf.cast(model_input, compute_dtype)
 
                 # For each scale, use TTA if enabled
                 if self.use_tta:
@@ -229,6 +235,9 @@ class MultiScalePredictor:
                 else:
                     # Regular prediction without TTA
                     logits = self._predict_batch(model_input)
+
+                # Cast logits to float32 for consistent post-processing
+                logits = tf.cast(logits, tf.float32)
 
                 # Resize prediction back to original size
                 if tf.shape(logits)[1] != height or tf.shape(logits)[2] != width:
@@ -538,7 +547,7 @@ def evaluate_model(model_path, test_dataset, batch_size=4, apply_ship_postproces
         Dictionary containing evaluation results
     """
     # Import model definition
-    from model import OilSpillSegformer, create_pretrained_weight_loader
+    from model import OilSpillSegformer
     from loss import HybridSegmentationLoss
     from test_time_augmentation import TestTimeAugmentation
 
@@ -558,7 +567,7 @@ def evaluate_model(model_path, test_dataset, batch_size=4, apply_ship_postproces
 
     # Use the final weights file if the best weights file is causing issues
     if not os.path.exists(model_path) or 'best' in model_path:
-        alt_model_path = 'segformer_b2_final.weights.h5'
+        alt_model_path = 'checkpoints/segformer_b2_final.weights.h5'
         if os.path.exists(alt_model_path):
             print(f"Using alternative weights file: {alt_model_path}")
             model_path = alt_model_path
@@ -586,14 +595,9 @@ def evaluate_model(model_path, test_dataset, batch_size=4, apply_ship_postproces
         _ = model(dummy_input, training=False)
         print("Model built successfully")
 
-        # Use custom weight loader from the model module
-        weight_loader = create_pretrained_weight_loader()
-        success = weight_loader(model, model_path)
-
-        if success:
-            print("Weights loaded successfully with custom weight loader")
-        else:
-            raise RuntimeError("Failed to load weights with custom loader")
+        # Use standard Keras load_weights method instead of the custom weight loader
+        model.load_weights(model_path)
+        print("Weights loaded successfully with standard Keras load_weights")
 
         # Restore original policy
         if original_policy.name != 'mixed_float16':
@@ -649,9 +653,32 @@ def evaluate_model(model_path, test_dataset, batch_size=4, apply_ship_postproces
     all_true_labels = []
     all_predictions = []
 
+    # Count total batches for tqdm
+    try:
+        total_batches = len(list(test_batches))
+    except:
+        # If test_batches doesn't support len(), use the num_test_batches provided
+        try:
+            total_batches = len(test_dataset) // batch_size
+            if len(test_dataset) % batch_size > 0:
+                total_batches += 1
+        except:
+            # Fallback to estimated total
+            total_batches = None
+
+    # Create a tqdm progress bar with clear description and formatting
+    print(f"Evaluating on test dataset with SegFormer-B2 model...")
+    progress_bar = tqdm(
+        test_batches,
+        total=total_batches,
+        desc="Processing batches",
+        unit="batch",
+        bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
+        dynamic_ncols=True
+    )
+
     # Process each batch
-    print("Evaluating on test dataset with SegFormer-B2 model...")
-    for images, labels in tqdm(test_batches):
+    for images, labels in progress_bar:
         try:
             # Get predictions using the predictor
             predictions = predictor.predict(images)
@@ -660,9 +687,15 @@ def evaluate_model(model_path, test_dataset, batch_size=4, apply_ship_postproces
             if apply_ship_postprocessing:
                 predictions = apply_ship_enhancement(predictions, ship_class_idx=3)
 
-            # Store labels and predictions (skip CRF for now as it may be causing issues)
+            # Store labels and predictions
             all_true_labels.append(labels)
             all_predictions.append(predictions)
+
+            # Update progress bar description with batch size info
+            progress_bar.set_postfix({
+                "batch_size": images.shape[0],
+                "image_shape": f"{images.shape[1]}x{images.shape[2]}"
+            })
         except Exception as e:
             print(f"Error processing batch: {e}")
             continue

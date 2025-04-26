@@ -41,8 +41,14 @@ class TestTimeAugmentation:
         self.expected_width = model.input_shape[2]
         self.expected_channels = model.input_shape[3]
 
+        # Store compute dtype for consistent dtype handling
+        self.compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+        if self.compute_dtype == 'mixed_float16':
+            self.compute_dtype = tf.float16
+        else:
+            self.compute_dtype = tf.float32
+
         print(f"TTA configured with {num_augmentations} augmentations")
-        print(f"Model expects input size: {self.expected_height}x{self.expected_width}x{self.expected_channels}")
 
     def _augment_image(self, image, aug_type):
         """
@@ -55,6 +61,9 @@ class TestTimeAugmentation:
         Returns:
             Augmented image and transformation info for reversal
         """
+        # Cast to float32 for consistent processing
+        image = tf.cast(image, tf.float32)
+
         # Store original size for later reversal
         orig_height, orig_width = tf.shape(image)[0], tf.shape(image)[1]
         orig_size = (orig_height, orig_width)
@@ -64,21 +73,24 @@ class TestTimeAugmentation:
             # Always ensure the image is the size expected by the model
             if orig_height != self.expected_height or orig_width != self.expected_width:
                 image = tf.image.resize(image, [self.expected_height, self.expected_width], method='bilinear')
-            return image, {'type': 'original', 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(image, self.compute_dtype), {'type': 'original', 'orig_size': orig_size}
 
         elif aug_type == 'h_flip':
             flipped = tf.image.flip_left_right(image)
             # Always ensure the image is the size expected by the model
             if orig_height != self.expected_height or orig_width != self.expected_width:
                 flipped = tf.image.resize(flipped, [self.expected_height, self.expected_width], method='bilinear')
-            return flipped, {'type': 'h_flip', 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(flipped, self.compute_dtype), {'type': 'h_flip', 'orig_size': orig_size}
 
         elif aug_type == 'v_flip':
             flipped = tf.image.flip_up_down(image)
             # Always ensure the image is the size expected by the model
             if orig_height != self.expected_height or orig_width != self.expected_width:
                 flipped = tf.image.resize(flipped, [self.expected_height, self.expected_width], method='bilinear')
-            return flipped, {'type': 'v_flip', 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(flipped, self.compute_dtype), {'type': 'v_flip', 'orig_size': orig_size}
 
         elif aug_type.startswith('rotate_'):
             angle = float(aug_type.split('_')[1])
@@ -96,7 +108,8 @@ class TestTimeAugmentation:
                 elif self.expected_channels == 3 and rotated.shape[-1] == 1:
                     rotated = tf.concat([rotated, rotated, rotated], axis=-1)
 
-            return rotated, {'type': 'rotate', 'angle': -angle, 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(rotated, self.compute_dtype), {'type': 'rotate', 'angle': -angle, 'orig_size': orig_size}
 
         elif aug_type.startswith('scale_'):
             scale = float(aug_type.split('_')[1])
@@ -121,7 +134,8 @@ class TestTimeAugmentation:
                 elif self.expected_channels == 3 and resized_img.shape[-1] == 1:
                     resized_img = tf.concat([resized_img, resized_img, resized_img], axis=-1)
 
-            return resized_img, {'type': 'scale', 'scale': scale, 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(resized_img, self.compute_dtype), {'type': 'scale', 'scale': scale, 'orig_size': orig_size}
 
         # Combinations
         elif aug_type == 'h_flip_v_flip':
@@ -132,14 +146,15 @@ class TestTimeAugmentation:
             if orig_height != self.expected_height or orig_width != self.expected_width:
                 flipped = tf.image.resize(flipped, [self.expected_height, self.expected_width], method='bilinear')
 
-            return flipped, {'type': 'h_flip_v_flip', 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(flipped, self.compute_dtype), {'type': 'h_flip_v_flip', 'orig_size': orig_size}
 
         else:
-            print(f"Unknown augmentation type: {aug_type}")
             # Always ensure the image is the size expected by the model
             if orig_height != self.expected_height or orig_width != self.expected_width:
                 image = tf.image.resize(image, [self.expected_height, self.expected_width], method='bilinear')
-            return image, {'type': 'original', 'orig_size': orig_size}
+            # Cast to compute dtype before returning
+            return tf.cast(image, self.compute_dtype), {'type': 'original', 'orig_size': orig_size}
 
     def _reverse_augmentation(self, pred, aug_info):
         """
@@ -194,7 +209,6 @@ class TestTimeAugmentation:
             return unflipped
 
         else:
-            print(f"Unknown augmentation type for reversal: {aug_type}")
             if orig_size is not None:
                 return tf.image.resize(pred, orig_size, method='bilinear')
             return pred
@@ -251,12 +265,11 @@ class TestTimeAugmentation:
         Returns:
             Averaged prediction after TTA
         """
-        # Make a copy of the input to avoid modifying the original
-        processed_images = tf.identity(images)
+        # Cast to float32 for consistent processing
+        processed_images = tf.cast(images, tf.float32)
 
         # Ensure input images have the correct number of channels - critical for the model
         if processed_images.shape[-1] != self.expected_channels:
-            print(f"Converting input from {processed_images.shape[-1]} to {self.expected_channels} channels...")
             if self.expected_channels == 1 and processed_images.shape[-1] > 1:
                 # Convert multi-channel to single channel (RGB to grayscale)
                 processed_images = tf.expand_dims(tf.reduce_mean(processed_images, axis=-1), axis=-1)
@@ -264,12 +277,8 @@ class TestTimeAugmentation:
                 # Convert single channel to RGB by duplicating the channel
                 processed_images = tf.concat([processed_images, processed_images, processed_images], axis=-1)
 
-        # Print shape after conversion
-        print(f"Input shape after initial channel adjustment: {processed_images.shape}")
-
         # Generate augmentation types
         aug_types = self._generate_augmentation_types()
-        print(f"Applying {len(aug_types)} TTA transformations: {aug_types}")
 
         # Store predictions from each augmentation
         all_predictions = []
@@ -287,16 +296,16 @@ class TestTimeAugmentation:
 
                     # Force correct dimensions
                     if tf.shape(aug_image)[0] != self.expected_height or tf.shape(aug_image)[1] != self.expected_width:
-                        print(f"Resizing to {self.expected_height}x{self.expected_width}")
                         aug_image = tf.image.resize(aug_image, [self.expected_height, self.expected_width], method='bilinear')
+                        aug_image = tf.cast(aug_image, self.compute_dtype)
 
                     # Force correct channel dimension
                     if aug_image.shape[-1] != self.expected_channels:
-                        print(f"Converting from {aug_image.shape[-1]} to {self.expected_channels} channels")
                         if self.expected_channels == 1:
                             aug_image = tf.expand_dims(tf.reduce_mean(aug_image, axis=-1), axis=-1)
                         elif self.expected_channels == 3 and aug_image.shape[-1] == 1:
                             aug_image = tf.concat([aug_image, aug_image, aug_image], axis=-1)
+                        aug_image = tf.cast(aug_image, self.compute_dtype)
 
                     # Add to batch
                     batch_aug_images.append(aug_image)
@@ -304,9 +313,6 @@ class TestTimeAugmentation:
 
                 # Stack augmented images into a batch
                 batch_aug_images = tf.stack(batch_aug_images, axis=0)
-
-                # Print shape for debugging
-                print(f"Batch shape after {aug_type}: {batch_aug_images.shape}, dtype: {batch_aug_images.dtype}")
 
                 # Final verification before model inference
                 if batch_aug_images.shape[1] != self.expected_height or batch_aug_images.shape[2] != self.expected_width:
@@ -319,11 +325,14 @@ class TestTimeAugmentation:
                 if tf.reduce_max(batch_aug_images) > 1.0:
                     batch_aug_images = batch_aug_images / 255.0
 
-                # Ensure correct data type for the model
-                batch_aug_images = tf.cast(batch_aug_images, tf.float32)
+                # Ensure correct data type for the model - use compute_dtype
+                batch_aug_images = tf.cast(batch_aug_images, self.compute_dtype)
 
                 # Get predictions for augmented batch
                 predictions = self.model(batch_aug_images, training=False)
+
+                # Cast predictions to float32 for consistent post-processing
+                predictions = tf.cast(predictions, tf.float32)
 
                 # Reverse augmentations for predictions
                 batch_reversed_preds = []
@@ -339,14 +348,10 @@ class TestTimeAugmentation:
                 all_predictions.append(batch_reversed_preds)
 
             except Exception as e:
-                print(f"Error during TTA with augmentation '{aug_type}': {e}")
-                import traceback
-                traceback.print_exc()
                 continue
 
         # Check if we have any successful augmentations
         if not all_predictions:
-            print("All TTA augmentations failed. Falling back to direct prediction.")
             try:
                 # Make sure input has correct size before direct prediction
                 if processed_images.shape[1] != self.expected_height or processed_images.shape[2] != self.expected_width:
@@ -359,10 +364,12 @@ class TestTimeAugmentation:
                     elif self.expected_channels == 3 and processed_images.shape[3] == 1:
                         processed_images = tf.concat([processed_images, processed_images, processed_images], axis=-1)
 
+                # Cast to compute_dtype before prediction
+                processed_images = tf.cast(processed_images, self.compute_dtype)
+
                 # Fallback to direct prediction without augmentation
                 return self.model(processed_images, training=False)
             except Exception as e:
-                print(f"Direct prediction also failed: {e}")
                 # Return a dummy prediction with the correct shape
                 dummy_shape = list(processed_images.shape)
                 dummy_shape[-1] = self.model.output_shape[-1]  # Use correct number of classes
@@ -375,6 +382,9 @@ class TestTimeAugmentation:
             # Ensure tensor is properly shaped and has correct dtype
             if isinstance(pred, np.ndarray):
                 pred = tf.convert_to_tensor(pred.astype(np.float32))
+            else:
+                pred = tf.cast(pred, tf.float32)
+
             # Apply softmax for proper averaging
             probs = tf.nn.softmax(pred, axis=-1)
             all_probs.append(probs)

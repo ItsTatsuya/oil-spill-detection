@@ -1,8 +1,6 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import glob
-import shutil # Import shutil for file copying
 from tqdm import tqdm
 from datetime import datetime
 import time
@@ -514,10 +512,13 @@ class ModelCheckpointWithHistory(tf.keras.callbacks.Callback):
 
 def train_and_evaluate():
     NUM_CLASSES = 5
-    BATCH_SIZE = 2  # Reduced batch size for memory efficiency with augmentations
+    BATCH_SIZE = 4  # Reduced batch size for memory efficiency with augmentations
     EPOCHS = 600
     LEARNING_RATE = 3e-5
     IMG_SIZE = (384, 384)
+
+    # Enable TFRecord usage for faster data loading
+    USE_TFRECORDS = True
 
     # Clear GPU memory before starting
     tf.keras.backend.clear_session()
@@ -544,8 +545,23 @@ def train_and_evaluate():
     initial_epoch = 0
 
     print("Loading datasets...")
-    train_ds, class_weights_dict, train_steps = load_dataset(data_dir='dataset', split='train', batch_size=BATCH_SIZE)
-    test_ds, _, val_steps = load_dataset(data_dir='dataset', split='test', batch_size=BATCH_SIZE)
+    colored_print(f"Using TFRecord format: {'Enabled' if USE_TFRECORDS else 'Disabled'}",
+                 color=TermColors.CYAN, bold=True)
+
+    # Load datasets using TFRecord format for improved I/O performance
+    train_ds, class_weights_dict, train_steps = load_dataset(
+        data_dir='dataset',
+        split='train',
+        batch_size=BATCH_SIZE,
+        use_tfrecords=USE_TFRECORDS  # Enable TFRecord loading
+    )
+
+    test_ds, _, val_steps = load_dataset(
+        data_dir='dataset',
+        split='test',
+        batch_size=BATCH_SIZE,
+        use_tfrecords=USE_TFRECORDS  # Enable TFRecord loading
+    )
 
     # Debug dataset shapes
     for images, labels in train_ds.take(1):
@@ -579,6 +595,8 @@ def train_and_evaluate():
     # Import the model and loss function
     from model import OilSpillSegformer
     from loss import HybridSegmentationLoss
+    # Import the test-time augmentation for evaluation
+    from test_time_augmentation import TestTimeAugmentation
 
     # Create the model explicitly without pretrained weights
     colored_print("Creating OilSpillSegformer model..", color=TermColors.CYAN, bold=True)
@@ -604,8 +622,12 @@ def train_and_evaluate():
     # Check if checkpoint exists (for resuming training, not pretrained weights)
     checkpoint_path = latest_weights if os.path.exists(latest_weights) else None
     if checkpoint_path:
-        colored_print(f"Found checkpoint at {checkpoint_path}, but training from scratch as requested.",
+        colored_print(f"Found checkpoint at {checkpoint_path}. Loading weights to resume training.",
                      color=TermColors.YELLOW, bold=True)
+        success, initial_epoch, _ = load_checkpoint(model, optimizer, checkpoint_path)
+        if not success:
+            colored_print("Failed to load checkpoint. Starting from scratch.", color=TermColors.RED, bold=True)
+            initial_epoch = 0
 
     # Set up the loss function
     loss_fn = HybridSegmentationLoss(
@@ -614,6 +636,16 @@ def train_and_evaluate():
         focal_weight=0.3,  # Focal loss weight (equivalent to beta)
         dice_weight=0.3,   # Dice loss weight
         from_logits=True
+    )
+
+    # Create TTA wrapper for evaluation (not used in training)
+    # This improves evaluation metrics by using test-time augmentation
+    tta_model = TestTimeAugmentation(
+        model=model,
+        num_augmentations=8,
+        use_flips=True,
+        use_scales=True,
+        use_rotations=True
     )
 
     # Compile the model with optimized settings for SAR imagery
@@ -693,6 +725,32 @@ def train_and_evaluate():
     loss, mean_iou_keras = results  # Get loss and mean IoU from Keras evaluation
     colored_print(f"Final Keras Metrics - Loss: {loss:.4f}, Mean IoU: {mean_iou_keras:.4f}",
                  color=TermColors.GREEN, bold=True)
+
+    # Try evaluating with test-time augmentation
+    colored_print("Evaluating with test-time augmentation...", color=TermColors.CYAN, bold=True)
+    # Define a TTA evaluation function
+    @tf.function
+    def evaluate_with_tta(images, labels):
+        logits = tta_model.predict(images)
+        return logits
+
+    # Manually evaluate a small subset with TTA to avoid memory issues
+    try:
+        tta_ious = []
+        for images, labels in test_ds.take(min(3, val_steps)):
+            # Get predictions with TTA
+            logits = evaluate_with_tta(images, labels)
+            # Update the IoU metric
+            class_iou_callback.iou_metric.update_state(labels, logits)
+
+        # Get the IoU results from the accumulated confusion matrix
+        tta_class_ious = class_iou_callback.iou_metric.get_class_iou()
+        tta_mean_iou = class_iou_callback.iou_metric.result().numpy()
+
+        colored_print(f"TTA Mean IoU: {tta_mean_iou:.4f} (subset only)", color=TermColors.GREEN, bold=True)
+        colored_print("TTA evaluation completed", color=TermColors.GREEN, bold=True)
+    except Exception as e:
+        colored_print(f"TTA evaluation failed: {e}", color=TermColors.YELLOW, bold=True)
 
     # Get the final class-wise IoU results directly from the callback's metric instance
     # This uses the confusion matrix accumulated by the callback during the last epoch's evaluation
