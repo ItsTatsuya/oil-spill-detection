@@ -185,7 +185,7 @@ class MultiScalePredictor:
                 image_batch = tf.concat([image_batch, image_batch, image_batch], axis=-1)
 
         # Cast input to the policy's compute dtype (float16 for mixed precision)
-        from tensorflow.keras import mixed_precision
+        from tensorflow.keras import mixed_precision # type: ignore
         policy = mixed_precision.global_policy()
         image_batch = tf.cast(image_batch, policy.compute_dtype)
 

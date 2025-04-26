@@ -425,16 +425,15 @@ def load_checkpoint(model, optimizer=None, checkpoint_path=None):
                 colored_print("No checkpoint found", color=TermColors.YELLOW, bold=True)
                 return False, 0, {}
 
-    # Get the weight loader function from improved_converter
-    from improved_converter import create_improved_weight_mapper
-    weight_loader = create_improved_weight_mapper()
-
     # Load the model weights
     colored_print(f"Loading checkpoint weights from {checkpoint_path}", color=TermColors.CYAN, bold=True)
-    success = weight_loader(model, checkpoint_path)
 
-    if not success:
-        colored_print(f"Failed to load checkpoint weights", color=TermColors.RED, bold=True)
+    # Use Keras built-in load_weights method directly instead of weight_loader
+    try:
+        model.load_weights(checkpoint_path)
+        success = True
+    except Exception as e:
+        colored_print(f"Failed to load checkpoint weights: {e}", color=TermColors.RED, bold=True)
         return False, 0, {}
 
     # Load only the epoch number from checkpoint_info.txt
@@ -577,23 +576,18 @@ def train_and_evaluate():
     if train_steps == 0 or val_steps == 0:
         raise ValueError("Empty dataset detected. Check data loading pipeline.")
 
-    # Determine pretrained weights path
-    pretrained_weights_path = 'pretrained_weights/segformer_b2_pretrain.weights.h5'
-    checkpoint_weights_path = latest_weights if os.path.exists(latest_weights) else None
-
-    # Import the model and weight loader
+    # Import the model and loss function
     from model import OilSpillSegformer
-    from improved_converter import create_improved_weight_mapper
     from loss import HybridSegmentationLoss
 
-    # Create the model without specifying pretrained weights initially
-    colored_print("Creating OilSpillSegformer model...", color=TermColors.CYAN, bold=True)
+    # Create the model explicitly without pretrained weights
+    colored_print("Creating OilSpillSegformer model..", color=TermColors.CYAN, bold=True)
     model = OilSpillSegformer(
         input_shape=(*IMG_SIZE, 1),
         num_classes=NUM_CLASSES,
         drop_rate=0.1,
         use_cbam=False,  # Disable CBAM to reduce memory usage
-        pretrained_weights=None  # Don't load weights yet
+        pretrained_weights=None  # Explicitly set to None to train from scratch
     )
 
     # Set up the learning rate schedule and optimizer
@@ -607,39 +601,11 @@ def train_and_evaluate():
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
-    # Try to load checkpoint using the improved loader
+    # Check if checkpoint exists (for resuming training, not pretrained weights)
     checkpoint_path = latest_weights if os.path.exists(latest_weights) else None
     if checkpoint_path:
-        colored_print(f"Attempting to load checkpoint from {checkpoint_path}...",
-                     color=TermColors.CYAN, bold=True)
-        success, initial_epoch, checkpoint_history = load_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            checkpoint_path=checkpoint_path
-        )
-
-        if not success and os.path.exists(pretrained_weights_path):
-            colored_print(f"Failed to load checkpoint. Trying pretrained weights instead...",
-                         color=TermColors.YELLOW, bold=True)
-            from improved_converter import create_improved_weight_mapper
-            weight_loader = create_improved_weight_mapper()
-            success = weight_loader(model, pretrained_weights_path)
-            if success:
-                colored_print("Successfully loaded pretrained weights",
-                             color=TermColors.GREEN, bold=True)
-    elif os.path.exists(pretrained_weights_path):
-        # If no checkpoint but pretrained weights exist, use those
-        colored_print(f"No checkpoints found. Loading pretrained weights...",
-                     color=TermColors.CYAN, bold=True)
-        from improved_converter import create_improved_weight_mapper
-        weight_loader = create_improved_weight_mapper()
-        success = weight_loader(model, pretrained_weights_path)
-        if success:
-            colored_print("Successfully loaded pretrained weights",
-                         color=TermColors.GREEN, bold=True)
-        else:
-            colored_print("Failed to load pretrained weights. Training from scratch.",
-                         color=TermColors.YELLOW, bold=True)
+        colored_print(f"Found checkpoint at {checkpoint_path}, but training from scratch as requested.",
+                     color=TermColors.YELLOW, bold=True)
 
     # Set up the loss function
     loss_fn = HybridSegmentationLoss(

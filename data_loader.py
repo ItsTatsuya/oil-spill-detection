@@ -2,7 +2,6 @@ import os
 import numpy as np
 import glob
 import logging
-import tensorflow as tf
 
 def silent_tf_import():
     import sys
@@ -160,14 +159,21 @@ def load_dataset(data_dir='dataset', split='train', batch_size=16):
 
     class_weights = analyze_class_distribution(label_files) if split == 'train' else None
 
+    # Map operations before any caching or shuffling
     dataset = dataset.map(parse_image_label, num_parallel_calls=tf.data.AUTOTUNE)
 
     if split == 'train':
+        # Apply data transformations
         dataset = dataset.map(sample_patches, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.map(apply_lightweight_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.map(lambda x, y: (tf.cast(x, tf.float32), y), num_parallel_calls=tf.data.AUTOTUNE)
+
+        # Shuffle first, then batch
         dataset = dataset.shuffle(buffer_size=min(2000, num_samples), seed=42)
         dataset = dataset.batch(batch_size, drop_remainder=True)
+
+        # Prefetch at the end for performance
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
         options = tf.data.Options()
         options.experimental_optimization.map_parallelization = True
@@ -177,12 +183,11 @@ def load_dataset(data_dir='dataset', split='train', batch_size=16):
         options.experimental_optimization.apply_default_optimizations = True
         options.deterministic = False
         dataset = dataset.with_options(options)
-
-        dataset = dataset.cache().prefetch(tf.data.AUTOTUNE)
     else:
+        # Testing dataset - simpler pipeline
         dataset = dataset.map(lambda x, y: (tf.cast(x, policy.compute_dtype), y), num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.batch(batch_size, drop_remainder=True)
-        dataset = dataset.cache().prefetch(tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
         options = tf.data.Options()
         options.experimental_optimization.apply_default_optimizations = True
@@ -202,11 +207,18 @@ if __name__ == "__main__":
     print(f"Train class weights: {train_class_weights}")
 
     try:
-        for images, labels in train_ds.take(1):
-            tf.print("Batch size:", tf.shape(images)[0])
-            print(f"Sample batch shapes - Images: {images.shape}, Labels: {labels.shape}")
-            print(f"Image value range: {tf.reduce_min(images).numpy()} to {tf.reduce_max(images).numpy()}")
-            print(f"Image dtype: {images.dtype}")
-            print(f"Label values: {np.unique(labels.numpy())}")
+        # Iterate through and consume the entire dataset (or at least more than 1 batch)
+        # to properly cache it when testing
+        print("Checking train dataset:")
+        batches_seen = 0
+        for images, labels in train_ds.take(3):  # Take a few batches to verify
+            batches_seen += 1
+            print(f"Batch {batches_seen} - Images shape: {images.shape}, Labels shape: {labels.shape}")
+
+        print("Checking test dataset:")
+        batches_seen = 0
+        for images, labels in test_ds.take(3):  # Take a few batches to verify
+            batches_seen += 1
+            print(f"Batch {batches_seen} - Images shape: {images.shape}, Labels shape: {labels.shape}")
     except Exception as e:
-        print(f"Error processing sample batch: {str(e)}")
+        print(f"Error processing dataset: {str(e)}")

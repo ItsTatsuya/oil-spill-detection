@@ -528,246 +528,6 @@ def SegFormer(input_shape=(320, 320, 1), num_classes=5, **kwargs):
 
     return model
 
-def create_pretrained_weight_loader():
-    """
-    Creates a custom weight loading function that handles different weight file formats
-    and properly maps them to the model architecture.
-
-    Returns:
-        A function that loads weights from a file into a model
-    """
-    import h5py
-    import io
-    import numpy as np
-    from improved_converter import create_improved_weight_mapper
-
-    # First try the improved mapper that has better layer name mapping
-    improved_mapper = create_improved_weight_mapper()
-
-    def verbose_load_weights(model, weights_path):
-        """
-        Load weights from a file into the model with proper layer mapping
-        and detailed verbose logging for debugging.
-
-        Args:
-            model: The model to load weights into
-            weights_path: Path to the weights file
-
-        Returns:
-            True if successful, False otherwise
-        """
-        if not os.path.exists(weights_path):
-            print(f"Weights file not found: {weights_path}")
-            return False
-
-        print(f"Loading weights from {weights_path}")
-
-        # First attempt: Try using the improved weight mapper method
-        try:
-            print("Attempting improved weight mapper method...")
-            success = improved_mapper(model, weights_path)
-
-            if success:
-                print("Successfully loaded weights using improved mapper")
-                return True
-            else:
-                print("Improved mapper was unable to load weights")
-        except Exception as e:
-            print(f"Improved mapper failed with error: {e}")
-            import traceback
-            traceback.print_exc()
-
-        # Second attempt: Try using the standard Keras load_weights method
-        try:
-            print("Attempting standard load_weights method...")
-            model.load_weights(weights_path, by_name=True)
-
-            # Verify weights were actually loaded by checking if any layer has non-zero weights
-            non_zero_layers = 0
-            for layer in model.layers:
-                if layer.weights:
-                    # Check if weights are non-zero
-                    for w in layer.weights:
-                        if tf.reduce_sum(tf.abs(w)) > 0:
-                            non_zero_layers += 1
-                            break
-
-            if non_zero_layers > 0:
-                print(f"Successfully loaded weights for {non_zero_layers} layers using standard method")
-                return True
-            else:
-                print("Standard weight loading appeared to succeed but no non-zero weights found")
-        except Exception as e:
-            print(f"Standard weight loading failed with error: {e}")
-
-        print("Trying fallback loading method with explicit layer mapping...")
-
-        # Build a mapping of layer names for easier lookup
-        layer_dict = {}
-        for layer in model.layers:
-            layer_dict[layer.name] = layer
-            # Also map to common naming variations
-            layer_dict[f"model/{layer.name}"] = layer
-            layer_dict[f"{layer.name}_1"] = layer
-            layer_dict[f"{layer.name}/kernel"] = layer  # For kernel/bias style naming
-            layer_dict[f"{layer.name}/bias"] = layer
-
-        # Find all nested layers (like in the MixVisionTransformer)
-        for layer in model.layers:
-            if hasattr(layer, 'layers'):
-                # For custom layers with nested layers like MixVisionTransformer
-                nested_layers = getattr(layer, 'layers', [])
-                if nested_layers:
-                    for nested_layer in nested_layers:
-                        layer_dict[f"{layer.name}/{nested_layer.name}"] = nested_layer
-                        layer_dict[f"model/{layer.name}/{nested_layer.name}"] = nested_layer
-
-                # Check for blocks like in MixVisionTransformer
-                for attr_name in ['block1', 'block2', 'block3', 'block4']:
-                    if hasattr(layer, attr_name):
-                        blocks = getattr(layer, attr_name)
-                        for i, block in enumerate(blocks):
-                            block_name = f"{attr_name}_{i}"
-                            layer_dict[f"{layer.name}/{block_name}"] = block
-                            layer_dict[f"model/{layer.name}/{block_name}"] = block
-
-                # Check for specific named attributes that contain layers
-                for attr_name in ['patch_embed1', 'patch_embed2', 'patch_embed3', 'patch_embed4',
-                                 'norm1', 'norm2', 'norm3', 'norm4']:
-                    if hasattr(layer, attr_name):
-                        nested_layer = getattr(layer, attr_name)
-                        if hasattr(nested_layer, 'name'):
-                            layer_dict[f"{layer.name}/{nested_layer.name}"] = nested_layer
-                            layer_dict[f"{layer.name}/{attr_name}"] = nested_layer
-                            layer_dict[f"model/{layer.name}/{nested_layer.name}"] = nested_layer
-
-        # For even deeper nested layers in decoder head
-        if 'decoder_head' in layer_dict:
-            decoder = layer_dict['decoder_head']
-            for attr_name in ['linear_c1', 'linear_c2', 'linear_c3', 'linear_c4',
-                             'linear_fuse', 'batch_norm', 'dropout', 'classifier']:
-                if hasattr(decoder, attr_name):
-                    nested_layer = getattr(decoder, attr_name)
-                    if hasattr(nested_layer, 'name'):
-                        layer_dict[f"decoder_head/{nested_layer.name}"] = nested_layer
-                        layer_dict[f"decoder_head/{attr_name}"] = nested_layer
-
-        print(f"Built layer dictionary with {len(layer_dict)} layer name mappings")
-
-        # Try loading with h5py for h5 files
-        if weights_path.endswith('.h5'):
-            try:
-                with h5py.File(weights_path, 'r') as h5_file:
-                    loaded_layers = 0
-                    tried_layers = 0
-                    matched_layers = []
-
-                    # Get list of weight group names from file
-                    weight_groups = []
-                    for key in h5_file.keys():
-                        if key not in ['model_weights', 'optimizer_weights', 'metadata']:
-                            weight_groups.append(key)
-
-                    print(f"Found {len(weight_groups)} weight groups in file")
-
-                    # Process each weight group
-                    for group_name in weight_groups:
-                        tried_layers += 1
-                        group = h5_file[group_name]
-
-                        # Find target layer
-                        target_layer = None
-                        if group_name in layer_dict:
-                            target_layer = layer_dict[group_name]
-                        else:
-                            # Try best-match approach
-                            best_match = None
-                            best_match_score = 0
-                            for layer_name in layer_dict:
-                                if group_name in layer_name or layer_name in group_name:
-                                    # Calculate match score (length of common substring)
-                                    if len(layer_name) > best_match_score:
-                                        best_match = layer_name
-                                        best_match_score = len(layer_name)
-
-                            if best_match:
-                                target_layer = layer_dict[best_match]
-                                print(f"Matched {group_name} to {best_match}")
-
-                        if target_layer is None:
-                            #print(f"No matching layer found for {group_name}")
-                            continue
-
-                        # Get weight names from group
-                        weight_names = []
-                        if 'weight_names' in group.attrs:
-                            weight_names = [n.decode('utf8') if isinstance(n, bytes) else n for n in group.attrs['weight_names']]
-                        else:
-                            for key in group:
-                                if isinstance(group[key], h5py.Dataset):
-                                    weight_names.append(key)
-
-                        if not weight_names:
-                            continue
-
-                        # Extract weights
-                        weight_values = []
-                        for weight_name in weight_names:
-                            weight_path = f"{group_name}/{weight_name}"
-                            if weight_path in h5_file:
-                                weight_values.append(h5_file[weight_path][()])
-
-                        if not weight_values:
-                            continue
-
-                        # Match weights to layer
-                        layer_weights = target_layer.get_weights()
-
-                        if len(layer_weights) == len(weight_values):
-                            # Check if shapes match
-                            shapes_match = True
-                            for i, (lw, wv) in enumerate(zip(layer_weights, weight_values)):
-                                if lw.shape != wv.shape:
-                                    print(f"  Shape mismatch for {group_name} weights[{i}]: {lw.shape} vs {wv.shape}")
-                                    shapes_match = False
-                                    # Try to adapt the shape if possible
-                                    if len(lw.shape) == len(wv.shape):
-                                        # If dimensions are same but sizes differ, try reshaping
-                                        try:
-                                            # Resize weight values if they're different by a small amount
-                                            resized = np.resize(wv, lw.shape)
-                                            weight_values[i] = resized
-                                            shapes_match = True
-                                            print(f"    Resized weight to match layer shape")
-                                        except Exception as e:
-                                            print(f"    Failed to resize: {e}")
-
-                            if shapes_match:
-                                # Set weights
-                                target_layer.set_weights(weight_values)
-                                loaded_layers += 1
-                                matched_layers.append(target_layer.name)
-                                print(f"  Loaded weights for layer: {target_layer.name}")
-
-                    # Print summary
-                    if loaded_layers > 0:
-                        print(f"Successfully loaded weights for {loaded_layers}/{tried_layers} layers")
-                        print(f"Layers with weights: {matched_layers[:5]}...")
-                        return True
-                    else:
-                        print("No weights could be loaded")
-                        return False
-
-            except Exception as e:
-                print(f"Alternative loading method failed with error: {e}")
-                import traceback
-                traceback.print_exc()
-
-        print("Weight loading failed after trying all available methods")
-        return False
-
-    return verbose_load_weights
-
 def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, use_cbam=True, pretrained_weights=None):
     """
     Create an oil spill detection model using SegFormer-B2 architecture with specialized enhancements
@@ -782,7 +542,7 @@ def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, u
         num_classes: Number of output classes (5 for: Sea Surface, Oil Spill, Look-alike, Ship, Land)
         drop_rate: Dropout rate for regularization
         use_cbam: Whether to use CBAM attention modules to enhance feature extraction
-        pretrained_weights: Path to pretrained weights file (converted from PyTorch)
+        pretrained_weights: No longer used, kept for backward compatibility
 
     Returns:
         Oil spill segmentation model based on SegFormer-B2 architecture
@@ -855,12 +615,8 @@ def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, u
     # Create the model
     model = models.Model(inputs=inputs, outputs=logits, name='OilSpillSegformer-B2')
 
-    # Load pretrained weights if provided
-    if pretrained_weights is not None:
-        print(f"Loading pretrained weights from: {pretrained_weights}")
-        weight_loader = create_pretrained_weight_loader()
-        if not weight_loader(model, pretrained_weights):
-            print("Failed to load pretrained weights, training from scratch instead")
+    # No longer loading pretrained weights, always training from scratch
+    print("Training model from scratch (no pretrained weights)")
 
     return model
 
@@ -928,26 +684,17 @@ if __name__ == "__main__":
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
     print("Mixed precision policy set to mixed_float16")
 
-    # Path to pretrained weights - use the converted weights file
-    pretrained_weights_path = 'pretrained_weights/segformer_b2_pretrain.weights.h5'
-    if os.path.exists(pretrained_weights_path):
-        print(f"Found pretrained weights at {pretrained_weights_path}")
-    else:
-        print(f"Warning: Pretrained weights not found at {pretrained_weights_path}")
-        pretrained_weights_path = None
-
     try:
-        print("Creating OilSpillSegformer-B2 model with pretrained weights...")
+        print("Creating OilSpillSegformer-B2 model...")
         # Define input shape and number of classes
         input_shape = (384, 384, 1)  # Standard shape for SAR imagery
         num_classes = 5  # Sea Surface, Oil Spill, Look-alike, Ship, Land
 
-        # Create the OilSpillSegformer model with pretrained weights
+        # Create the OilSpillSegformer model
         model = OilSpillSegformer(
             input_shape=input_shape,
             num_classes=num_classes,
-            use_cbam=True,
-            pretrained_weights=pretrained_weights_path
+            use_cbam=True
         )
         print("\nModel summary:")
         model.summary()
