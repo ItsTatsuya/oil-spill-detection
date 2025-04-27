@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 import time
-import sys  # For colored terminal output
 
 # ANSI color codes for terminal highlighting
 class TermColors:
@@ -318,7 +317,7 @@ def plot_training_curves(history, save_path='miou_curves.png'):
 def train_and_evaluate():
     NUM_CLASSES = 5
     BATCH_SIZE = 2  # Reduced batch size for memory efficiency with augmentations
-    EPOCHS = 800
+    EPOCHS = 600
     LEARNING_RATE = 3e-5
     IMG_SIZE = (384, 384)
 
@@ -432,26 +431,78 @@ def train_and_evaluate():
     if os.path.exists(latest_weights):
         print(f"Loading checkpoint from {latest_weights}...")
         try:
-            model.load_weights(latest_weights, by_name=True, skip_mismatch=True)
+            # First attempt: load weights without extra parameters
+            model.load_weights(latest_weights)
+            print("Successfully loaded checkpoint with standard load_weights")
+
+            # Load epoch information
             checkpoint_info_path = 'checkpoints/checkpoint_info.txt'
             if os.path.exists(checkpoint_info_path):
                 with open(checkpoint_info_path, 'r') as f:
                     initial_epoch = int(f.read().strip())
                 print(f"Resuming from epoch {initial_epoch}")
         except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            print("Continuing with pre-trained weights or from scratch")
-            initial_epoch = 0
+            print(f"Standard loading failed: {e}")
+            try:
+                # Second attempt: try loading with custom options
+                model.load_weights(latest_weights, by_name=False, skip_mismatch=False)
+                print("Successfully loaded checkpoint with modified options")
+
+                checkpoint_info_path = 'checkpoints/checkpoint_info.txt'
+                if os.path.exists(checkpoint_info_path):
+                    with open(checkpoint_info_path, 'r') as f:
+                        initial_epoch = int(f.read().strip())
+                    print(f"Resuming from epoch {initial_epoch}")
+            except Exception as e2:
+                print(f"Modified loading also failed: {e2}")
+                try:
+                    # Third attempt: try with custom weight loader from model.py
+                    from model import create_pretrained_weight_loader
+                    weight_loader = create_pretrained_weight_loader()
+                    success = weight_loader(model, latest_weights)
+                    if success:
+                        print("Successfully loaded checkpoint with custom weight loader")
+
+                        checkpoint_info_path = 'checkpoints/checkpoint_info.txt'
+                        if os.path.exists(checkpoint_info_path):
+                            with open(checkpoint_info_path, 'r') as f:
+                                initial_epoch = int(f.read().strip())
+                            print(f"Resuming from epoch {initial_epoch}")
+                    else:
+                        print("Custom weight loader did not succeed")
+                        print("Continuing with pre-trained weights or from scratch")
+                        initial_epoch = 0
+                except Exception as e3:
+                    print(f"All weight loading methods failed: {e3}")
+                    print("Continuing with pre-trained weights or from scratch")
+                    initial_epoch = 0
     else:
         print("No checkpoint found. Using pre-trained weights or training from scratch.")
+
+    # Create a suitable warmup period based on total epochs
+    warmup_epochs = 10 if EPOCHS >= 100 else 1  # Use 10 epochs warmup for long training, 1 for short runs
 
     lr_schedule = create_cosine_decay_with_warmup(
         epochs=EPOCHS,
         train_steps=train_steps,
         batch_size=BATCH_SIZE,
         initial_lr=LEARNING_RATE,
-        warmup_epochs=10
+        warmup_epochs=warmup_epochs
     )
+
+    # Debug learning rate schedule
+    print(f"Learning rate schedule configuration:")
+    print(f"  Total epochs: {EPOCHS}")
+    print(f"  Warmup epochs: {warmup_epochs}")
+    print(f"  Initial learning rate: {LEARNING_RATE}")
+
+    # Print expected learning rates at various points
+    iterations = tf.Variable(0)
+    print(f"Initial learning rate (step 0): {lr_schedule(iterations).numpy():.2e}")
+    iterations.assign(train_steps // 2)  # Middle of first epoch
+    print(f"Mid-warmup learning rate (step {iterations.numpy()}): {lr_schedule(iterations).numpy():.2e}")
+    iterations.assign(train_steps * warmup_epochs)  # End of warmup period
+    print(f"End of warmup learning rate (step {iterations.numpy()}): {lr_schedule(iterations).numpy():.2e}")
 
     # Check TensorFlow/Keras version and use appropriate optimizer
     # Detect if we're using Keras 3 (which has built-in weight decay for Adam)
@@ -613,25 +664,76 @@ def train_and_evaluate():
 
     plot_training_curves(history, save_path='segformer_b2_miou_curves.png')
 
-    print("\nEvaluating with multi-scale prediction...")
+    print("\nEvaluating with Test Time Augmentation and multi-scale prediction...")
     eval_batch_size = 2
-    multi_scale_predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=eval_batch_size)
+
+    # Import the TTA class
+    from test_time_augmentation import TestTimeAugmentation
+
+    # Create TTA engine with optimal configuration for oil spill detection
+    tta_engine = TestTimeAugmentation(
+        model=model,
+        num_augmentations=8,  # Use 8 augmentations for comprehensive coverage
+        use_flips=True,       # Horizontal/vertical flips for orientation invariance
+        use_scales=True,      # Multiple scales for different feature sizes
+        use_rotations=True,   # Rotations to handle different oil spill orientations
+        include_original=True # Include the original image in predictions
+    )
+    colored_print("Test Time Augmentation enabled with 8 augmentations for better oil spill detection", TermColors.GREEN)
+
+    # Initialize metrics
     test_metric = IoUMetric(num_classes=NUM_CLASSES)
     eval_start_time = time.time()
 
-    for images, labels in tqdm(test_ds, desc="Evaluating"):
-        predictions = multi_scale_predictor.predict(images)
+    # Evaluate with TTA
+    for images, labels in tqdm(test_ds, desc="Evaluating with TTA"):
+        # Apply TTA to get enhanced predictions
+        predictions = tta_engine.predict(images)
         test_metric.update_state(labels, predictions)
 
     eval_time = time.time() - eval_start_time
     minutes, seconds = divmod(eval_time, 60)
-    print(f"\nEvaluation completed in {int(minutes)}m {seconds:.1f}s")
+    print(f"\nTTA Evaluation completed in {int(minutes)}m {seconds:.1f}s")
     mean_iou = test_metric.result().numpy()
-    print(f"Test Mean IoU: {mean_iou:.4f}")
+    print(f"Test Mean IoU with TTA: {mean_iou:.4f}")
     class_iou = test_metric.get_class_iou()
-    print("\nClass-wise IoU:")
+    print("\nClass-wise IoU with TTA:")
     for class_name, iou in class_iou.items():
         print(f"  {class_name}: {iou:.4f}")
+
+    # Compare with simple multi-scale prediction (optional)
+    print("\nFor comparison, also evaluating with basic multi-scale prediction (no TTA)...")
+    multi_scale_predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], batch_size=eval_batch_size)
+    baseline_metric = IoUMetric(num_classes=NUM_CLASSES)
+    baseline_start_time = time.time()
+
+    for images, labels in tqdm(test_ds, desc="Evaluating with multi-scale"):
+        predictions = multi_scale_predictor.predict(images)
+        baseline_metric.update_state(labels, predictions)
+
+    baseline_time = time.time() - baseline_start_time
+    baseline_minutes, baseline_seconds = divmod(baseline_time, 60)
+    print(f"\nBasic evaluation completed in {int(baseline_minutes)}m {baseline_seconds:.1f}s")
+    baseline_mean_iou = baseline_metric.result().numpy()
+    print(f"Test Mean IoU with multi-scale only: {baseline_mean_iou:.4f}")
+    baseline_class_iou = baseline_metric.get_class_iou()
+
+    # Show improvement from TTA
+    iou_improvement = mean_iou - baseline_mean_iou
+    colored_print(f"TTA improved overall IoU by: {iou_improvement:.4f} ({iou_improvement*100:.1f}%)",
+                 TermColors.GREEN if iou_improvement > 0 else TermColors.RED)
+
+    # Save results to CSV for analysis
+    import pandas as pd
+    results_df = pd.DataFrame({
+        'Class': list(class_iou.keys()),
+        'IoU_with_TTA': [class_iou[cls] for cls in class_iou.keys()],
+        'IoU_baseline': [baseline_class_iou[cls] for cls in baseline_class_iou.keys()],
+        'Improvement': [class_iou[cls] - baseline_class_iou[cls] for cls in class_iou.keys()]
+    })
+    os.makedirs('logs/class_ious', exist_ok=True)
+    results_df.to_csv(f'logs/class_ious/final_class_ious.csv', index=False)
+    print(f"Detailed IoU results saved to logs/class_ious/final_class_ious.csv")
 
     return history
 

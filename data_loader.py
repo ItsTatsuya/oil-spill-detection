@@ -19,12 +19,9 @@ def silent_tf_import():
 tf = silent_tf_import()
 
 # Import mixed precision
-from tensorflow.keras import mixed_precision
+from tensorflow.keras import mixed_precision # type: ignore
 policy = mixed_precision.global_policy()
 print(f"Data loader using mixed precision policy: {policy.name}")
-
-# Import custom augmentation
-from augmentation import _augment_image_and_label
 
 # Suppress TensorFlow warnings
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
@@ -38,25 +35,6 @@ def analyze_class_distribution(label_paths):
     adjusted_weights = {i: float(weights[i]) for i in range(5)}
     tf.print("Using predefined class weights:", adjusted_weights)
     return adjusted_weights
-
-@tf.function
-def apply_lightweight_augmentation(image, label):
-    """Apply lightweight augmentations with minimal memory usage."""
-    image = tf.ensure_shape(image, [384, 384, 1])
-    label = tf.ensure_shape(label, [384, 384, 1])
-
-    # Random horizontal flip
-    if tf.random.uniform(()) > 0.5:
-        image = tf.image.flip_left_right(image)
-        label = tf.image.flip_left_right(label)
-
-    # Random small rotation (±10°)
-    if tf.random.uniform(()) > 0.5:
-        angle = tf.random.uniform((), -0.174, 0.174)
-        image = tf.image.rot90(image, k=tf.cast(tf.round(angle * 2 / 3.14159), tf.int32) % 4)
-        label = tf.image.rot90(label, k=tf.cast(tf.round(angle * 2 / 3.14159), tf.int32) % 4)
-
-    return image, label
 
 @tf.function
 def sample_patches(image, label, patch_size=384):
@@ -167,7 +145,6 @@ def load_dataset(data_dir='dataset', split='train', batch_size=16):
 
     if split == 'train':
         dataset = dataset.map(sample_patches, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.map(apply_lightweight_augmentation, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.map(lambda x, y: (tf.cast(x, tf.float32), y), num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.shuffle(buffer_size=min(2000, num_samples), seed=42)
         dataset = dataset.batch(batch_size, drop_remainder=True)

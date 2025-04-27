@@ -32,6 +32,7 @@ checkpoints/
 *.h5
 *.weights.h5
 pretrained_weights/
+graph_tool.py
 
 # Keep README images
 !readme_images/*.png
