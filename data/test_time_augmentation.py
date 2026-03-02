@@ -52,7 +52,7 @@ class TestTimeAugmentation:
 
         elif aug_type.startswith('rotate_'):
             angle = float(aug_type.split('_')[1])
-            from augmentation import rotate_image
+            from .augmentation import rotate_image
             rotated = rotate_image(image, angle, 'bilinear')
 
             if tf.shape(rotated)[0] != self.expected_height or tf.shape(rotated)[1] != self.expected_width:
@@ -123,7 +123,7 @@ class TestTimeAugmentation:
 
         elif aug_type == 'rotate':
             angle = aug_info['angle']
-            from augmentation import rotate_image
+            from .augmentation import rotate_image
             rotated_back = rotate_image(pred, angle, 'bilinear')
             if orig_size is not None:
                 return tf.image.resize(rotated_back, orig_size, method='bilinear')

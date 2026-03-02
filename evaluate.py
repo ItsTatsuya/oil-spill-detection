@@ -28,7 +28,7 @@ policy = mixed_precision.global_policy()
 print(f"Mixed precision policy: {policy.name}")
 
 # Import the data loading function from data_loader.py
-from data_loader import load_dataset
+from data.data_loader import load_dataset
 
 # Define baseline results for comparison
 BASELINE_RESULTS = {
@@ -59,7 +59,7 @@ class MultiScalePredictor:
         self.expected_channels = self.model.input_shape[3]
 
         if self.use_tta:
-            from test_time_augmentation import TestTimeAugmentation
+            from data.test_time_augmentation import TestTimeAugmentation
             self.tta = TestTimeAugmentation(
                 model,
                 num_augmentations=8,
@@ -162,6 +162,18 @@ class MultiScalePredictor:
 
 
 def compute_iou(y_true, y_pred, num_classes=5):
+    """
+    Compute pixel-level IoU per class from accumulated confusion matrix.
+
+    IoU_c = TP_c / (TP_c + FP_c + FN_c)
+    mIoU  = mean over classes present in at least one ground-truth mask.
+
+    Returns
+    -------
+    mean_iou : float
+    class_ious : ndarray (num_classes,)
+    confusion_matrix : ndarray (num_classes, num_classes)  – rows = true, cols = pred
+    """
     y_true = tf.cast(y_true, tf.int32)
     y_true = tf.squeeze(y_true, axis=-1)
 
@@ -182,18 +194,84 @@ def compute_iou(y_true, y_pred, num_classes=5):
 
         confusion_matrix += cm_i
 
-    sum_over_row = tf.reduce_sum(confusion_matrix, axis=0)
-    sum_over_col = tf.reduce_sum(confusion_matrix, axis=1)
+    sum_over_row = tf.reduce_sum(confusion_matrix, axis=0)   # predicted positives per class
+    sum_over_col = tf.reduce_sum(confusion_matrix, axis=1)   # actual positives per class
     true_positives = tf.linalg.tensor_diag_part(confusion_matrix)
 
     denominator = sum_over_row + sum_over_col - true_positives
-
     class_ious = tf.math.divide_no_nan(true_positives, denominator)
 
     mask = tf.greater(sum_over_col, 0)
     mean_iou = tf.reduce_mean(tf.boolean_mask(class_ious, mask))
 
-    return mean_iou.numpy(), class_ious.numpy()
+    return mean_iou.numpy(), class_ious.numpy(), confusion_matrix.numpy()
+
+
+def compute_precision_recall_f1(confusion_matrix):
+    """
+    Derive per-class Precision, Recall, and F1-score from a confusion matrix.
+
+    Convention: confusion_matrix[i, j] = number of pixels with true label i
+    predicted as label j.
+
+    Precision_c = TP_c / (TP_c + FP_c)   (column-wise predicted positives)
+    Recall_c    = TP_c / (TP_c + FN_c)   (row-wise actual positives)
+    F1_c        = 2 * P * R / (P + R)
+    """
+    cm = confusion_matrix.astype(np.float64)
+    tp = np.diag(cm)
+    row_sums = cm.sum(axis=1)   # actual positives  (TP + FN)
+    col_sums = cm.sum(axis=0)   # predicted positives (TP + FP)
+
+    precision = np.where(col_sums > 0, tp / col_sums, 0.0)
+    recall    = np.where(row_sums > 0, tp / row_sums, 0.0)
+    denom     = precision + recall
+    f1        = np.where(denom > 0, 2 * precision * recall / denom, 0.0)
+
+    return precision, recall, f1
+
+
+def compute_bootstrap_ci(per_image_labels, per_image_preds, num_classes=5,
+                         n_bootstrap=1000, confidence=0.95, seed=42):
+    """
+    Estimate a bootstrap confidence interval for mean IoU by resampling images.
+
+    Parameters
+    ----------
+    per_image_labels : list of np.ndarray  (H, W) int arrays
+    per_image_preds  : list of np.ndarray  (H, W) int arrays (argmax already applied)
+    n_bootstrap      : number of bootstrap iterations
+    confidence       : desired confidence level (default 0.95 → 95 % CI)
+
+    Returns
+    -------
+    ci_low, ci_high : float  (same scale as mean_iou, i.e. 0–1)
+    """
+    rng = np.random.default_rng(seed)
+    n = len(per_image_labels)
+    bootstrap_mious = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        cm = np.zeros((num_classes, num_classes), dtype=np.float64)
+        for i in idx:
+            y_t = per_image_labels[i].ravel().astype(np.int32)
+            y_p = per_image_preds[i].ravel().astype(np.int32)
+            for c_t, c_p in zip(y_t, y_p):
+                cm[c_t, c_p] += 1
+
+        tp   = np.diag(cm)
+        fp   = cm.sum(axis=0) - tp
+        fn   = cm.sum(axis=1) - tp
+        denom = tp + fp + fn
+        iou   = np.where(denom > 0, tp / denom, 0.0)
+        present = cm.sum(axis=1) > 0
+        bootstrap_mious.append(iou[present].mean())
+
+    alpha = 1.0 - confidence
+    ci_low  = float(np.percentile(bootstrap_mious, 100 * alpha / 2))
+    ci_high = float(np.percentile(bootstrap_mious, 100 * (1 - alpha / 2)))
+    return ci_low, ci_high
 
 
 def measure_inference_time(model, num_runs=5, batch_size=1, multi_scale=False, use_tta=False):
@@ -308,8 +386,8 @@ def apply_ship_enhancement(predictions, ship_class_idx=3):
 
 def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postprocessing=True,
                 use_tta=True, tta_num_augs=8):
-    from model import OilSpillSegformer, create_pretrained_weight_loader
-    from test_time_augmentation import TestTimeAugmentation
+    from model.model import OilSpillSegformer, create_pretrained_weight_loader
+    from data.test_time_augmentation import TestTimeAugmentation
 
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
@@ -395,6 +473,10 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
     all_true_labels = []
     all_predictions = []
 
+    # Also collect individual images for bootstrap CI
+    per_image_true  = []
+    per_image_pred  = []
+
     progress_bar = tqdm(test_batches, total=total_batches, desc="Evaluating", unit="batch")
 
     for images, labels in progress_bar:
@@ -411,6 +493,13 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
                 final_predictions = original_predictions
             all_true_labels.append(labels)
             all_predictions.append(final_predictions)
+
+            # Store per-image argmax predictions for bootstrap sampling
+            labels_np = tf.squeeze(labels, axis=-1).numpy().astype(np.int32)
+            pred_np   = tf.argmax(final_predictions, axis=-1).numpy().astype(np.int32)
+            for b in range(labels_np.shape[0]):
+                per_image_true.append(labels_np[b])
+                per_image_pred.append(pred_np[b])
         except Exception:
             continue
 
@@ -420,7 +509,15 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
     true_labels = tf.concat(all_true_labels, axis=0)
     predictions = tf.concat(all_predictions, axis=0)
 
-    mean_iou, class_ious = compute_iou(true_labels, predictions, num_classes=5)
+    mean_iou, class_ious, confusion_mat = compute_iou(true_labels, predictions, num_classes=5)
+
+    # Precision / Recall / F1 per class
+    precision, recall, f1 = compute_precision_recall_f1(confusion_mat)
+
+    # Bootstrap 95 % CI for mean IoU (image-level resampling)
+    print("Computing bootstrap confidence interval (1000 iterations)...")
+    ci_low, ci_high = compute_bootstrap_ci(per_image_true, per_image_pred, num_classes=5,
+                                           n_bootstrap=1000, confidence=0.95)
 
     inference_time_results = measure_inference_time(model, multi_scale=True, use_tta=use_tta)
     single_scale_time_results = measure_inference_time(model, multi_scale=False, use_tta=False)
@@ -429,7 +526,12 @@ def evaluate_model(model_path, test_dataset, batch_size=8, apply_ship_postproces
 
     results = {
         'mean_iou': mean_iou * 100,
-        'class_ious': {class_names[i]: class_ious[i] * 100 for i in range(len(class_names))},
+        'mean_iou_ci': (ci_low * 100, ci_high * 100),
+        'class_ious':      {class_names[i]: class_ious[i] * 100 for i in range(len(class_names))},
+        'class_precision': {class_names[i]: precision[i]  * 100 for i in range(len(class_names))},
+        'class_recall':    {class_names[i]: recall[i]     * 100 for i in range(len(class_names))},
+        'class_f1':        {class_names[i]: f1[i]         * 100 for i in range(len(class_names))},
+        'confusion_matrix': confusion_mat,
         'inference_time_ms': inference_time_results,
         'single_scale_time_ms': single_scale_time_results
     }
@@ -543,11 +645,17 @@ def main():
     if model_results:
         results = {model_name: model_results}
 
+        ci_lo, ci_hi = model_results['mean_iou_ci']
         print(f"\nResults for {model_name}:")
-        print(f"Mean IoU: {model_results['mean_iou']:.2f}%")
-        print("Class-wise IoU:")
-        for class_name, iou in model_results['class_ious'].items():
-            print(f"  {class_name}: {iou:.2f}%")
+        print(f"Mean IoU: {model_results['mean_iou']:.2f}%  (95% CI: {ci_lo:.2f}% – {ci_hi:.2f}%)")
+        print(f"{'Class':<15} {'IoU':>7} {'Precision':>11} {'Recall':>9} {'F1':>7}")
+        print("-" * 55)
+        for cn in model_results['class_ious']:
+            print(f"{cn:<15} "
+                  f"{model_results['class_ious'][cn]:>6.2f}% "
+                  f"{model_results['class_precision'][cn]:>10.2f}% "
+                  f"{model_results['class_recall'][cn]:>8.2f}% "
+                  f"{model_results['class_f1'][cn]:>6.2f}%")
         print(f"Single-scale inference time: {model_results['single_scale_time_ms']['mixed_precision_ms']:.2f} ms")
         print(f"Multi-scale inference time: {model_results['inference_time_ms']['mixed_precision_ms']:.2f} ms")
 

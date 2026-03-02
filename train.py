@@ -42,8 +42,8 @@ mixed_precision.set_global_policy('mixed_float16')
 policy = mixed_precision.global_policy()
 print(f"Mixed precision policy: {policy.name}")
 
-from data_loader import load_dataset
-from augmentation import apply_augmentation
+from data.data_loader import load_dataset
+from data.augmentation import apply_augmentation
 
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
@@ -418,8 +418,8 @@ def train_and_evaluate():
     use_pretrained = os.path.exists(pretrained_weights_path)
     print(f"Pre-trained weights {'found' if use_pretrained else 'not found'} at {pretrained_weights_path}")
 
-    from model import OilSpillSegformer
-    from loss import HybridSegmentationLoss
+    from model.model import OilSpillSegformer
+    from model.loss import HybridSegmentationLoss
     model = OilSpillSegformer(
         input_shape=(*IMG_SIZE, 1),
         num_classes=NUM_CLASSES,
@@ -457,7 +457,7 @@ def train_and_evaluate():
                 print(f"Modified loading also failed: {e2}")
                 try:
                     # Third attempt: try with custom weight loader from model.py
-                    from model import create_pretrained_weight_loader
+                    from model.model import create_pretrained_weight_loader
                     weight_loader = create_pretrained_weight_loader()
                     success = weight_loader(model, latest_weights)
                     if success:
@@ -668,7 +668,7 @@ def train_and_evaluate():
     eval_batch_size = 2
 
     # Import the TTA class
-    from test_time_augmentation import TestTimeAugmentation
+    from data.test_time_augmentation import TestTimeAugmentation
 
     # Create TTA engine with optimal configuration for oil spill detection
     tta_engine = TestTimeAugmentation(
