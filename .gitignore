@@ -24,6 +24,7 @@ wheels/
 oilspill/
 venv/
 ENV/
+.venv/
 
 # Logs and checkpoints
 logs/

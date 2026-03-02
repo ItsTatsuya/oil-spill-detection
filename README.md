@@ -1,219 +1,231 @@
-# Oil Spill Detection Using Deep Learning
+# Oil Spill Detection in SAR Imagery Using SegFormer-B2
 
-A deep learning-based segmentation model for oil spill detection in SAR (Synthetic Aperture Radar) imagery.
+**Semantic segmentation of Synthetic Aperture Radar (SAR) satellite images for automated oil spill detection in maritime environments.**
 
-## Project Overview
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![TensorFlow 2.19](https://img.shields.io/badge/TensorFlow-2.19-orange.svg)](https://www.tensorflow.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-This project implements a state-of-the-art semantic segmentation pipeline for detecting oil spills in radar satellite imagery. The model is designed to distinguish between five key classes in maritime environments:
+## Abstract
 
-- Sea Surface (background)
-- Oil Spill
-- Look-alike (false positives)
-- Ship
-- Land
+Oil spills in marine environments cause severe ecological damage, making timely and accurate detection critical for rapid response. This project presents a fully engineered training and evaluation pipeline for oil spill detection in SAR imagery using **SegFormer-B2**, a hierarchical vision transformer (~27.99 M parameters). The system classifies each pixel into five semantic classes — _Sea Surface_, _Oil Spill_, _Look-alike_, _Ship_, and _Land_ — without modifying the base model architecture. Key contributions include: (1) a **hybrid segmentation loss** combining weighted cross-entropy, focal, Dice, and boundary terms; (2) **smart patch sampling** that up-samples rare classes during training; (3) **multi-GPU distributed training** with mixed-precision and EMA weight averaging; and (4) **multi-scale test-time augmentation** with ship-specific post-processing. The pipeline is designed for 8× NVIDIA A100 GPUs and trains with a global batch size of 256.
 
-## Architecture
+---
 
-### SegFormer-B2 Model
+## Method Overview
 
-The primary model used is a customized version of SegFormer-B2 (called OilSpillSegformer), an efficient transformer-based segmentation architecture optimized for oil spill detection:
+### Architecture
 
-- **Backbone**: Mix Vision Transformer (MiT) with hierarchical structure
-- **Input Size**: 384×384×1 (single-channel SAR imagery)
-- **Embedding Dimensions**: [64, 128, 320, 512] (B2 configuration)
-- **Number of Transformer Layers**: [3, 4, 6, 3]
-- **Number of Attention Heads**: [1, 2, 5, 8]
-- **MLP Ratios**: [8, 8, 4, 4]
-- **Decoder Embedding Dims**: 768
-- **Output Resolution**: Full input resolution using progressive upsampling
-- **Parameters**: ~27.99M
+The backbone is **SegFormer-B2** (Mix Vision Transformer) with a lightweight all-MLP decoder, enhanced with a **CBAM** (Convolutional Block Attention Module) for SAR-specific feature refinement.
 
-### CBAM Attention Module
+| Component            | Specification                              |
+| :------------------- | :----------------------------------------- |
+| Backbone             | Mix Vision Transformer (MiT-B2)            |
+| Input resolution     | 384 × 384 × 1 (grayscale SAR)              |
+| Embedding dimensions | [64, 128, 320, 512]                        |
+| Transformer layers   | [3, 4, 6, 3]                               |
+| Attention heads      | [1, 2, 5, 8]                               |
+| MLP ratios           | [8, 8, 4, 4]                               |
+| Decoder embedding    | 768                                        |
+| Output               | 384 × 384 × 5 (full-resolution, 5 classes) |
+| Parameters           | ~27.99 M                                   |
+| Attention module     | CBAM (channel + 7×7 spatial)               |
 
-The model incorporates Convolutional Block Attention Module (CBAM) specifically enhanced for SAR oil spill imagery:
+### Hybrid Loss Function
 
-- **Channel Attention**: Emphasizes important spectral features in the noisy radar imagery
-- **Spatial Attention**: 7×7 kernel for capturing broader spatial context of oil spills
-- **Enhanced Boundary Detection**: Special focus on water-oil boundaries that are challenging in SAR images
+A multi-component loss is designed to address class imbalance, hard-example mining, and boundary fidelity:
 
-### Optimization Strategy
+$$\mathcal{L} = 0.35 \cdot \mathcal{L}_{\text{CE}} + 0.25 \cdot \mathcal{L}_{\text{Focal}} + 0.30 \cdot \mathcal{L}_{\text{Dice}} + 0.10 \cdot \mathcal{L}_{\text{Boundary}}$$
 
-- **Mixed Precision Training**: Using float16 for computation and float32 for variables
-- **Learning Rate Schedule**: Cosine decay with warmup (initial LR: 3e-5)
-- **Optimizer**: Adam with AMSGrad and gradient clipping (clipnorm=1.0)
-- **Weight Decay**: 1e-4
-- **Batch Size**: 2 (memory-optimized)
-- **Training Epochs**: 600 with early stopping (patience: 100)
+| Term                   | Purpose                                   | Key Parameters                     |
+| :--------------------- | :---------------------------------------- | :--------------------------------- |
+| Weighted Cross-Entropy | Per-class balancing via inverse-frequency | Label smoothing ε = 0.1            |
+| Focal Loss             | Down-weights easy examples                | γ = 2.0                            |
+| Dice Loss              | Region-level overlap optimisation         | Per-class soft Dice                |
+| Boundary Loss          | Penalises errors at class boundaries      | Sobel edge detection, boost = 2.5× |
 
-## Loss Function
+Class weights are computed from inverse pixel frequency across the training set and cached to avoid recomputation.
 
-The model uses a custom Hybrid Segmentation Loss tailored for oil spill and ship detection:
+### Training Strategy
+
+| Hyperparameter    | Value                                                    |
+| :---------------- | :------------------------------------------------------- |
+| Optimizer         | AdamW (β₁ = 0.9, β₂ = 0.999, ε = 1e-7, AMSGrad)          |
+| Learning rate     | 3.4 × 10⁻⁴ (√-scaled from 3 × 10⁻⁵ for batch 256)        |
+| LR schedule       | Cosine decay with 25-epoch linear warmup (α_min = 0.001) |
+| LR reduction      | ReduceLROnPlateau (factor = 0.5, patience = 15)          |
+| Batch size        | 256 global (32 per GPU × 8 GPUs)                         |
+| Epochs            | 600 max                                                  |
+| Early stopping    | Patience = 30 (monitored on val mIoU)                    |
+| Weight decay      | 1 × 10⁻⁴                                                 |
+| Gradient clipping | clipnorm = 1.0                                           |
+| EMA               | Exponential moving average, decay = 0.999                |
+| Mixed precision   | float16 compute, float32 variables (XLA JIT)             |
+| Distribution      | TensorFlow MirroredStrategy (8 replicas)                 |
+| Reproducibility   | Global seed = 42                                         |
+
+### Data Pipeline
+
+**Train/Val/Test split**: The official training set is deterministically split 85/15 at the file level into training and validation subsets. The test set is held out entirely for final evaluation.
+
+**Smart patch sampling** (training only): Images are loaded at original resolution and a 384×384 crop is extracted. With 50% probability, the crop is centred on an Oil Spill or Ship pixel, naturally up-sampling rare classes without duplicating images.
+
+**Augmentation pipeline** (applied per sample):
+
+| Transform        | Details                                      | Probability |
+| :--------------- | :------------------------------------------- | :---------: |
+| Horizontal flip  | Mirror left–right                            |     50%     |
+| Vertical flip    | Mirror top–bottom                            |     30%     |
+| Rotation         | ±15° affine (reflect fill) or 90° discrete   |  80% / 20%  |
+| Speckle noise    | Multiplicative N(0, σ = 0.15) — SAR-specific |     70%     |
+| Brightness       | ±0.2 delta                                   |     40%     |
+| Contrast         | Factor ∈ [0.8, 1.2]                          |     40%     |
+| Gamma correction | γ ∈ [0.7, 1.5]                               |     30%     |
+| Gaussian blur    | 5×5, σ ∈ [0.5, 1.5]                          |     20%     |
+| Cutout           | 1–3 patches, 5–15% of image each             |     30%     |
+
+Validation and test sets are resized to 384×384 deterministically (no augmentation, cached in memory).
+
+### Inference
+
+**Multi-scale prediction**: Input is evaluated at scales {0.5, 0.75, 1.0, 1.25, 1.5} and predictions are averaged.
+
+**Test-time augmentation (TTA)**: 8 geometric augmentations (flips + rotations) are applied at each scale; softmax probabilities are averaged before argmax.
+
+**Ship post-processing**: Morphological filtering with probability boosting (1.35×) for the Ship class to recover small detections.
+
+---
+
+## Dataset
+
+The **ROBORDER Oil Spill Detection Dataset** contains SAR images annotated with five semantic classes:
+
+| Class ID | Label       | Description                                             |
+| :------: | :---------- | :------------------------------------------------------ |
+|    0     | Sea Surface | Background ocean water                                  |
+|    1     | Oil Spill   | Petroleum / oil spill regions                           |
+|    2     | Look-alike  | Natural phenomena mimicking oil (wind slicks, biogenic) |
+|    3     | Ship        | Maritime vessels                                        |
+|    4     | Land        | Coastal and land regions                                |
 
 ```
-HybridSegmentationLoss = 0.4*CE_Loss + 0.3*Focal_Loss + 0.3*Dice_Loss
+dataset/
+├── train/
+│   ├── images/         # SAR .jpg images
+│   ├── labels/         # RGB label visualisations
+│   └── labels_1D/      # Single-channel masks (pixel values 0–4)
+└── test/
+    ├── images/
+    ├── labels/
+    └── labels_1D/
 ```
 
-Where:
+The dataset exhibits extreme class imbalance — Sea Surface and Land dominate, while Ship pixels constitute < 0.1% of the total. The pipeline addresses this through inverse-frequency class weighting and smart patch sampling.
 
-- **CE_Loss**: Weighted cross-entropy with label smoothing
-- **Focal_Loss**: Gamma=3.0, focuses on hard-to-detect objects (small oil spills, ships)
-- **Dice_Loss**: Addresses class imbalance and improves boundary delineation
-- **Class Weights**: Higher weights for minority classes (oil spill, look-alike, ship)
-
-## Data Augmentation Pipeline
-
-The augmentation pipeline is implemented in `augmentation.py` and applied using TensorFlow's data pipeline:
-
-### Training Augmentations
-
-1. **Random Flips**:
-
-   - Horizontal flip (p=0.5)
-   - Vertical flip (p=0.3)
-
-2. **Random Rotations**:
-
-   - Small angle rotations (±15°)
-   - 90° rotations (p=0.2)
-
-3. **Speckle Noise**:
-   - Applied with p=0.7
-   - Simulates realistic SAR noise patterns (stddev=0.15)
-   - Important for model robustness to different sensor conditions
-
-### Test-Time Augmentation (TTA)
-
-During inference, a comprehensive TTA strategy is applied to improve prediction quality:
-
-1. **Multiple augmentations**: 8 variations of the input image
-2. **Flips and rotations**: Applied to handle orientation variations
-3. **Multi-scale processing**: Scales [0.75, 1.0, 1.25] for better context
-4. **Prediction fusion**: Softmax averaging for more stable predictions
-5. **Ship enhancement**: Post-processing to improve small ship detection
-
-## Training Hardware
-
-The model was trained on a consumer-grade workstation with the following specifications:
-
-- **CPU**: AMD Ryzen 7 5700X (8 cores, 16 threads)
-- **RAM**: 32GB DDR4
-- **GPU**: NVIDIA RTX 4060 Ti (8GB VRAM)
-- **Storage**: NVMe SSD
-- **OS**: Ubuntu 22.04 LTS
-- **Framework**: TensorFlow 2.19 with CUDA 12.5 and CuDNN 9.3
-
-## Evaluation Metrics
-
-The primary evaluation metric is mean Intersection over Union (mIoU):
-
-- **Overall mIoU**: 66.38%
-- **Class-wise IoU**:
-  - Sea Surface: 95.81%
-  - Oil Spill: 54.65%
-  - Look-alike: 55.84%
-  - Ship: 32.12%
-  - Land: 93.48%
-
-This represents a significant improvement over the baseline DeepLabV3+ model (mIoU: 65.06%):
-
-- Overall improvement: +1.32%
-- Most significant improvement in Ship class: +4.49%
+---
 
 ## Results
 
-The implemented SegFormer-B2 model outperforms the baseline DeepLabV3+ model in all classes, with particular improvements in detecting small ships and distinguishing between oil spills and look-alikes.
+### Baseline Comparison
 
-![Model Comparison](model_comparison.png)
+| Metric          | DeepLabV3+ (baseline) | SegFormer-B2 (ours) |   Δ    |
+| :-------------- | :-------------------: | :-----------------: | :----: |
+| **mIoU**        |        65.06%         |       66.38%        | +1.32% |
+| Sea Surface IoU |           —           |       95.81%        |   —    |
+| Oil Spill IoU   |           —           |       54.65%        |   —    |
+| Look-alike IoU  |           —           |       55.84%        |   —    |
+| Ship IoU        |           —           |       32.12%        | +4.49% |
+| Land IoU        |           —           |       93.48%        |   —    |
 
-_Figure: Performance comparison between SegFormer-B2 and DeepLabV3+ baseline. The SegFormer model shows superior performance in all metrics, especially for the Ship class detection which improved by 4.49%._
+> **Note**: Results above were obtained with an earlier configuration (batch size 2, single GPU, LR = 3 × 10⁻⁵). The current pipeline with distributed training, EMA, and the improved loss function is expected to yield further gains upon retraining.
 
-## Limitations
+### Evaluation Metrics
 
-Several hardware and memory constraints impacted the training and performance of the model:
+The evaluation script computes:
 
-1. **VRAM Limitations**:
+- **Mean IoU** and per-class IoU
+- **Pixel Accuracy** (overall and per-class)
+- **Frequency-Weighted IoU** (FWIoU)
+- **Cohen's Kappa** coefficient
+- **Precision, Recall, F1-score** per class
+- **Bootstrap 95% Confidence Intervals** (1 000 iterations)
 
-   - The 8GB VRAM of the RTX 4060 Ti restricted batch size to only 2 samples
-   - Larger batch sizes (8-16) would likely improve model convergence and final mIoU
-   - Had to disable CBAM attention in some model configurations to prevent OOM errors
+---
 
-2. **Augmentation Constraints**:
+## Repository Structure
 
-   - More advanced augmentations like CutMix and MixUp could not be implemented due to memory constraints
-   - These techniques have shown significant improvements for segmentation tasks in recent literature
-   - Had to use smaller TTA ensemble (8 augmentations) instead of the optimal 16-32 range
+```
+oil-spill-detection/
+├── config.py                       # Centralised hyperparameter dataclasses
+├── utils.py                        # TF setup, reproducibility, colour maps
+├── train.py                        # Distributed training with EMA & callbacks
+├── evaluate.py                     # Full evaluation + metric reporting
+├── working.md                      # Detailed pipeline documentation & flowchart
+├── data/
+│   ├── __init__.py
+│   ├── data_loader.py              # Train/val/test split, class weights, tf.data
+│   ├── augmentation.py             # SAR-specific augmentation transforms
+│   └── test_time_augmentation.py   # TTA engine for inference
+├── model/
+│   ├── __init__.py
+│   ├── model.py                    # SegFormer-B2 architecture (unchanged)
+│   ├── loss.py                     # Hybrid loss (CE + Focal + Dice + Boundary)
+│   ├── metrics.py                  # IoU, accuracy, FWIoU, Kappa, bootstrap CI
+│   └── prediction.py              # Multi-scale predictor with optional TTA
+└── dataset/                        # ROBORDER dataset (see Dataset section)
+```
 
-3. **Model Size Constraints**:
+---
 
-   - Limited to SegFormer-B2 variant instead of larger B5 variant
-   - Could not use higher resolution inputs (512x512 or 768x768) that would better capture small objects
-   - Multi-scale training was not feasible with available memory
+## Getting Started
 
-4. **Dataset Limitations**:
-   - Imbalanced class distribution (sea surface dominates)
-   - Limited variety of oil spill shapes and ship sizes
-   - Some ambiguity between oil spill and look-alike classes
+### Prerequisites
 
-## Future Improvements
+- Python ≥ 3.10
+- NVIDIA GPU(s) with CUDA 12.x and cuDNN 9.x
+- TensorFlow ≥ 2.19
 
-Several potential improvements could enhance the model's performance:
+### Installation
 
-1. **Architecture Enhancements**:
+```bash
+# Clone the repository
+git clone https://github.com/ItsTatsuya/oil-spill-detection.git
+cd oil-spill-detection
 
-   - Implement hybrid CNN-Transformer architecture for better feature extraction
-   - Add dedicated ship detection branch in the network
-   - Explore larger SegFormer variants (B3-B5) with more training hardware
-   - Implement hierarchical feature fusion across different scales
+# Install dependencies
+pip install tensorflow numpy opencv-python matplotlib tqdm
+```
 
-2. **Advanced Augmentation Techniques**:
-
-   - Add CutMix and ClassMix augmentations with memory-efficient implementations
-   - Implement physics-informed data augmentation specific to SAR imagery
-   - Explore self-supervised pre-training on unlabeled SAR data
-   - Add realistic oil spill simulations for synthetic data augmentation
-
-3. **Training Improvements**:
-
-   - Increase batch size to 16+ using gradient accumulation or distributed training
-   - Implement curriculum learning to focus on harder examples
-   - Use progressive resizing (start small, finish at high resolution)
-   - Implement knowledge distillation from larger teacher models
-
-4. **Post-processing Enhancements**:
-
-   - Develop oil spill-specific CRF implementation that preserves small regions
-   - Design specialized boundary refinement for water-oil interfaces
-   - Implement temporal consistency for satellite image sequences
-   - Add uncertainty estimation for more reliable predictions
-
-## Usage
+Place the ROBORDER dataset under `dataset/` following the directory structure shown above.
 
 ### Training
-
-To train the model:
 
 ```bash
 python train.py
 ```
 
+All hyperparameters are controlled via `config.py`. The script automatically detects available GPUs and configures `MirroredStrategy`. Checkpoints, logs, and the best model weights are saved to `checkpoints/` and `logs/`.
+
 ### Evaluation
 
-To evaluate the model:
-
 ```bash
-python evaluate.py --model_path segformer_b2_final.weights.h5 --use_tta True
+python evaluate.py
 ```
 
-## Requirements
+By default, evaluation loads the best checkpoint from `checkpoints/segformer_b2_best.weights.h5`, runs multi-scale TTA, and writes results to `evaluation_results.md`.
 
-- TensorFlow 2.13+
-- Python 3.10+
-- NVIDIA GPU with at least 8GB VRAM
-- Additional packages: numpy, matplotlib, tqdm, opencv-python
+---
 
-## References
+## Configuration
 
-- SegFormer: [Simple and Efficient Design for Semantic Segmentation with Transformers](https://arxiv.org/abs/2105.15203)
-- Test Time Augmentation: [Augment your Batch: Improving Generalization Through Instance Repetition](https://arxiv.org/abs/1901.09335)
-- Mixed Precision Training: [Mixed Precision Training](https://arxiv.org/abs/1710.03740)
-- ROBORDER Oil Spill Dataset: [Dataset](https://m4d.iti.gr/oil-spill-detection-dataset/)
+All settings are defined as Python dataclasses in `config.py`:
+
+| Dataclass            | Scope                                                             |
+| :------------------- | :---------------------------------------------------------------- |
+| `DataConfig`         | Image size, val split, class names, class weight cache path       |
+| `AugmentationConfig` | Every augmentation probability and parameter range                |
+| `LossConfig`         | Component weights, focal γ, label smoothing, boundary boost       |
+| `TrainConfig`        | Batch size, LR, warmup, EMA, early stopping, optimiser, paths     |
+| `EvalConfig`         | TTA scales, ship post-processing thresholds, bootstrap iterations |
+
+Modify `config.py` to run new experiments without changing any other file.

@@ -1,5 +1,10 @@
+import logging
+
 import numpy as np
 import tensorflow as tf
+
+logger = logging.getLogger('oil_spill')
+
 
 class TestTimeAugmentation:
     def __init__(self, model, num_augmentations=8, use_flips=True, use_scales=True,
@@ -239,6 +244,7 @@ class TestTimeAugmentation:
                 all_predictions.append(batch_reversed_preds)
 
             except Exception as e:
+                logger.warning("TTA augmentation '%s' failed: %s", aug_type, e)
                 continue
 
         if not all_predictions:
