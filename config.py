@@ -20,7 +20,7 @@ class DataConfig:
         'Sea Surface', 'Oil Spill', 'Look-alike', 'Ship', 'Land'
     )
     class_weights_cache: str = 'dataset/class_weights.npy'
-    shuffle_buffer: int = 2000
+    num_workers: int = 4           # DataLoader worker processes
 
 
 @dataclass
@@ -76,14 +76,14 @@ class LossConfig:
 class TrainConfig:
     """Training loop configuration."""
     # Basic
-    batch_size: int = 256           # Global batch size across all GPUs
-    per_gpu_batch_size: int = 32    # Per-GPU batch size
-    epochs: int = 600
+    batch_size: int = 8             # Global batch size across all GPUs
+    per_gpu_batch_size: int = 8     # Per-GPU batch size
+    epochs: int = 3
     num_classes: int = 5
 
-    # Learning rate (sqrt scaling: 3e-5 * sqrt(256/2) ≈ 3.4e-4)
-    learning_rate: float = 3.4e-4
-    warmup_epochs: int = 25
+    # Learning rate (sqrt scaling: 3e-5 * sqrt(8) ≈ 8.5e-5 for batch 8)
+    learning_rate: float = 8.5e-5
+    warmup_epochs: int = 1
     cosine_alpha: float = 0.001  # minimum LR fraction
 
     # Optimizer
@@ -95,8 +95,8 @@ class TrainConfig:
     amsgrad: bool = True
 
     # Callbacks
-    early_stopping_patience: int = 30
-    reduce_lr_patience: int = 15
+    early_stopping_patience: int = 3
+    reduce_lr_patience: int = 1
     reduce_lr_factor: float = 0.5
     reduce_lr_min: float = 1e-7
 
@@ -104,17 +104,14 @@ class TrainConfig:
     use_ema: bool = True
     ema_decay: float = 0.999
 
-    # Distributed
+    # Distributed (multi-GPU via torchrun --nproc_per_node=N)
     use_distributed: bool = True
-
-    # Parallelism (0 = auto-detect)
-    inter_op_threads: int = 0
-    intra_op_threads: int = 0
 
     # Paths
     checkpoint_dir: str = 'checkpoints'
     log_dir: str = 'logs'
-    pretrained_weights: str = 'pretrained_weights/segformer_b2_pretrain.weights.h5'
+    pretrained_weights: str = 'pretrained_weights/segformer_b2_pretrain.pt'
+    hub_pretrained: str = 'nvidia/mit-b2'   # HuggingFace model ID for backbone
 
     # Reproducibility
     seed: int = 42
@@ -145,4 +142,4 @@ class EvalConfig:
     bootstrap_confidence: float = 0.95
 
     # Model path
-    model_path: str = 'checkpoints/segformer_b2_best.weights.h5'
+    model_path: str = 'checkpoints/segformer_b2_best.pt'

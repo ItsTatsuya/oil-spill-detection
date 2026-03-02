@@ -1,637 +1,561 @@
 import os
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models # type: ignore
+import re
+import logging
+from typing import Optional
 
-class CastToDtype(layers.Layer):
-    def __init__(self, dtype, **kwargs):
-        super().__init__(**kwargs)
-        self._target_dtype = dtype
+# Suppress HuggingFace symlinks warning on Windows (cosmetic only)
+os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
 
-    def call(self, inputs):
-        return tf.cast(inputs, self._target_dtype)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({"dtype": self._target_dtype})
-        return config
+try:
+    from timm.layers.drop import DropPath  # type: ignore[assignment]
+except ImportError:
+    class DropPath(nn.Module):  # type: ignore[no-redef]
+        """Stochastic depth fallback when timm is unavailable."""
+        def __init__(self, drop_prob: float = 0.0):
+            super().__init__()
+            self.drop_prob = drop_prob
 
-class ResizeImage(layers.Layer):
-    def __init__(self, method='bilinear', **kwargs):
-        super().__init__(**kwargs)
-        self.method = method
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if self.drop_prob == 0.0 or not self.training:
+                return x
+            keep = 1.0 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            rand_t = torch.rand(shape, dtype=x.dtype, device=x.device)
+            return x / keep * (rand_t < keep).float()
 
-    def call(self, inputs, size):
-        return tf.image.resize(inputs, size=size, method=self.method)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"method": self.method})
-        return config
+logger = logging.getLogger('oil_spill')
 
 
-class PatchEmbed(layers.Layer):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dims=768, **kwargs):
-        super().__init__(**kwargs)
-        self.img_size = img_size if isinstance(img_size, tuple) else (img_size, img_size)
+# ---------------------------------------------------------------------------
+# Building block: LayerNorm for NCHW feature maps
+# ---------------------------------------------------------------------------
+class LayerNorm2d(nn.Module):
+    """LayerNorm adapted for NCHW tensors — normalises over the C dimension."""
+
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels, eps=eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 3, 1)   # [B, C, H, W] → [B, H, W, C]
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)   # → [B, C, H, W]
+        return x
+
+
+class PatchEmbed(nn.Module):
+    """Non-overlapping patch embedding (SegFormer-B0 only; kept for API compat)."""
+
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dims=768):
+        super().__init__()
+        self.img_size  = img_size if isinstance(img_size, tuple) else (img_size, img_size)
         self.patch_size = patch_size
-        self.grid_size = (self.img_size[0] // patch_size, self.img_size[1] // patch_size)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-
-        self.projection = layers.Conv2D(
-            filters=embed_dims,
-            kernel_size=patch_size,
-            strides=patch_size,
-            padding='valid',
-            use_bias=True,
-            name='projection'
+        self.projection = nn.Conv2d(
+            in_channels, embed_dims,
+            kernel_size=patch_size, stride=patch_size, bias=True,
         )
 
-    def call(self, x):
-        return self.projection(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.projection(x)   # [B, embed_dims, H//P, W//P]
 
-class OverlapPatchEmbed(layers.Layer):
-    def __init__(self, img_size=224, patch_size=7, stride=4, in_channels=3, embed_dims=768, **kwargs):
-        super().__init__(**kwargs)
-        self.img_size = img_size if isinstance(img_size, tuple) else (img_size, img_size)
-        self.patch_size = patch_size
-        self.stride = stride
-        self.grid_size = (self.img_size[0] // stride, self.img_size[1] // stride)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
 
-        self.projection = layers.Conv2D(
-            filters=embed_dims,
-            kernel_size=patch_size,
-            strides=stride,
-            padding='same',
-            use_bias=True,
-            name='projection'
+class OverlapPatchEmbed(nn.Module):
+    def __init__(self, img_size=224, patch_size=7, stride=4, in_channels=3, embed_dims=768):
+        super().__init__()
+        self.projection = nn.Conv2d(
+            in_channels, embed_dims,
+            kernel_size=patch_size, stride=stride,
+            padding=patch_size // 2, bias=True,
         )
-        self.norm = layers.LayerNormalization(epsilon=1e-6, name='norm')
+        self.norm = LayerNorm2d(embed_dims)
 
-    def call(self, x):
-        x = self.projection(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.projection(x)   # [B, embed_dims, H', W']
         x = self.norm(x)
         return x
 
-class MixFFN(layers.Layer):
-    def __init__(self, embed_dims, feedforward_channels, **kwargs):
-        super().__init__(**kwargs)
-        self.embed_dims = embed_dims
-        self.feedforward_channels = feedforward_channels
 
-        self.fc1 = layers.Conv2D(
-            filters=feedforward_channels,
-            kernel_size=1,
-            activation=None,
-            use_bias=True,
-            name='fc1'
-        )
-        self.dwconv = layers.DepthwiseConv2D(
-            kernel_size=3,
-            padding='same',
-            use_bias=True,
-            name='dwconv'
-        )
-        self.act = layers.Activation('gelu')
-        self.fc2 = layers.Conv2D(
-            filters=embed_dims,
-            kernel_size=1,
-            activation=None,
-            use_bias=True,
-            name='fc2'
-        )
-        self.drop = layers.Dropout(0.1)
+class MixFFN(nn.Module):
+    """Mix Feed-Forward Network: Conv1×1 → DW-Conv3×3 → GELU → Dropout → Conv1×1."""
 
-    def call(self, x, training=False):
+    def __init__(self, embed_dims: int, feedforward_channels: int):
+        super().__init__()
+        self.fc1    = nn.Conv2d(embed_dims, feedforward_channels, kernel_size=1, bias=True)
+        self.dwconv = nn.Conv2d(
+            feedforward_channels, feedforward_channels,
+            kernel_size=3, padding=1, groups=feedforward_channels, bias=True,
+        )
+        self.act  = nn.GELU()
+        self.fc2  = nn.Conv2d(feedforward_channels, embed_dims, kernel_size=1, bias=True)
+        self.drop = nn.Dropout(0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
         x = self.dwconv(x)
         x = self.act(x)
-        x = self.drop(x, training=training)
+        x = self.drop(x)
         x = self.fc2(x)
-        x = self.drop(x, training=training)
+        x = self.drop(x)
         return x
 
-class EfficientAttention(layers.Layer):
-    def __init__(self, embed_dims, num_heads, sr_ratio, **kwargs):
-        super().__init__(**kwargs)
-        self.embed_dims = embed_dims
-        self.num_heads = num_heads
-        self.sr_ratio = sr_ratio
-        self.head_dim = embed_dims // num_heads
-        self.scale = self.head_dim ** -0.5
 
-        self.q = layers.Conv2D(
-            filters=embed_dims,
-            kernel_size=1,
-            use_bias=True,
-            name='q'
-        )
-        self.kv = layers.Conv2D(
-            filters=embed_dims * 2,
-            kernel_size=1,
-            use_bias=True,
-            name='kv'
-        )
+class EfficientAttention(nn.Module):
+    """
+    Efficient Self-Attention with Sequence Reduction (sr_ratio).
+
+    Uses torch.nn.functional.scaled_dot_product_attention (PyTorch ≥ 2.0)
+    for memory-efficient attention; falls back to manual matmul otherwise.
+    All operations stay in NCHW format — no reshape to sequence form.
+    """
+
+    def __init__(self, embed_dims: int, num_heads: int, sr_ratio: int):
+        super().__init__()
+        assert embed_dims % num_heads == 0
+        self.embed_dims = embed_dims
+        self.num_heads  = num_heads
+        self.sr_ratio   = sr_ratio
+        self.head_dim   = embed_dims // num_heads
+
+        self.q    = nn.Conv2d(embed_dims, embed_dims,     kernel_size=1, bias=True)
+        self.kv   = nn.Conv2d(embed_dims, embed_dims * 2, kernel_size=1, bias=True)
+        self.proj = nn.Conv2d(embed_dims, embed_dims,     kernel_size=1, bias=True)
+        self.drop = nn.Dropout(0.1)
 
         if sr_ratio > 1:
-            self.sr = layers.Conv2D(
-                filters=embed_dims,
-                kernel_size=sr_ratio,
-                strides=sr_ratio,
-                use_bias=True,
-                name='sr'
-            )
-            self.norm = layers.LayerNormalization(epsilon=1e-6, name='norm')
+            self.sr   = nn.Conv2d(embed_dims, embed_dims,
+                                  kernel_size=sr_ratio, stride=sr_ratio, bias=True)
+            self.norm = LayerNorm2d(embed_dims)
 
-        self.proj = layers.Conv2D(
-            filters=embed_dims,
-            kernel_size=1,
-            use_bias=True,
-            name='proj'
-        )
-        self.drop = layers.Dropout(0.1)
-
-    def call(self, x, training=False):
-        batch_size = tf.shape(x)[0]
-        height, width = tf.shape(x)[1], tf.shape(x)[2]
-
-        q = self.q(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        q = self.q(x)                     # [B, C, H, W]
 
         if self.sr_ratio > 1:
-            x_reduced = self.sr(x)
-            x_reduced = self.norm(x_reduced)
-            kv = self.kv(x_reduced)
-            reduced_height, reduced_width = tf.shape(x_reduced)[1], tf.shape(x_reduced)[2]
+            x_r = self.norm(self.sr(x))   # [B, C, H/sr, W/sr]
+            kv  = self.kv(x_r)
+            _, _, Hr, Wr = x_r.shape
         else:
-            kv = self.kv(x)
-            reduced_height, reduced_width = height, width
+            kv  = self.kv(x)
+            Hr, Wr = H, W
 
-        k, v = tf.split(kv, 2, axis=-1)
+        k, v = kv.chunk(2, dim=1)         # each [B, C, Hr, Wr]
 
-        q = tf.reshape(q, [batch_size, height * width, self.num_heads, self.head_dim])
-        k = tf.reshape(k, [batch_size, reduced_height * reduced_width, self.num_heads, self.head_dim])
-        v = tf.reshape(v, [batch_size, reduced_height * reduced_width, self.num_heads, self.head_dim])
+        # Reshape to [B, num_heads, seq_len, head_dim] for SDPA
+        q = (q.permute(0, 2, 3, 1)
+               .reshape(B, H * W,    self.num_heads, self.head_dim)
+               .permute(0, 2, 1, 3))
+        k = (k.permute(0, 2, 3, 1)
+               .reshape(B, Hr * Wr, self.num_heads, self.head_dim)
+               .permute(0, 2, 1, 3))
+        v = (v.permute(0, 2, 3, 1)
+               .reshape(B, Hr * Wr, self.num_heads, self.head_dim)
+               .permute(0, 2, 1, 3))
 
-        q = tf.transpose(q, [0, 2, 1, 3])
-        k = tf.transpose(k, [0, 2, 1, 3])
-        v = tf.transpose(v, [0, 2, 1, 3])
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.drop.p if self.training else 0.0,
+        )  # [B, nh, HW, hd]
 
-        attn = tf.matmul(q, k, transpose_b=True) * self.scale
-        attn = tf.nn.softmax(attn, axis=-1)
-        attn = self.drop(attn, training=training)
-
-        out = tf.matmul(attn, v)
-
-        out = tf.transpose(out, [0, 2, 1, 3])
-        out = tf.reshape(out, [batch_size, height, width, self.embed_dims])
+        # Merge heads → NCHW
+        out = (out.permute(0, 2, 1, 3)     # [B, HW, nh, hd]
+                  .reshape(B, H, W, C)      # [B, H, W, C]
+                  .permute(0, 3, 1, 2))     # [B, C, H, W]
 
         out = self.proj(out)
-        out = self.drop(out, training=training)
-
+        out = self.drop(out)
         return out
 
-class TransformerEncoderLayer(layers.Layer):
-    def __init__(self, embed_dims, num_heads, feedforward_channels, sr_ratio=1, drop_rate=0.0, **kwargs):
-        super().__init__(**kwargs)
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6, name='norm1')
-        self.attn = EfficientAttention(
-            embed_dims=embed_dims,
-            num_heads=num_heads,
-            sr_ratio=sr_ratio,
-            name='attn'
-        )
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6, name='norm2')
-        self.ffn = MixFFN(
-            embed_dims=embed_dims,
-            feedforward_channels=feedforward_channels,
-            name='ffn'
-        )
-        self.drop_path = layers.Dropout(drop_rate, noise_shape=(None, 1, 1, 1))
 
-    def call(self, x, training=False):
-        residual = x
-        x = self.norm1(x)
-        x = self.attn(x, training=training)
-        x = self.drop_path(x, training=training)
-        x = residual + x
+class TransformerEncoderLayer(nn.Module):
+    """Pre-norm Transformer block: LN→Attn→DropPath + LN→FFN→DropPath."""
 
-        residual = x
-        x = self.norm2(x)
-        x = self.ffn(x, training=training)
-        x = self.drop_path(x, training=training)
-        x = residual + x
+    def __init__(
+        self,
+        embed_dims: int,
+        num_heads: int,
+        feedforward_channels: int,
+        sr_ratio: int = 1,
+        drop_rate: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1     = LayerNorm2d(embed_dims)
+        self.attn      = EfficientAttention(embed_dims, num_heads, sr_ratio)
+        self.norm2     = LayerNorm2d(embed_dims)
+        self.ffn       = MixFFN(embed_dims, feedforward_channels)
+        self.drop_path = DropPath(drop_rate) if drop_rate > 0.0 else nn.Identity()
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.ffn(self.norm2(x)))
         return x
 
-class MixVisionTransformer(layers.Layer):
-    def __init__(self, img_size=224, in_channels=3, embed_dims=[32, 64, 160, 256], num_heads=[1, 2, 5, 8],
-                 mlp_ratios=[4, 4, 4, 4], drop_rate=0.0, sr_ratios=[8, 4, 2, 1], num_layers=[2, 2, 2, 2], **kwargs):
-        super().__init__(**kwargs)
-        self.embed_dims = embed_dims
-        self.num_heads = num_heads
-        self.mlp_ratios = mlp_ratios
-        self.sr_ratios = sr_ratios
-        self.num_layers = num_layers
 
+class MixVisionTransformer(nn.Module):
+    """Hierarchical ViT backbone with 4 stages (SegFormer-B2 configuration)."""
+
+    def __init__(
+        self,
+        img_size: int = 224,
+        in_channels: int = 3,
+        embed_dims=(64, 128, 320, 512),
+        num_heads=(1, 2, 5, 8),
+        mlp_ratios=(8, 8, 4, 4),
+        drop_rate: float = 0.0,
+        sr_ratios=(8, 4, 2, 1),
+        num_layers=(3, 4, 6, 3),
+    ):
+        super().__init__()
         self.patch_embed1 = OverlapPatchEmbed(
-            img_size=img_size,
-            patch_size=7,
-            stride=4,
-            in_channels=in_channels,
-            embed_dims=embed_dims[0],
-            name='patch_embed1'
+            img_size=img_size,       patch_size=7, stride=4,
+            in_channels=in_channels, embed_dims=embed_dims[0],
         )
         self.patch_embed2 = OverlapPatchEmbed(
-            patch_size=3,
-            stride=2,
-            in_channels=embed_dims[0],
-            embed_dims=embed_dims[1],
-            name='patch_embed2'
+            img_size=img_size // 4,  patch_size=3, stride=2,
+            in_channels=embed_dims[0], embed_dims=embed_dims[1],
         )
         self.patch_embed3 = OverlapPatchEmbed(
-            patch_size=3,
-            stride=2,
-            in_channels=embed_dims[1],
-            embed_dims=embed_dims[2],
-            name='patch_embed3'
+            img_size=img_size // 8,  patch_size=3, stride=2,
+            in_channels=embed_dims[1], embed_dims=embed_dims[2],
         )
         self.patch_embed4 = OverlapPatchEmbed(
-            patch_size=3,
-            stride=2,
-            in_channels=embed_dims[2],
-            embed_dims=embed_dims[3],
-            name='patch_embed4'
+            img_size=img_size // 16, patch_size=3, stride=2,
+            in_channels=embed_dims[2], embed_dims=embed_dims[3],
         )
 
-        self.block1 = [
-            TransformerEncoderLayer(
-                embed_dims=embed_dims[0],
-                num_heads=num_heads[0],
-                feedforward_channels=mlp_ratios[0] * embed_dims[0],
-                sr_ratio=sr_ratios[0],
-                drop_rate=drop_rate,
-                name=f'block1_{i}'
-            ) for i in range(num_layers[0])
-        ]
+        self.block1 = nn.ModuleList([
+            TransformerEncoderLayer(embed_dims[0], num_heads[0],
+                                    mlp_ratios[0] * embed_dims[0], sr_ratios[0], drop_rate)
+            for _ in range(num_layers[0])
+        ])
+        self.block2 = nn.ModuleList([
+            TransformerEncoderLayer(embed_dims[1], num_heads[1],
+                                    mlp_ratios[1] * embed_dims[1], sr_ratios[1], drop_rate)
+            for _ in range(num_layers[1])
+        ])
+        self.block3 = nn.ModuleList([
+            TransformerEncoderLayer(embed_dims[2], num_heads[2],
+                                    mlp_ratios[2] * embed_dims[2], sr_ratios[2], drop_rate)
+            for _ in range(num_layers[2])
+        ])
+        self.block4 = nn.ModuleList([
+            TransformerEncoderLayer(embed_dims[3], num_heads[3],
+                                    mlp_ratios[3] * embed_dims[3], sr_ratios[3], drop_rate)
+            for _ in range(num_layers[3])
+        ])
 
-        self.block2 = [
-            TransformerEncoderLayer(
-                embed_dims=embed_dims[1],
-                num_heads=num_heads[1],
-                feedforward_channels=mlp_ratios[1] * embed_dims[1],
-                sr_ratio=sr_ratios[1],
-                drop_rate=drop_rate,
-                name=f'block2_{i}'
-            ) for i in range(num_layers[1])
-        ]
+        self.norm1 = LayerNorm2d(embed_dims[0])
+        self.norm2 = LayerNorm2d(embed_dims[1])
+        self.norm3 = LayerNorm2d(embed_dims[2])
+        self.norm4 = LayerNorm2d(embed_dims[3])
 
-        self.block3 = [
-            TransformerEncoderLayer(
-                embed_dims=embed_dims[2],
-                num_heads=num_heads[2],
-                feedforward_channels=mlp_ratios[2] * embed_dims[2],
-                sr_ratio=sr_ratios[2],
-                drop_rate=drop_rate,
-                name=f'block3_{i}'
-            ) for i in range(num_layers[2])
-        ]
-
-        self.block4 = [
-            TransformerEncoderLayer(
-                embed_dims=embed_dims[3],
-                num_heads=num_heads[3],
-                feedforward_channels=mlp_ratios[3] * embed_dims[3],
-                sr_ratio=sr_ratios[3],
-                drop_rate=drop_rate,
-                name=f'block4_{i}'
-            ) for i in range(num_layers[3])
-        ]
-
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6, name='norm1')
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6, name='norm2')
-        self.norm3 = layers.LayerNormalization(epsilon=1e-6, name='norm3')
-        self.norm4 = layers.LayerNormalization(epsilon=1e-6, name='norm4')
-
-    def call(self, x, training=False):
+    def forward(self, x: torch.Tensor):
         x1 = self.patch_embed1(x)
         for blk in self.block1:
-            x1 = blk(x1, training=training)
+            x1 = blk(x1)
         x1 = self.norm1(x1)
 
         x2 = self.patch_embed2(x1)
         for blk in self.block2:
-            x2 = blk(x2, training=training)
+            x2 = blk(x2)
         x2 = self.norm2(x2)
 
         x3 = self.patch_embed3(x2)
         for blk in self.block3:
-            x3 = blk(x3, training=training)
+            x3 = blk(x3)
         x3 = self.norm3(x3)
 
         x4 = self.patch_embed4(x3)
         for blk in self.block4:
-            x4 = blk(x4, training=training)
+            x4 = blk(x4)
         x4 = self.norm4(x4)
 
         return [x1, x2, x3, x4]
 
-class MLP_Decoder(layers.Layer):
-    def __init__(self, embed_dims, **kwargs):
-        super().__init__(**kwargs)
-        self.proj = layers.Conv2D(embed_dims, kernel_size=1, use_bias=True)
 
-    def call(self, x):
-        return self.proj(x)
+# ---------------------------------------------------------------------------
+# CBAM — Convolutional Block Attention Module
+# ---------------------------------------------------------------------------
+class CBAMModule(nn.Module):
+    """Channel + Spatial attention (Woo et al., ECCV 2018)."""
 
-class SegFormerHead(layers.Layer):
-    def __init__(self, num_classes=5, embed_dims=[32, 64, 160, 256], decoder_embed_dims=256, **kwargs):
-        super().__init__(**kwargs)
-        self.num_classes = num_classes
-        self.embed_dims = embed_dims
-        self.decoder_embed_dims = decoder_embed_dims
+    def __init__(self, channels: int, reduction_ratio: int = 2, kernel_size: int = 7):
+        super().__init__()
+        mid = max(channels // reduction_ratio, 4)
+        self.ca_fc1  = nn.Conv2d(channels, mid,      kernel_size=1, bias=True)
+        self.ca_relu = nn.ReLU()
+        self.ca_fc2  = nn.Conv2d(mid,      channels, kernel_size=1, bias=True)
+        self.sa_conv = nn.Conv2d(3, 1, kernel_size=kernel_size,
+                                 padding=kernel_size // 2, bias=False)
 
-        self.linear_c1 = MLP_Decoder(decoder_embed_dims, name='linear_c1')
-        self.linear_c2 = MLP_Decoder(decoder_embed_dims, name='linear_c2')
-        self.linear_c3 = MLP_Decoder(decoder_embed_dims, name='linear_c3')
-        self.linear_c4 = MLP_Decoder(decoder_embed_dims, name='linear_c4')
-
-        self.linear_fuse = layers.Conv2D(
-            filters=decoder_embed_dims,
-            kernel_size=1,
-            padding='valid',
-            use_bias=False,
-            name='linear_fuse'
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Channel attention
+        avg = F.adaptive_avg_pool2d(x, 1)
+        mx  = F.adaptive_max_pool2d(x, 1)
+        ca  = torch.sigmoid(
+            self.ca_fc2(self.ca_relu(self.ca_fc1(avg))) +
+            self.ca_fc2(self.ca_relu(self.ca_fc1(mx)))
         )
+        x = x * ca
 
-        self.batch_norm = layers.BatchNormalization(name='batch_norm')
-        self.dropout = layers.Dropout(0.15)
-        self.classifier = layers.Conv2D(
-            filters=num_classes,
-            kernel_size=1,
-            padding='valid',
-            use_bias=True,
-            name='classifier'
-        )
-
-        self.upsample_c2 = ResizeImage(method='bilinear', name='upsample_c2')
-        self.upsample_c3 = ResizeImage(method='bilinear', name='upsample_c3')
-        self.upsample_c4 = ResizeImage(method='bilinear', name='upsample_c4')
-
-    def call(self, inputs, training=False):
-        c1, c2, c3, c4 = inputs
-        h, w = tf.shape(c1)[1], tf.shape(c1)[2]
-        target_size = (h, w)
-
-        _c1 = self.linear_c1(c1)
-        _c2 = self.linear_c2(c2)
-        _c3 = self.linear_c3(c3)
-        _c4 = self.linear_c4(c4)
-
-        _c2 = self.upsample_c2(_c2, size=target_size)
-        _c3 = self.upsample_c3(_c3, size=target_size)
-        _c4 = self.upsample_c4(_c4, size=target_size)
-
-        _c = layers.Concatenate(axis=-1)([_c1, _c2, _c3, _c4])
-
-        _c = self.linear_fuse(_c)
-        _c = self.batch_norm(_c, training=training)
-        _c = tf.nn.relu(_c)
-        _c = self.dropout(_c, training=training)
-
-        x = self.classifier(_c)
-
+        # Spatial attention (mean + max + var over channels)
+        mean_sp = x.mean(dim=1, keepdim=True)
+        max_sp  = x.amax(dim=1, keepdim=True)
+        var_sp  = x.var(dim=1, keepdim=True, unbiased=False)
+        sa = torch.sigmoid(self.sa_conv(torch.cat([mean_sp, max_sp, var_sp], dim=1)))
+        x = x * sa
         return x
 
-def SegFormer(input_shape=(320, 320, 1), num_classes=5, **kwargs):
-    compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
 
-    inputs = layers.Input(shape=input_shape, dtype=tf.float32, name='input_image')
-    x = CastToDtype(dtype=compute_dtype, name='cast_input_to_compute_dtype')(inputs)
+# ---------------------------------------------------------------------------
+# All-MLP Decoder Head
+# ---------------------------------------------------------------------------
+class SegFormerHead(nn.Module):
+    """Project 4 encoder levels → upsample → fuse → classify."""
 
-    embed_dims = [32, 64, 160, 256]
-    num_heads = [1, 2, 5, 8]
-    mlp_ratios = [4, 4, 4, 4]
-    sr_ratios = [8, 4, 2, 1]
-    num_layers = [2, 2, 2, 2]
-    decoder_embed_dims = 256
+    def __init__(
+        self,
+        num_classes: int = 5,
+        embed_dims=(64, 128, 320, 512),
+        decoder_embed_dims: int = 768,
+    ):
+        super().__init__()
+        self.linear_c1 = nn.Conv2d(embed_dims[0], decoder_embed_dims, kernel_size=1, bias=True)
+        self.linear_c2 = nn.Conv2d(embed_dims[1], decoder_embed_dims, kernel_size=1, bias=True)
+        self.linear_c3 = nn.Conv2d(embed_dims[2], decoder_embed_dims, kernel_size=1, bias=True)
+        self.linear_c4 = nn.Conv2d(embed_dims[3], decoder_embed_dims, kernel_size=1, bias=True)
 
-    backbone = MixVisionTransformer(
-        img_size=input_shape[0],
-        in_channels=input_shape[2],
-        embed_dims=embed_dims,
-        num_heads=num_heads,
-        mlp_ratios=mlp_ratios,
-        drop_rate=0.1,
-        sr_ratios=sr_ratios,
-        num_layers=num_layers,
-        name='backbone'
-    )
+        self.linear_fuse = nn.Conv2d(decoder_embed_dims * 4, decoder_embed_dims,
+                                     kernel_size=1, bias=False)
+        self.bn         = nn.BatchNorm2d(decoder_embed_dims)
+        self.relu       = nn.ReLU(inplace=True)
+        self.dropout    = nn.Dropout(0.15)
+        self.classifier = nn.Conv2d(decoder_embed_dims, num_classes, kernel_size=1, bias=True)
 
-    features = backbone(x)
+    def forward(self, features):
+        c1, c2, c3, c4 = features
+        target_size = c1.shape[2:]   # (H/4, W/4)
 
-    decoder_head = SegFormerHead(
-        num_classes=num_classes,
-        embed_dims=embed_dims,
-        decoder_embed_dims=decoder_embed_dims,
-        name='decoder_head'
-    )
-    logits = decoder_head(features)
+        _c1 = self.linear_c1(c1)
+        _c2 = F.interpolate(self.linear_c2(c2), size=target_size, mode='bilinear', align_corners=False)
+        _c3 = F.interpolate(self.linear_c3(c3), size=target_size, mode='bilinear', align_corners=False)
+        _c4 = F.interpolate(self.linear_c4(c4), size=target_size, mode='bilinear', align_corners=False)
 
-    img_height, img_width = input_shape[0], input_shape[1]
-    final_output_size = (img_height, img_width)
+        _c = torch.cat([_c1, _c2, _c3, _c4], dim=1)
+        _c = self.linear_fuse(_c)
+        _c = self.bn(_c)
+        _c = self.relu(_c)
+        _c = self.dropout(_c)
+        return self.classifier(_c)   # [B, num_classes, H/4, W/4]
 
-    final_upsample_layer = ResizeImage(method='bilinear', name='final_upscaling')
-    logits = final_upsample_layer(logits, size=final_output_size)
 
-    if compute_dtype == 'mixed_float16':
-        logits = CastToDtype(dtype=tf.float32, name='cast_output_to_float32')(logits)
+# ---------------------------------------------------------------------------
+# Full model
+# ---------------------------------------------------------------------------
+class OilSpillSegformerModel(nn.Module):
+    """
+    SegFormer-B2 adapted for single-channel SAR oil-spill segmentation.
 
-    model = models.Model(inputs=inputs, outputs=logits, name='SegFormer-B0')
+    Input:  [B, C, H, W]  float32  (NCHW — PyTorch convention)
+    Output: [B, num_classes, H, W]  float32 logits (NOT softmaxed)
+    """
 
-    return model
+    def __init__(
+        self,
+        input_shape=(384, 384, 1),
+        num_classes: int = 5,
+        drop_rate: float = 0.1,
+        use_cbam: bool = True,
+    ):
+        super().__init__()
+        in_channels = input_shape[2]
+        img_size    = input_shape[0]
 
-def create_pretrained_weight_loader():
-    import h5py
+        # Store for MultiScalePredictor / TTA compatibility
+        self.num_classes       = num_classes
+        self.expected_height   = input_shape[0]
+        self.expected_width    = input_shape[1]
+        self.expected_channels = in_channels
 
-    def load_weights(model, weights_path):
-        if not os.path.exists(weights_path):
-            print(f"Weights file not found: {weights_path}")
-            return False
+        embed_dims   = [64, 128, 320, 512]
+        num_heads    = [1, 2, 5, 8]
+        mlp_ratios   = [8, 8, 4, 4]
+        sr_ratios    = [8, 4, 2, 1]
+        num_layers   = [3, 4, 6, 3]
+        decoder_dims = 768
 
-        print(f"Loading weights from {weights_path}")
+        self.use_cbam = use_cbam
+        if use_cbam:
+            self.cbam = CBAMModule(channels=in_channels, reduction_ratio=2, kernel_size=7)
+
+        self.backbone = MixVisionTransformer(
+            img_size=img_size,
+            in_channels=in_channels,
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            mlp_ratios=mlp_ratios,
+            drop_rate=drop_rate,
+            sr_ratios=sr_ratios,
+            num_layers=num_layers,
+        )
+        self.decode_head = SegFormerHead(
+            num_classes=num_classes,
+            embed_dims=embed_dims,
+            decoder_embed_dims=decoder_dims,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H, W = x.shape[2], x.shape[3]
+        if self.use_cbam:
+            x = self.cbam(x)
+        features = self.backbone(x)
+        logits   = self.decode_head(features)
+        logits   = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+        return logits
+
+    # ------------------------------------------------------------------
+    # Pretrained weight loading
+    # ------------------------------------------------------------------
+    def load_pretrained_backbone(
+        self,
+        hub_name: str = 'nvidia/mit-b2',
+        local_path: Optional[str] = None,
+    ) -> bool:
+        """Load MiT-B2 weights from a local .pt file or HuggingFace hub."""
+        if local_path and os.path.exists(local_path):
+            try:
+                ckpt  = torch.load(local_path, map_location='cpu', weights_only=True)
+                state = ckpt.get('state_dict', ckpt)
+                if self._apply_backbone_weights(state):
+                    print(f"Loaded pretrained backbone from {local_path}")
+                    return True
+            except Exception as e:
+                print(f"Local weight loading failed: {e}")
 
         try:
-            model.load_weights(weights_path)
-            print("Successfully loaded weights using standard method")
-            return True
-        except Exception as e:
-            print(f"Standard weight loading failed with error: {e}")
-            print("Trying alternative loading method...")
-
-        if weights_path.endswith('.h5'):
+            from huggingface_hub import hf_hub_download
             try:
-                with h5py.File(weights_path, 'r') as h5_file:
-                    layer_mapping = {}
-                    for layer in model.layers:
-                        layer_mapping[layer.name] = layer
-                        layer_mapping[f"model/{layer.name}"] = layer
-                        layer_mapping[f"{layer.name}_1"] = layer
-
-                    loaded_layers = 0
-                    for name in h5_file.keys():
-                        if name in ['model_weights', 'optimizer_weights', 'metadata']:
-                            continue
-
-                        target_layer = None
-                        if name in layer_mapping:
-                            target_layer = layer_mapping[name]
-                        else:
-                            for layer_name, layer in layer_mapping.items():
-                                if name in layer_name or layer_name in name:
-                                    target_layer = layer
-                                    break
-
-                        if target_layer is None:
-                            continue
-
-                        group = h5_file[name]
-                        weight_names = []
-                        if 'weight_names' in group.attrs:
-                            weight_names = [n.decode('utf8') for n in group.attrs['weight_names']]
-                        else:
-                            for key in group.keys():
-                                if isinstance(group[key], h5py.Dataset):
-                                    weight_names.append(key)
-
-                        if not weight_names:
-                            continue
-
-                        weight_values = []
-                        for weight_name in weight_names:
-                            weight_path = f"{name}/{weight_name}"
-                            if weight_path in h5_file:
-                                weight_values.append(h5_file[weight_path][()])
-
-                        if len(weight_values) > 0:
-                            layer_weights = target_layer.get_weights()
-                            if len(layer_weights) == len(weight_values):
-                                shapes_match = True
-                                for i, (lw, wv) in enumerate(zip(layer_weights, weight_values)):
-                                    if lw.shape != wv.shape:
-                                        print(f"  Shape mismatch for {name} weights[{i}]: {lw.shape} vs {wv.shape}")
-                                        shapes_match = False
-                                        break
-
-                                if shapes_match:
-                                    target_layer.set_weights(weight_values)
-                                    loaded_layers += 1
-                                    print(f"  Loaded weights for layer: {target_layer.name}")
-
-                    if loaded_layers > 0:
-                        print(f"Successfully loaded weights for {loaded_layers} layers using h5py method")
-                        return True
-                    else:
-                        print("No matching layers found in weights file")
-                        return False
-            except Exception as e:
-                print(f"Alternative h5py loading failed with error: {e}")
-
+                path  = hf_hub_download(repo_id=hub_name, filename='pytorch_model.bin')
+                state = torch.load(path, map_location='cpu', weights_only=True)
+            except Exception:
+                try:
+                    from safetensors.torch import load_file
+                    path  = hf_hub_download(repo_id=hub_name, filename='model.safetensors')
+                    state = load_file(path)
+                except Exception:
+                    print(f"Could not download weights from HuggingFace: {hub_name}")
+                    return False
+            ok = self._apply_backbone_weights(state)
+            if ok:
+                print(f"Loaded pretrained backbone from HuggingFace ({hub_name})")
+            return ok
+        except ImportError:
+            print("huggingface_hub not installed — skipping pretrained weights.")
+        except Exception as e:
+            print(f"HuggingFace weight loading error: {e}\nTraining from scratch.")
         return False
 
-    return load_weights
+    def _apply_backbone_weights(self, hf_state: dict) -> bool:
+        """
+        Remap HuggingFace SegFormer-B2 keys to our backbone naming.
 
-def OilSpillSegformer(input_shape=(384, 384, 1), num_classes=5, drop_rate=0.1, use_cbam=True, pretrained_weights=None):
-    compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+        HF format                                    → Our format
+        segformer.encoder.patch_embeddings.N.proj    → backbone.patch_embed{N+1}.projection
+        block.N.K.*                                  → backbone.block{N+1}.{K}.*
+        layer_norm.N.*                               → backbone.norm{N+1}.norm.*
+        attention.self.query                         → attn.q
+        attention.self.key_value                     → attn.kv
+        attention.self.sr                            → attn.sr
+        attention.output.dense                       → attn.proj
+        intermediate.dense                           → ffn.fc1
+        output.dense                                 → ffn.fc2
+        dwconv.dwconv                                → ffn.dwconv
+        layernorm_before / layer_norm_1              → norm1.norm
+        layernorm_after  / layer_norm_2              → norm2.norm
+        """
+        mapped = {}
+        for hf_key, val in hf_state.items():
+            key = hf_key
+            for pfx in ('segformer.encoder.', 'mit.', 'encoder.', 'model.'):
+                if key.startswith(pfx):
+                    key = key[len(pfx):]
+                    break
 
-    inputs = layers.Input(shape=input_shape, dtype=tf.float32, name='input_image')
-    x = CastToDtype(dtype=compute_dtype, name='cast_input_to_compute_dtype')(inputs)
+            key = re.sub(r'patch_embeddings\.(\d+)\.',
+                         lambda m: f'patch_embed{int(m.group(1)) + 1}.', key)
+            key = re.sub(r'block\.(\d+)\.(\d+)\.',
+                         lambda m: f'block{int(m.group(1)) + 1}.{m.group(2)}.', key)
+            key = re.sub(r'layer_norm\.(\d+)\.',
+                         lambda m: f'norm{int(m.group(1)) + 1}.norm.', key)
 
-    embed_dims = [64, 128, 320, 512]
-    num_heads = [1, 2, 5, 8]
-    mlp_ratios = [8, 8, 4, 4]
-    sr_ratios = [8, 4, 2, 1]
-    num_layers = [3, 4, 6, 3]
-    decoder_embed_dims = 768
+            for old, new in [
+                ('attention.self.query',      'attn.q'),
+                ('attention.self.key_value',  'attn.kv'),
+                ('attention.self.sr',         'attn.sr'),
+                ('attention.self.layer_norm', 'attn.norm.norm'),
+                ('attention.output.dense',    'attn.proj'),
+                ('intermediate.dense',        'ffn.fc1'),
+                ('output.dense',              'ffn.fc2'),
+                ('dwconv.dwconv',             'ffn.dwconv'),
+                ('layernorm_before',          'norm1.norm'),
+                ('layernorm_after',           'norm2.norm'),
+                ('layer_norm_1',              'norm1.norm'),
+                ('layer_norm_2',              'norm2.norm'),
+            ]:
+                key = key.replace(old, new)
 
-    if use_cbam:
-        x = CBAM(channels=input_shape[2], reduction_ratio=2, kernel_size=7, dtype=compute_dtype)(x)
+            mapped[key] = val
 
-    backbone = MixVisionTransformer(
-        img_size=input_shape[0],
-        in_channels=input_shape[2],
-        embed_dims=embed_dims,
-        num_heads=num_heads,
-        mlp_ratios=mlp_ratios,
-        drop_rate=drop_rate,
-        sr_ratios=sr_ratios,
-        num_layers=num_layers,
-        name='backbone'
-    )
+        own     = self.backbone.state_dict()
+        matched = 0
+        for key, val in mapped.items():
+            if key in own and own[key].shape == val.shape:
+                try:
+                    own[key].copy_(val)
+                    matched += 1
+                except Exception:
+                    pass
+        self.backbone.load_state_dict(own, strict=False)
+        total = len(own)
+        print(f"Backbone weight loading: {matched}/{total} tensors matched")
+        return matched > 0
 
-    features = backbone(x)
 
-    decoder_head = SegFormerHead(
+# ---------------------------------------------------------------------------
+# Public factory — mirrors original OilSpillSegformer() API
+# ---------------------------------------------------------------------------
+def OilSpillSegformer(
+    input_shape=(384, 384, 1),
+    num_classes: int = 5,
+    drop_rate: float = 0.1,
+    use_cbam: bool = True,
+    pretrained_weights: Optional[str] = None,
+    hub_pretrained: str = 'nvidia/mit-b2',
+) -> OilSpillSegformerModel:
+    """
+    Build and optionally initialise an OilSpillSegformerModel.
+
+    Parameters
+    ----------
+    input_shape       : (H, W, C) — C is last (legacy API compat); forward() expects NCHW.
+    num_classes       : number of segmentation classes.
+    drop_rate         : stochastic depth / dropout rate.
+    use_cbam          : prepend CBAM attention on the input channel.
+    pretrained_weights: path to a local .pt file for backbone initialisation.
+    hub_pretrained    : HuggingFace model ID for auto backbone download.
+    """
+    model = OilSpillSegformerModel(
+        input_shape=input_shape,
         num_classes=num_classes,
-        embed_dims=embed_dims,
-        decoder_embed_dims=decoder_embed_dims,
-        name='decoder_head'
+        drop_rate=drop_rate,
+        use_cbam=use_cbam,
     )
-
-    logits = decoder_head(features)
-
-    img_height, img_width = input_shape[0], input_shape[1]
-    final_output_size = (img_height, img_width)
-
-    final_upsample_layer = ResizeImage(method='bilinear', name='final_upsampling')
-    logits = final_upsample_layer(logits, size=final_output_size)
-
-    if compute_dtype == 'mixed_float16':
-        logits = CastToDtype(dtype=tf.float32, name='cast_output_to_float32')(logits)
-
-    model = models.Model(inputs=inputs, outputs=logits, name='OilSpillSegformer-B2')
-
-    if pretrained_weights is not None:
-        print(f"Loading pretrained weights from: {pretrained_weights}")
-        weight_loader = create_pretrained_weight_loader()
-        if not weight_loader(model, pretrained_weights):
-            print("Failed to load pretrained weights, training from scratch instead")
-
+    if pretrained_weights or hub_pretrained:
+        model.load_pretrained_backbone(
+            hub_name=hub_pretrained or 'nvidia/mit-b2',
+            local_path=pretrained_weights,
+        )
     return model
-
-def CBAM(channels, reduction_ratio=2, kernel_size=7, dtype=None):
-    def apply(inputs):
-        avg_pool = layers.GlobalAveragePooling2D(keepdims=True, dtype=dtype)(inputs)
-        max_pool = layers.GlobalMaxPooling2D(keepdims=True, dtype=dtype)(inputs)
-
-        avg_pool = layers.Conv2D(filters=max(channels // reduction_ratio, 4), kernel_size=1,
-                                 use_bias=True, dtype=dtype)(avg_pool)
-        avg_pool = layers.ReLU(dtype=dtype)(avg_pool)
-        avg_pool = layers.Conv2D(filters=channels, kernel_size=1,
-                                 use_bias=True, dtype=dtype)(avg_pool)
-
-        max_pool = layers.Conv2D(filters=max(channels // reduction_ratio, 4), kernel_size=1,
-                                 use_bias=True, dtype=dtype)(max_pool)
-        max_pool = layers.ReLU(dtype=dtype)(max_pool)
-        max_pool = layers.Conv2D(filters=channels, kernel_size=1,
-                                 use_bias=True, dtype=dtype)(max_pool)
-
-        channel_attention = layers.Add(dtype=dtype)([avg_pool, max_pool])
-        channel_attention = layers.Activation('sigmoid', dtype=dtype)(channel_attention)
-        channel_refined = layers.Multiply(dtype=dtype)([inputs, channel_attention])
-
-        avg_spatial = layers.Lambda(lambda x: tf.reduce_mean(x, axis=-1, keepdims=True),
-                                    dtype=dtype)(channel_refined)
-        max_spatial = layers.Lambda(lambda x: tf.reduce_max(x, axis=-1, keepdims=True),
-                                    dtype=dtype)(channel_refined)
-        var_spatial = layers.Lambda(lambda x: tf.cast(tf.math.reduce_variance(tf.cast(x, tf.float32), axis=-1, keepdims=True), dtype),
-                                    dtype=dtype)(channel_refined)
-
-        spatial_concat = layers.Concatenate(axis=-1, dtype=dtype)([avg_spatial, max_spatial, var_spatial])
-
-        spatial_attention = layers.Conv2D(filters=1, kernel_size=kernel_size, padding='same',
-                                         activation='sigmoid', use_bias=False, dtype=dtype)(spatial_concat)
-
-        output = layers.Multiply(dtype=dtype)([channel_refined, spatial_attention])
-        return output
-    return apply

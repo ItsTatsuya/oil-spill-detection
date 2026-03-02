@@ -1,11 +1,11 @@
 """
 Shared utilities for oil spill detection project.
 
-Consolidates duplicated helpers (silent_tf_import, colored_print, etc.) into one module.
+Consolidates helpers (set_reproducibility, colored_print, etc.) into one module.
+All TensorFlow/Keras dependencies removed — now pure PyTorch.
 """
 
 import os
-import sys
 import random
 import logging
 
@@ -24,30 +24,19 @@ def setup_logging(level=logging.INFO):
     return logging.getLogger('oil_spill')
 
 
-def silent_tf_import():
-    """Import TensorFlow while suppressing noisy startup warnings."""
-    orig_stderr_fd = sys.stderr.fileno()
-    saved_stderr_fd = os.dup(orig_stderr_fd)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull_fd, orig_stderr_fd)
-    os.close(devnull_fd)
-
-    import tensorflow as tf
-
-    os.dup2(saved_stderr_fd, orig_stderr_fd)
-    os.close(saved_stderr_fd)
-    return tf
-
-
 def set_reproducibility(seed: int = 42):
-    """Set all random seeds for reproducibility."""
+    """Set all random seeds for reproducibility (Python, NumPy, PyTorch)."""
     os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
     random.seed(seed)
     np.random.seed(seed)
 
-    import tensorflow as tf
-    tf.random.set_seed(seed)
+    import torch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic CUDNN ops (slight perf hit, improves reproducibility)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ---------------------------------------------------------------------------

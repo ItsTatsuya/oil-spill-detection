@@ -1,16 +1,20 @@
 """
-Training script for SegFormer-B2 oil spill detection.
+Training script for SegFormer-B2 oil spill detection — PyTorch implementation.
 
-Key improvements over the original:
-- 8x A100 distributed training via MirroredStrategy (global batch 256)
-- Proper train/val split (test set reserved for final evaluation only)
-- Learning rate scaled via sqrt rule for large-batch training
-- EMA of weights for better generalisation
-- ReduceLROnPlateau alongside cosine schedule
-- Re-enabled boundary loss, label smoothing, corrected focal weighting
-- Lower focal gamma (2.0 vs 3.0), lower cosine alpha (0.001 vs 0.01)
-- Thread parallelism auto-detected instead of hardcoded to 2
-- Full reproducibility (PYTHONHASHSEED, TF_DETERMINISTIC_OPS, random.seed)
+Key features:
+- Explicit training loop with AMP (autocast + GradScaler)
+- Auto-detects GPUs: single-GPU, CPU, or multi-GPU via torchrun / DDP
+- Cosine LR with linear warmup; ReduceLROnPlateau safety net
+- EMA (torch-ema) — swapped in during validation
+- TensorBoard logging
+- Checkpoint resume + early stopping
+- Post-training TTA evaluation
+
+Single GPU / CPU usage:
+    python train.py
+
+Multi-GPU (2 GPUs on one machine):
+    torchrun --nproc_per_node=2 train.py
 """
 
 import os
@@ -18,570 +22,531 @@ import gc
 import time
 import logging
 from datetime import datetime
+from typing import Optional, cast
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from utils import silent_tf_import, set_reproducibility, colored_print, TermColors
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils import clip_grad_norm_
+from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, ReduceLROnPlateau, SequentialLR
+from torch.utils.tensorboard import SummaryWriter
+from torch_ema import ExponentialMovingAverage
+
+from utils import set_reproducibility, colored_print, TermColors
 from config import TrainConfig, LossConfig, DataConfig
 
-# ---- Reproducibility (before any TF import) --------------------------------
+# ---------------------------------------------------------------------------
+# Config + reproducibility (before DDP init)
+# ---------------------------------------------------------------------------
 cfg = TrainConfig()
 set_reproducibility(cfg.seed)
 
-tf = silent_tf_import()
-from tensorflow.keras import mixed_precision  # type: ignore
-
 logger = logging.getLogger('oil_spill')
-
-# ---- Mixed precision --------------------------------------------------------
-mixed_precision.set_global_policy('mixed_float16')
-print(f"Mixed precision policy: {mixed_precision.global_policy().name}")
-
-from data.data_loader import load_dataset
-from data.augmentation import apply_augmentation
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s  %(levelname)s  %(message)s')
 
 
 # ---------------------------------------------------------------------------
-# Callbacks
+# LR schedule: linear warmup → cosine decay
 # ---------------------------------------------------------------------------
-class ProgressCallback(tf.keras.callbacks.Callback):
-    def __init__(self, total_epochs, steps_per_epoch, validation_steps=None):
-        super().__init__()
-        self.total_epochs = total_epochs
-        self.steps_per_epoch = steps_per_epoch
-        self.validation_steps = validation_steps
-        self.step_times = []
-        self.epoch_start_time = None
+def build_scheduler(optimizer, epochs: int, train_steps: int,
+                    warmup_epochs: int = 25, cosine_alpha: float = 0.001):
+    """Return a SequentialLR: LinearLR warmup then CosineAnnealingLR."""
+    warmup_iters = max(1, warmup_epochs * train_steps)
+    total_iters  = epochs * train_steps
 
-    def on_train_begin(self, logs=None):
-        print("\n" + "=" * 80)
-        print(f"Training started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Total epochs: {self.total_epochs}")
-        print(f"Steps per epoch: {self.steps_per_epoch}")
-        if self.validation_steps:
-            print(f"Validation steps: {self.validation_steps}")
-        print("=" * 80 + "\n")
-
-    def on_epoch_begin(self, epoch, logs=None):
-        self.epoch_start_time = time.time()
-        self.step_times = []
-        print(f"\nEpoch {epoch + 1}/{self.total_epochs} - "
-              f"Starting at {datetime.now().strftime('%H:%M:%S')}")
-        self.last_step_time = time.time()
-
-    def on_train_batch_end(self, batch, logs=None):
-        now = time.time()
-        self.step_times.append(now - self.last_step_time)
-        self.last_step_time = now
-        report_every = max(1, self.steps_per_epoch // 20)
-        if batch % report_every == 0 or batch == self.steps_per_epoch - 1:
-            loss = logs.get('loss', 0.0)
-            iou = logs.get('iou_metric', 0.0)
-            avg_ms = np.mean(self.step_times[-50:]) * 1000 if self.step_times else 0
-            eta_s = avg_ms / 1000 * (self.steps_per_epoch - batch) if batch > 0 else 0
-            eta = f"{int(eta_s // 60):02d}:{int(eta_s % 60):02d}" if batch > 0 else "??:??"
-            print(f"  Step {batch + 1}/{self.steps_per_epoch} - "
-                  f"Loss: {loss:.4f} - IoU: {iou:.4f} - "
-                  f"{avg_ms:.1f} ms/step - ETA: {eta}")
-
-    def on_epoch_end(self, epoch, logs=None):
-        elapsed = time.time() - self.epoch_start_time
-        h, rem = divmod(elapsed, 3600)
-        m, s = divmod(rem, 60)
-        val_loss = logs.get('val_loss', 0.0)
-        val_iou = logs.get('val_iou_metric', 0.0)
-        print(f"\nEpoch {epoch + 1}/{self.total_epochs} "
-              f"completed in {int(h):02d}:{int(m):02d}:{int(s):02d}")
-        print(f"  Loss: {logs.get('loss', 0.0):.4f} - "
-              f"IoU: {logs.get('iou_metric', 0.0):.4f} - "
-              f"Val Loss: {val_loss:.4f} - Val IoU: {val_iou:.4f}")
-        if hasattr(self.model.optimizer, 'lr'):
-            lr = self.model.optimizer.lr
-            if hasattr(lr, 'numpy'):
-                lr_val = float(lr.numpy())
-            elif callable(getattr(lr, '__call__', None)):
-                lr_val = float(lr(self.model.optimizer.iterations).numpy())
-            else:
-                lr_val = float(lr)
-            print(f"  Learning rate: {lr_val:.2e}")
-        print("=" * 80)
-
-
-class EMACallback(tf.keras.callbacks.Callback):
-    """Exponential Moving Average of model weights — swap in during validation."""
-
-    def __init__(self, decay=0.999):
-        super().__init__()
-        self.decay = decay
-        self.ema_weights = None
-        self.backup_weights = None
-
-    def on_train_batch_end(self, batch, logs=None):
-        if self.ema_weights is None:
-            self.ema_weights = [tf.Variable(w) for w in self.model.trainable_weights]
-        for ema_w, w in zip(self.ema_weights, self.model.trainable_weights):
-            ema_w.assign(self.decay * ema_w + (1.0 - self.decay) * w)
-
-    def on_test_begin(self, logs=None):
-        if self.ema_weights is None:
-            return
-        self.backup_weights = [tf.identity(w) for w in self.model.trainable_weights]
-        for w, ema_w in zip(self.model.trainable_weights, self.ema_weights):
-            w.assign(ema_w)
-
-    def on_test_end(self, logs=None):
-        if self.backup_weights is None:
-            return
-        for w, bak in zip(self.model.trainable_weights, self.backup_weights):
-            w.assign(bak)
-        self.backup_weights = None
-
-    def apply_ema_weights(self):
-        """Permanently replace model weights with EMA weights (call after training)."""
-        if self.ema_weights is not None:
-            for w, ema_w in zip(self.model.trainable_weights, self.ema_weights):
-                w.assign(ema_w)
-
-
-# ---------------------------------------------------------------------------
-# LR schedule
-# ---------------------------------------------------------------------------
-def create_cosine_decay_with_warmup(
-    epochs, train_steps, initial_lr=3.4e-4, warmup_epochs=25, alpha=0.001
-):
-    total_steps = epochs * train_steps
-    warmup_steps = warmup_epochs * train_steps
-
-    warmup_lr = tf.keras.optimizers.schedules.PolynomialDecay(
-        initial_learning_rate=0.0,
-        decay_steps=max(warmup_steps, 1),
-        end_learning_rate=initial_lr,
+    warmup = LinearLR(
+        optimizer,
+        start_factor=1e-6,
+        end_factor=1.0,
+        total_iters=warmup_iters,
     )
-
-    if total_steps <= warmup_steps:
-        class FallbackLR(tf.keras.optimizers.schedules.LearningRateSchedule):
-            def __call__(self, step):
-                return tf.keras.optimizers.schedules.PolynomialDecay(
-                    initial_learning_rate=initial_lr,
-                    decay_steps=total_steps,
-                    end_learning_rate=1e-6,
-                )(step)
-            def get_config(self):
-                return {"initial_lr": initial_lr, "total_steps": total_steps}
-        return FallbackLR()
-
-    cosine_lr = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=initial_lr,
-        decay_steps=total_steps - warmup_steps,
-        alpha=alpha,
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_iters - warmup_iters),
+        eta_min=cfg.learning_rate * cosine_alpha,
     )
-
-    class CosineWarmupLR(tf.keras.optimizers.schedules.LearningRateSchedule):
-        def __call__(self, step):
-            step = tf.cast(step, tf.float32)
-            return tf.cond(
-                step < warmup_steps,
-                lambda: warmup_lr(step),
-                lambda: cosine_lr(step - warmup_steps),
-            )
-
-        def get_config(self):
-            return {
-                "epochs": epochs,
-                "train_steps": train_steps,
-                "initial_lr": initial_lr,
-                "warmup_epochs": warmup_epochs,
-                "alpha": alpha,
-            }
-
-    return CosineWarmupLR()
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_iters],
+    )
+    return scheduler
 
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def plot_training_curves(history, save_path='miou_curves.png'):
-    if not history.history:
-        print("Warning: Empty training history.")
-        return
+def plot_training_curves(train_losses, val_losses, train_ious, val_ious,
+                         save_path='miou_curves.png'):
+    epochs = list(range(1, len(train_losses) + 1))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    plt.figure(figsize=(12, 5))
-    keys = list(history.history.keys())
+    if train_ious and val_ious:
+        axes[0].plot(epochs, train_ious, label='Train IoU')
+        axes[0].plot(epochs[:len(val_ious)], val_ious, label='Val IoU')
+        axes[0].set_title('Mean IoU Over Time')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Mean IoU')
+        axes[0].legend(loc='lower right')
+        axes[0].grid(True, linestyle='--', alpha=0.6)
 
-    t_iou = next((k for k in keys if 'iou' in k.lower() and not k.startswith('val_')), None)
-    v_iou = next((k for k in keys if 'iou' in k.lower() and k.startswith('val_')), None)
-
-    if t_iou and v_iou:
-        plt.subplot(1, 2, 1)
-        plt.plot(history.history[t_iou], label=f'Train {t_iou}')
-        plt.plot(history.history[v_iou], label=f'Val {v_iou}')
-        plt.title('Mean IoU Over Time')
-        plt.xlabel('Epoch')
-        plt.ylabel('Mean IoU')
-        plt.legend(loc='lower right')
-        plt.grid(True, linestyle='--', alpha=0.6)
-
-    if 'loss' in keys and 'val_loss' in keys:
-        plt.subplot(1, 2, 2)
-        plt.plot(history.history['loss'], label='Train Loss')
-        plt.plot(history.history['val_loss'], label='Val Loss')
-        plt.title('Loss Over Time')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend(loc='upper right')
-        plt.grid(True, linestyle='--', alpha=0.6)
+    if train_losses and val_losses:
+        axes[1].plot(epochs, train_losses, label='Train Loss')
+        axes[1].plot(epochs[:len(val_losses)], val_losses, label='Val Loss')
+        axes[1].set_title('Loss Over Time')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Loss')
+        axes[1].legend(loc='upper right')
+        axes[1].grid(True, linestyle='--', alpha=0.6)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
     print(f"Training curves saved to {save_path}")
 
 
 # ---------------------------------------------------------------------------
-# Main: train_and_evaluate
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+def save_checkpoint(path, model, optimizer, scaler, ema, epoch, best_iou):
+    """Save full training state."""
+    raw_model = model.module if hasattr(model, 'module') else model
+    torch.save({
+        'epoch':      epoch,
+        'model':      raw_model.state_dict(),
+        'optimizer':  optimizer.state_dict(),
+        'scaler':     scaler.state_dict(),
+        'ema':        ema.state_dict(),
+        'best_iou':   best_iou,
+    }, path)
+
+
+def load_checkpoint(path, model, optimizer=None, scaler=None, ema=None, device='cpu'):
+    """Load training state. Returns the epoch to resume from."""
+    ckpt = torch.load(path, map_location=device)
+    raw_model = model.module if hasattr(model, 'module') else model
+    raw_model.load_state_dict(ckpt['model'])
+    if optimizer is not None and 'optimizer' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer'])
+    if scaler is not None and 'scaler' in ckpt:
+        scaler.load_state_dict(ckpt['scaler'])
+    if ema is not None and 'ema' in ckpt:
+        ema.load_state_dict(ckpt['ema'])
+    epoch    = ckpt.get('epoch', 0)
+    best_iou = ckpt.get('best_iou', 0.0)
+    return epoch, best_iou
+
+
+# ---------------------------------------------------------------------------
+# Validation loop
+# ---------------------------------------------------------------------------
+@torch.inference_mode()
+def validate(model, val_loader, criterion, device, metric, use_amp=True):
+    """Run one validation pass. Returns (mean_loss, mean_iou)."""
+    model.eval()
+    metric.reset_state()
+    total_loss = 0.0
+    n_batches  = 0
+
+    for images, labels in val_loader:
+        images, labels = images.to(device), labels.to(device)
+        with autocast('cuda', enabled=use_amp):
+            logits = model(images)
+            loss   = criterion(logits, labels)
+        total_loss += loss.item()
+        metric.update_state(labels, logits)
+        n_batches  += 1
+
+    mean_loss = total_loss / max(n_batches, 1)
+    mean_iou  = float(metric.result().item())
+    model.train()
+    return mean_loss, mean_iou
+
+
+# ---------------------------------------------------------------------------
+# Main training function
 # ---------------------------------------------------------------------------
 def train_and_evaluate():
-    # ---- Config -------------------------------------------------------------
+    # ---- DDP setup ---------------------------------------------------------
+    rank       = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    is_main    = (rank == 0)
+
+    if world_size > 1:
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(rank)
+        device = torch.device(f'cuda:{rank}')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    if is_main:
+        print(f"\n{'='*70}")
+        print(f"PyTorch SegFormer-B2  —  oil spill detection")
+        print(f"Device: {device}  |  World size: {world_size}  |  Seed: {cfg.seed}")
+        print(f"{'='*70}\n")
+
+    # ---- Config ------------------------------------------------------------
     NUM_CLASSES = cfg.num_classes
-    BATCH_SIZE = cfg.batch_size
-    PER_GPU_BS = cfg.per_gpu_batch_size
-    EPOCHS = cfg.epochs
-    LEARNING_RATE = cfg.learning_rate
-    IMG_SIZE = (384, 384)
-
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-    # ---- GPU setup ----------------------------------------------------------
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            except RuntimeError:
-                pass
-        print(f"Found {len(gpus)} GPU(s), memory growth enabled")
-    else:
-        print("No GPU found — using CPU")
-
-    # Thread parallelism: auto-detect (0 = let TF decide)
-    if cfg.inter_op_threads > 0:
-        tf.config.threading.set_inter_op_parallelism_threads(cfg.inter_op_threads)
-    if cfg.intra_op_threads > 0:
-        tf.config.threading.set_intra_op_parallelism_threads(cfg.intra_op_threads)
-
-    # ---- Distribution strategy ----------------------------------------------
-    if cfg.use_distributed and len(gpus) > 1:
-        strategy = tf.distribute.MirroredStrategy()
-        print(f"MirroredStrategy: {strategy.num_replicas_in_sync} replicas")
-        BATCH_SIZE = PER_GPU_BS * strategy.num_replicas_in_sync
-    else:
-        strategy = tf.distribute.get_strategy()  # default (single device)
-        if len(gpus) == 1:
-            BATCH_SIZE = PER_GPU_BS
-        print(f"Single-device strategy, batch_size={BATCH_SIZE}")
+    PER_GPU_BS  = cfg.per_gpu_batch_size
+    BATCH_SIZE  = PER_GPU_BS * world_size
+    EPOCHS      = cfg.epochs
+    LR          = cfg.learning_rate
+    IMG_SIZE    = (384, 384)
+    use_amp     = torch.cuda.is_available()
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    latest_weights = os.path.join(cfg.checkpoint_dir, 'segformer_b2_latest.weights.h5')
-    initial_epoch = 0
 
-    # ---- Data ---------------------------------------------------------------
-    print("Loading datasets …")
+    # ---- Data --------------------------------------------------------------
     dcfg = DataConfig()
-    train_ds, class_weights_dict, train_steps = load_dataset(
-        data_dir=dcfg.data_dir, split='train', batch_size=BATCH_SIZE,
-        val_split=dcfg.val_split, class_weights_cache=dcfg.class_weights_cache,
-    )
-    val_ds, _, val_steps = load_dataset(
-        data_dir=dcfg.data_dir, split='val', batch_size=BATCH_SIZE,
-        val_split=dcfg.val_split,
-    )
 
-    # Debug shapes
-    for images, labels in train_ds.take(1):
-        print(f"Train batch — images: {images.shape} ({images.dtype}), labels: {labels.shape}")
-    for images, labels in val_ds.take(1):
-        print(f"Val batch   — images: {images.shape} ({images.dtype}), labels: {labels.shape}")
+    # DataLoader for DDP: DistributedSampler handles per-rank sharding
+    from torch.utils.data import DataLoader as _DataLoader
+    from torch.utils.data.distributed import DistributedSampler
+    from data.data_loader import OilSpillDataset, analyze_class_distribution, _worker_init_fn
+    import glob
 
-    colored_print("Applying augmentation pipeline …", color=TermColors.YELLOW, bold=True)
-    augmented_train_ds = apply_augmentation(train_ds, batch_size=BATCH_SIZE)
+    train_sampler = None  # set below when world_size > 1
 
-    for images, labels in augmented_train_ds.take(1):
-        print(f"Augmented   — images: {images.shape} ({images.dtype}), labels: {labels.shape}")
+    def _make_loaders():
+        nonlocal train_sampler
+        base_dir  = os.path.join(dcfg.data_dir, 'train')
+        image_dir = os.path.join(base_dir, 'images')
+        label_dir = os.path.join(base_dir, 'labels_1D')
+        all_images = sorted(glob.glob(os.path.join(image_dir, '*.jpg')))
+        all_labels = sorted(glob.glob(os.path.join(label_dir, '*.png')))
 
-    # Shape validation
-    @tf.function
-    def ensure_shapes(images, labels):
-        expected_h, expected_w, expected_c = 384, 384, 1
+        n_total  = len(all_images)
+        n_val    = max(1, int(dcfg.val_split * n_total))
+        tr_imgs  = all_images[:-n_val];  tr_lbls = all_labels[:-n_val]
+        va_imgs  = all_images[-n_val:];  va_lbls = all_labels[-n_val:]
 
-        def reshape5(tensor):
-            rank = tf.rank(tensor)
-            shape = tf.shape(tensor)
-            return tf.cond(
-                tf.equal(rank, 5),
-                lambda: tf.reshape(tensor, [shape[0] * shape[1], expected_h, expected_w, expected_c]),
-                lambda: tensor,
-            )
+        cw = analyze_class_distribution(
+            tr_lbls, num_classes=NUM_CLASSES,
+            cache_path=dcfg.class_weights_cache,
+        )
 
-        images = reshape5(images)
-        labels = reshape5(labels)
-        return images, labels
+        tr_ds = OilSpillDataset(tr_imgs, tr_lbls, split='train', augment=True)
+        va_ds = OilSpillDataset(va_imgs, va_lbls, split='val',   augment=False)
 
-    augmented_train_ds = augmented_train_ds.map(ensure_shapes)
-    val_ds = val_ds.map(ensure_shapes)
+        if world_size > 1:
+            train_sampler = DistributedSampler(tr_ds, num_replicas=world_size,
+                                               rank=rank, shuffle=True)
+            val_sampler   = DistributedSampler(va_ds, num_replicas=world_size,
+                                               rank=rank, shuffle=False)
+        else:
+            train_sampler = None
+            val_sampler   = None
 
-    print(f"Train steps: {train_steps}, Val steps: {val_steps}")
-    if train_steps == 0 or val_steps == 0:
-        raise ValueError("Empty dataset detected — check data loading pipeline.")
+        tr_loader = _DataLoader(
+            tr_ds, batch_size=PER_GPU_BS,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=dcfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+            persistent_workers=(dcfg.num_workers > 0),
+            worker_init_fn=_worker_init_fn if dcfg.num_workers > 0 else None,
+        )
+        va_loader = _DataLoader(
+            va_ds, batch_size=PER_GPU_BS,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=dcfg.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=(dcfg.num_workers > 0),
+            worker_init_fn=_worker_init_fn if dcfg.num_workers > 0 else None,
+        )
+        return tr_loader, va_loader, cw, len(tr_loader), len(va_loader)
 
-    # ---- Model (inside strategy scope) --------------------------------------
+    if is_main:
+        print("Loading datasets …")
+    train_loader, val_loader, class_weights_dict, train_steps, val_steps = _make_loaders()
+
+    if is_main:
+        for images, labels in train_loader:
+            print(f"Train batch — images: {tuple(images.shape)} ({images.dtype}), "
+                  f"labels: {tuple(labels.shape)}")
+            break
+        if train_steps == 0 or val_steps == 0:
+            raise ValueError("Empty dataset detected — check data path.")
+
+    gc.collect()
+
+    # ---- Model -------------------------------------------------------------
+    from model.model import OilSpillSegformer
+    from model.loss import HybridSegmentationLoss
+    from model.metrics import IoUMetric
+
     pretrained_path = cfg.pretrained_weights
-    use_pretrained = os.path.exists(pretrained_path)
-    print(f"Pre-trained weights {'found' if use_pretrained else 'not found'} at {pretrained_path}")
+    use_pretrained  = os.path.exists(pretrained_path)
+    if is_main:
+        print(f"Pre-trained weights {'found' if use_pretrained else 'not found'} "
+              f"at {pretrained_path}")
 
-    with strategy.scope():
-        from model.model import OilSpillSegformer
-        from model.loss import HybridSegmentationLoss
-        from model.metrics import IoUMetric
+    model = OilSpillSegformer(
+        input_shape=(*IMG_SIZE, 1),
+        num_classes=NUM_CLASSES,
+        drop_rate=0.1,
+        use_cbam=False,
+        pretrained_weights=pretrained_path if use_pretrained else None,
+    ).to(device)
 
-        model = OilSpillSegformer(
-            input_shape=(*IMG_SIZE, 1),
-            num_classes=NUM_CLASSES,
-            drop_rate=0.1,
-            use_cbam=False,
-            pretrained_weights=pretrained_path if use_pretrained else None,
-        )
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
-        # ---- Attempt checkpoint resume --------------------------------------
-        if os.path.exists(latest_weights):
-            print(f"Loading checkpoint from {latest_weights} …")
-            try:
-                model.load_weights(latest_weights)
-                info_path = os.path.join(cfg.checkpoint_dir, 'checkpoint_info.txt')
-                if os.path.exists(info_path):
-                    with open(info_path, 'r') as f:
-                        initial_epoch = int(f.read().strip())
-                    print(f"Resuming from epoch {initial_epoch}")
-            except Exception as e:
-                print(f"Checkpoint loading failed: {e} — training from scratch")
-                initial_epoch = 0
-        else:
-            print("No checkpoint found — starting from scratch / pre-trained weights.")
+    # ---- Loss + metrics ----------------------------------------------------
+    lcfg = LossConfig()
+    class_weights_list = [class_weights_dict[i] for i in range(NUM_CLASSES)] \
+                         if class_weights_dict else None
+    criterion = HybridSegmentationLoss(
+        class_weights=class_weights_list,
+        ce_weight=lcfg.ce_weight,
+        focal_weight=lcfg.focal_weight,
+        dice_weight=lcfg.dice_weight,
+        boundary_weight=lcfg.boundary_weight,
+        gamma=lcfg.focal_gamma,
+        label_smoothing=lcfg.label_smoothing,
+    ).to(device)
 
-        # ---- LR schedule ----------------------------------------------------
-        lr_schedule = create_cosine_decay_with_warmup(
-            epochs=EPOCHS,
-            train_steps=train_steps,
-            initial_lr=LEARNING_RATE,
-            warmup_epochs=cfg.warmup_epochs,
-            alpha=cfg.cosine_alpha,
-        )
+    metric = IoUMetric(num_classes=NUM_CLASSES, device=device)
 
-        print(f"LR schedule: peak={LEARNING_RATE:.2e}, warmup={cfg.warmup_epochs} epochs, "
-              f"alpha={cfg.cosine_alpha}")
-
-        # ---- Optimizer -------------------------------------------------------
-        using_keras3 = hasattr(tf.keras, '__version__') and tf.keras.__version__.startswith('3')
-        if using_keras3:
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=lr_schedule,
-                beta_1=cfg.beta_1,
-                beta_2=cfg.beta_2,
-                epsilon=cfg.epsilon,
-                amsgrad=cfg.amsgrad,
-                weight_decay=cfg.weight_decay,
-                clipnorm=cfg.clipnorm,
-                name="adam_optimizer",
-            )
-            print("Keras 3 Adam with built-in weight decay")
-        else:
-            try:
-                optimizer = tf.keras.optimizers.AdamW(
-                    learning_rate=lr_schedule,
-                    weight_decay=cfg.weight_decay,
-                    beta_1=cfg.beta_1,
-                    beta_2=cfg.beta_2,
-                    epsilon=cfg.epsilon,
-                    clipnorm=cfg.clipnorm,
-                )
-                print("AdamW optimizer")
-            except (ImportError, AttributeError):
-                optimizer = tf.keras.optimizers.Adam(
-                    learning_rate=lr_schedule,
-                    beta_1=cfg.beta_1,
-                    beta_2=cfg.beta_2,
-                    epsilon=cfg.epsilon,
-                    clipnorm=cfg.clipnorm,
-                )
-                print("Adam optimizer (no built-in weight decay)")
-
-        # ---- Loss ------------------------------------------------------------
-        lcfg = LossConfig()
-        class_weights_list = [class_weights_dict[i] for i in range(NUM_CLASSES)]
-        loss_fn = HybridSegmentationLoss(
-            class_weights=class_weights_list,
-            ce_weight=lcfg.ce_weight,
-            focal_weight=lcfg.focal_weight,
-            dice_weight=lcfg.dice_weight,
-            boundary_weight=lcfg.boundary_weight,
-            gamma=lcfg.focal_gamma,
-            label_smoothing=lcfg.label_smoothing,
-            from_logits=lcfg.from_logits,
-        )
-        print(f"HybridSegmentationLoss: CE={lcfg.ce_weight}, Focal={lcfg.focal_weight} (γ={lcfg.focal_gamma}), "
+    if is_main:
+        print(f"HybridSegmentationLoss: CE={lcfg.ce_weight}, "
+              f"Focal={lcfg.focal_weight} (γ={lcfg.focal_gamma}), "
               f"Dice={lcfg.dice_weight}, Boundary={lcfg.boundary_weight}, "
               f"label_smoothing={lcfg.label_smoothing}")
 
-        # ---- Compile ---------------------------------------------------------
-        model.compile(
-            optimizer=optimizer,
-            loss=loss_fn,
-            metrics=[IoUMetric(num_classes=NUM_CLASSES)],
-            run_eagerly=False,
-            jit_compile=True,
-        )
-
-    print("Model compiled with XLA JIT compilation")
-    model.summary()
-
-    # ---- Callbacks -----------------------------------------------------------
-    ema_cb = EMACallback(decay=cfg.ema_decay) if cfg.use_ema else None
-
-    checkpoint_path = os.path.join(cfg.checkpoint_dir, 'segformer_b2_best.weights.h5')
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=checkpoint_path,
-            monitor='val_iou_metric',
-            save_best_only=True,
-            save_weights_only=True,
-            mode='max',
-            verbose=1,
-        ),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=latest_weights,
-            save_weights_only=True,
-            save_best_only=False,
-            save_freq='epoch',
-            verbose=0,
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor='val_iou_metric',
-            patience=cfg.early_stopping_patience,
-            mode='max',
-            restore_best_weights=True,
-            verbose=1,
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_iou_metric',
-            factor=cfg.reduce_lr_factor,
-            patience=cfg.reduce_lr_patience,
-            mode='max',
-            min_lr=cfg.reduce_lr_min,
-            verbose=1,
-        ),
-        tf.keras.callbacks.TensorBoard(
-            log_dir=os.path.join(cfg.log_dir, 'fit',
-                                 'segformer_b2_' + datetime.now().strftime("%Y%m%d-%H%M%S")),
-            update_freq='epoch',
-        ),
-        ProgressCallback(total_epochs=EPOCHS, steps_per_epoch=train_steps,
-                         validation_steps=val_steps),
-        tf.keras.callbacks.LambdaCallback(
-            on_epoch_end=lambda epoch, logs: open(
-                os.path.join(cfg.checkpoint_dir, 'checkpoint_info.txt'), 'w'
-            ).write(str(epoch + 1)),
-        ),
-    ]
-    if ema_cb is not None:
-        callbacks.append(ema_cb)
-
-    # ---- Train ---------------------------------------------------------------
-    print(f"\nStarting training for {EPOCHS} epochs from epoch {initial_epoch} …")
-    print(f"Global batch size: {BATCH_SIZE}  |  GPUs: {strategy.num_replicas_in_sync if hasattr(strategy, 'num_replicas_in_sync') else 1}")
-
-    history = model.fit(
-        augmented_train_ds,
-        validation_data=val_ds,
-        epochs=EPOCHS,
-        callbacks=callbacks,
-        verbose=0,
-        initial_epoch=initial_epoch,
+    # ---- Optimizer + scheduler + scaler + EMA ------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        betas=(cfg.beta_1, cfg.beta_2),
+        eps=cfg.epsilon,
+        weight_decay=cfg.weight_decay,
+        amsgrad=cfg.amsgrad,
     )
 
-    # Apply EMA weights permanently before saving
-    if ema_cb is not None:
-        ema_cb.apply_ema_weights()
-        print("Applied EMA weights to model")
+    scheduler      = build_scheduler(optimizer, EPOCHS, train_steps,
+                                     warmup_epochs=cfg.warmup_epochs,
+                                     cosine_alpha=cfg.cosine_alpha)
+    plateau_sched  = ReduceLROnPlateau(optimizer, mode='max',
+                                       factor=cfg.reduce_lr_factor,
+                                       patience=cfg.reduce_lr_patience,
+                                       min_lr=cfg.reduce_lr_min)
+    scaler = GradScaler('cuda', enabled=use_amp)
+    raw_model = model.module if hasattr(model, 'module') else model
+    assert isinstance(raw_model, torch.nn.Module)
+    ema = ExponentialMovingAverage(raw_model.parameters(), decay=cfg.ema_decay)
 
-    # Save final
-    final_path = 'segformer_b2_final.weights.h5'
-    model.save_weights(final_path)
-    print(f"Final weights saved to {final_path}")
+    # ---- Checkpoint resume -------------------------------------------------
+    initial_epoch = 0
+    best_iou      = 0.0
+    latest_ckpt   = os.path.join(cfg.checkpoint_dir, 'segformer_b2_latest.pt')
+    best_ckpt     = os.path.join(cfg.checkpoint_dir, 'segformer_b2_best.pt')
 
-    plot_training_curves(history, save_path='segformer_b2_miou_curves.png')
+    if os.path.exists(latest_ckpt):
+        if is_main:
+            print(f"Resuming from {latest_ckpt} …")
+        try:
+            initial_epoch, best_iou = load_checkpoint(
+                latest_ckpt, model, optimizer, scaler, ema, device=str(device)
+            )
+            if is_main:
+                print(f"  → epoch {initial_epoch}, best_iou={best_iou:.4f}")
+        except Exception as e:
+            if is_main:
+                print(f"Checkpoint load failed ({e}) — training from scratch")
+            initial_epoch = 0
+    else:
+        if is_main:
+            print("No checkpoint found — starting from scratch / pre-trained backbone.")
 
-    # ---- Post-training evaluation with TTA on validation set ----------------
-    print("\nEvaluating on validation set with TTA …")
-    from model.prediction import MultiScalePredictor
-    from model.metrics import IoUMetric as _IoU
+    # ---- TensorBoard -------------------------------------------------------
+    writer: Optional[SummaryWriter] = None
+    if is_main:
+        run_id = datetime.now().strftime('%Y%m%d-%H%M%S')
+        tb_dir = os.path.join(cfg.log_dir, 'fit', f'segformer_b2_{run_id}')
+        writer = SummaryWriter(log_dir=tb_dir)
 
-    tta_predictor = MultiScalePredictor(
-        model, scales=[0.75, 1.0, 1.25], batch_size=BATCH_SIZE, use_tta=True,
-    )
-    test_metric = _IoU(num_classes=NUM_CLASSES)
-    t0 = time.time()
+    # ---- History buffers ---------------------------------------------------
+    train_losses, val_losses  = [], []
+    train_ious,   val_ious    = [], []
+    patience_counter          = 0
 
-    for images, labels in tqdm(val_ds, desc="Evaluating with TTA"):
-        preds = tta_predictor.predict(images)
-        test_metric.update_state(labels, preds)
+    # ---- Training loop -----------------------------------------------------
+    if is_main:
+        print(f"\nStarting training for {EPOCHS} epochs from epoch {initial_epoch} …")
+        print(f"Batch/GPU: {PER_GPU_BS}  |  Global batch: {BATCH_SIZE}  |  "
+              f"GPUs: {world_size}  |  AMP: {use_amp}\n")
 
-    elapsed = time.time() - t0
-    m, s = divmod(elapsed, 60)
-    print(f"\nTTA Evaluation completed in {int(m)}m {s:.1f}s")
-    mean_iou = test_metric.result().numpy()
-    print(f"Val Mean IoU (TTA): {mean_iou:.4f}")
-    class_iou = test_metric.get_class_iou()
-    print("Class-wise IoU:")
-    for cn, v in class_iou.items():
-        print(f"  {cn}: {v:.4f}")
+    for epoch in range(initial_epoch, EPOCHS):
+        # DistributedSampler must be re-seeded each epoch for proper shuffling
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
-    # Basic multi-scale comparison
-    print("\nComparing with basic multi-scale (no TTA) …")
-    ms_predictor = MultiScalePredictor(model, scales=[0.75, 1.0, 1.25], use_tta=False)
-    baseline_metric = _IoU(num_classes=NUM_CLASSES)
-    for images, labels in tqdm(val_ds, desc="Multi-scale eval"):
-        preds = ms_predictor.predict(images)
-        baseline_metric.update_state(labels, preds)
-    bl_iou = baseline_metric.result().numpy()
-    print(f"Val Mean IoU (multi-scale only): {bl_iou:.4f}")
+        model.train()
+        epoch_loss = 0.0
+        metric.reset_state()
+        t_ep = time.time()
 
-    diff = mean_iou - bl_iou
-    colored_print(
-        f"TTA improvement: {diff:+.4f} ({diff * 100:+.1f}%)",
-        TermColors.GREEN if diff > 0 else TermColors.RED,
-    )
+        if is_main:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
+        else:
+            pbar = train_loader
 
-    # Save CSV
-    import pandas as pd
+        for step, (images, labels) in enumerate(pbar):
+            images, labels = images.to(device, non_blocking=True), \
+                             labels.to(device, non_blocking=True)
 
-    bl_class = baseline_metric.get_class_iou()
-    df = pd.DataFrame({
-        'Class': list(class_iou.keys()),
-        'IoU_TTA': [class_iou[c] for c in class_iou],
-        'IoU_baseline': [bl_class[c] for c in bl_class],
-        'Improvement': [class_iou[c] - bl_class[c] for c in class_iou],
-    })
-    os.makedirs('logs/class_ious', exist_ok=True)
-    df.to_csv('logs/class_ious/final_class_ious.csv', index=False)
-    print("IoU results saved to logs/class_ious/final_class_ious.csv")
+            optimizer.zero_grad(set_to_none=True)
+            with autocast('cuda', enabled=use_amp):
+                logits = model(images)
+                loss   = criterion(logits, labels)
 
-    return history
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), cfg.clipnorm)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            ema.update()
+
+            epoch_loss += loss.item()
+            metric.update_state(labels, logits.detach())
+
+            if is_main and step % max(1, train_steps // 20) == 0:
+                cur_lr = optimizer.param_groups[0]['lr']
+                cast(tqdm, pbar).set_postfix(loss=f"{loss.item():.4f}", lr=f"{cur_lr:.2e}")
+
+        # Capture training IoU BEFORE validate() resets+overwrites the metric
+        train_iou = float(metric.result().item())
+
+        # ---- Validation with EMA weights -----------------------------------
+        with ema.average_parameters():
+            val_loss, val_iou = validate(model, val_loader, criterion,
+                                         device, metric, use_amp)
+        mean_loss = epoch_loss / max(train_steps, 1)
+        elapsed   = time.time() - t_ep
+        cur_lr    = optimizer.param_groups[0]['lr']
+
+        train_losses.append(mean_loss)
+        val_losses.append(val_loss)
+        train_ious.append(train_iou)
+        val_ious.append(val_iou)
+
+        if is_main:
+            print(f"Epoch {epoch+1}/{EPOCHS} — "
+                  f"Loss: {mean_loss:.4f}  IoU: {train_iou:.4f}  |  "
+                  f"Val Loss: {val_loss:.4f}  Val IoU: {val_iou:.4f}  |  "
+                  f"LR: {cur_lr:.2e}  |  {elapsed:.1f}s")
+            assert writer is not None
+            writer.add_scalars('Loss',
+                {'train': mean_loss, 'val': val_loss}, epoch)
+            writer.add_scalars('IoU',
+                {'train': train_iou, 'val': val_iou}, epoch)
+            writer.add_scalar('lr', cur_lr, epoch)
+
+        # ---- Plateau scheduler (operates per epoch) ------------------------
+        plateau_sched.step(val_iou)
+
+        # ---- Checkpoint + early stopping -----------------------------------
+        if is_main:
+            if val_iou > best_iou:
+                best_iou = val_iou
+                save_checkpoint(best_ckpt, model, optimizer, scaler, ema,
+                                epoch + 1, best_iou)
+                print(f"  ↑ New best IoU: {best_iou:.4f} — saved to {best_ckpt}")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= cfg.early_stopping_patience:
+                    print(f"Early stopping: no improvement for "
+                          f"{cfg.early_stopping_patience} epochs")
+                    break
+            # Save latest after best_iou is updated so resume is consistent
+            save_checkpoint(latest_ckpt, model, optimizer, scaler, ema,
+                            epoch + 1, best_iou)
+
+    # ---- Apply EMA and save final model ------------------------------------
+    if is_main:
+        with ema.average_parameters():
+            final_path = 'segformer_b2_final.pt'
+            raw_model = model.module if hasattr(model, 'module') else model
+            assert isinstance(raw_model, torch.nn.Module)
+            torch.save(raw_model.state_dict(), final_path)
+            print(f"\nFinal model saved to {final_path}")
+
+        plot_training_curves(train_losses, val_losses, train_ious, val_ious,
+                             save_path='segformer_b2_miou_curves.png')
+        assert writer is not None
+        writer.close()
+
+    # ---- Post-training TTA evaluation (main process only) ------------------
+    if is_main:
+        print("\nEvaluating on validation set with TTA …")
+        from model.prediction import MultiScalePredictor
+
+        raw_model = model.module if hasattr(model, 'module') else model
+        with ema.average_parameters():
+            tta_predictor  = MultiScalePredictor(raw_model, scales=[0.75, 1.0, 1.25],
+                                                  use_tta=True, device=device)
+            ms_predictor   = MultiScalePredictor(raw_model, scales=[0.75, 1.0, 1.25],
+                                                  use_tta=False, device=device)
+            tta_metric     = IoUMetric(num_classes=NUM_CLASSES, device=device)
+            ms_metric      = IoUMetric(num_classes=NUM_CLASSES, device=device)
+            t0 = time.time()
+
+            for images, labels in tqdm(val_loader, desc="TTA eval"):
+                images = images.to(device)
+                labels = labels.to(device)
+                preds  = tta_predictor.predict(images)
+                tta_metric.update_state(labels, preds)
+                preds  = ms_predictor.predict(images)
+                ms_metric.update_state(labels, preds)
+
+        elapsed = time.time() - t0
+        print(f"TTA Evaluation completed in {elapsed:.1f}s")
+        tta_iou  = float(tta_metric.result().item())
+        ms_iou   = float(ms_metric.result().item())
+        diff     = tta_iou - ms_iou
+        print(f"Val Mean IoU — TTA: {tta_iou:.4f}  |  Multi-scale: {ms_iou:.4f}  "
+              f"|  Δ: {diff:+.4f}")
+        print("Class-wise IoU (TTA):")
+        for cn, v in tta_metric.get_class_iou().items():
+            print(f"  {cn}: {v:.4f}")
+
+        # Save CSV
+        import pandas as pd
+        tta_cls = tta_metric.get_class_iou()
+        ms_cls  = ms_metric.get_class_iou()
+        df = pd.DataFrame({
+            'Class':       list(tta_cls.keys()),
+            'IoU_TTA':     list(tta_cls.values()),
+            'IoU_ms':      [ms_cls[c] for c in tta_cls],
+            'Improvement': [tta_cls[c] - ms_cls[c] for c in tta_cls],
+        })
+        os.makedirs('logs/class_ious', exist_ok=True)
+        df.to_csv('logs/class_ious/final_class_ious.csv', index=False)
+        print("IoU results saved to logs/class_ious/final_class_ious.csv")
+
+    # ---- Cleanup DDP -------------------------------------------------------
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     print("=" * 70)
     print("Starting SegFormer-B2 training for oil spill detection …")
     print("=" * 70)
-    history = train_and_evaluate()
+    train_and_evaluate()
     print("Training completed successfully ✓")

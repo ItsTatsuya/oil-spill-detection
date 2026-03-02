@@ -1,244 +1,170 @@
 """
-Loss functions for oil spill segmentation.
+Loss functions for oil spill segmentation — PyTorch implementation.
 
-Key improvements over the original:
-- Label smoothing added to HybridSegmentationLoss (was only in standalone weighted_cross_entropy)
-- Focal loss double-weighting fixed: focal modulator applied to UNWEIGHTED CE, then class weights added
-- Boundary loss re-enabled (boundary_weight > 0) with Sobel-based edge detection
-- Lovász-Softmax loss added as an option (directly optimises IoU)
-- Generalised Dice Loss option with inverse-square volume weighting
+Key design points:
+- All losses operate on NCHW logits [B, C, H, W] and long targets [B, H, W].
+- HybridSegmentationLoss is an nn.Module; standalone functions kept for compat.
+- Boundary Sobel kernels registered as buffers (auto device placement).
+- Focal modulator applied to UNWEIGHTED CE, class weights applied after (corrected).
+- Lovász-Softmax available as standalone function (directly optimises IoU).
 """
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
 # Standalone losses (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 def weighted_cross_entropy(class_weights=None, from_logits=True, epsilon=1e-5):
-    compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+    """Return a callable weighted cross-entropy loss (standalone, not nn.Module)."""
+    cw_tensor = None
     if class_weights is not None:
-        class_weights = tf.constant(class_weights, dtype=compute_dtype)
+        cw_tensor = torch.tensor(class_weights, dtype=torch.float32)
 
-    def loss(y_true, y_pred):
-        y_true_shape = tf.shape(y_true)
-        y_pred_shape = tf.shape(y_pred)
-        num_classes = y_pred_shape[-1]
+    def loss(logits, targets):
+        # logits:  [B, C, H, W]
+        # targets: [B, H, W] long  —or—  [B, 1, H, W] uint8
+        if targets.dim() == 4:
+            targets = targets.squeeze(1)
+        targets = targets.long()
 
-        y_true_rank = tf.rank(y_true)
-        y_pred_rank = tf.rank(y_pred)
-        is_sparse = tf.logical_and(
-            tf.equal(y_true_rank, y_pred_rank - 1),
-            tf.equal(y_true_shape[-1], 1)
-        )
+        B, C, H, W = logits.shape
+        device = logits.device
 
-        def process_sparse():
-            y_true_squeezed = tf.squeeze(y_true, axis=-1)
-            y_true_indices = tf.cast(y_true_squeezed, tf.int32)
-            return tf.one_hot(y_true_indices, depth=num_classes, dtype=compute_dtype)
+        if cw_tensor is not None:
+            weight = cw_tensor.to(device)
+        else:
+            weight = None
 
-        def process_error():
-            tf.print("Error: Expected y_true shape [..., 1], got ", y_true_shape)
-            return tf.one_hot(tf.zeros_like(y_true_shape[:-1]), depth=num_classes, dtype=compute_dtype)
+        probs = F.softmax(logits, dim=1).clamp(epsilon, 1 - epsilon)
+        y_oh  = F.one_hot(targets, C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+        smooth = 0.1
+        y_sm  = y_oh * (1 - smooth) + smooth / C
+        ce    = -(y_sm * probs.log()).sum(dim=1)  # [B,H,W]
 
-        y_true_one_hot = tf.cond(is_sparse, process_sparse, process_error)
+        if weight is not None:
+            pw = (y_oh * weight.view(1, C, 1, 1)).sum(dim=1)
+            ce = ce * pw
 
-        y_true_smoothed = y_true_one_hot * 0.9 + 0.1 / tf.cast(num_classes, compute_dtype)
-        y_pred = tf.clip_by_value(y_pred, -100.0, 100.0)
-
-        if from_logits:
-            y_pred = tf.nn.softmax(y_pred, axis=-1)
-
-        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
-
-        ce_loss = -tf.reduce_mean(
-            tf.cast(y_true_smoothed, tf.float32) * tf.math.log(tf.cast(y_pred, tf.float32)),
-            axis=-1
-        )
-
-        if class_weights is not None:
-            weights = tf.reduce_sum(y_true_one_hot * class_weights, axis=-1)
-            ce_loss = ce_loss * tf.cast(weights, tf.float32)
-
-        ce_loss = tf.cast(ce_loss, compute_dtype)
-        tf.debugging.assert_all_finite(ce_loss, "NaN or Inf in weighted_cross_entropy")
-        return tf.reduce_mean(ce_loss)
+        assert torch.isfinite(ce).all(), "NaN/Inf in weighted_cross_entropy"
+        return ce.mean()
 
     return loss
 
 
 def focal_loss(class_weights=None, gamma=2.0, from_logits=True, epsilon=1e-5):
-    compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+    """Return a callable focal loss (standalone)."""
+    cw_tensor = None
     if class_weights is not None:
-        class_weights = tf.constant(class_weights, dtype=compute_dtype)
+        cw_tensor = torch.tensor(class_weights, dtype=torch.float32)
 
-    def loss(y_true, y_pred):
-        y_true_shape = tf.shape(y_true)
-        y_pred_shape = tf.shape(y_pred)
-        num_classes = y_pred_shape[-1]
+    def loss(logits, targets):
+        if targets.dim() == 4:
+            targets = targets.squeeze(1)
+        targets = targets.long()
 
-        y_true_rank = tf.rank(y_true)
-        y_pred_rank = tf.rank(y_pred)
-        is_sparse = tf.logical_and(
-            tf.equal(y_true_rank, y_pred_rank - 1),
-            tf.equal(y_true_shape[-1], 1)
-        )
+        B, C, H, W = logits.shape
+        device = logits.device
 
-        def process_sparse():
-            y_true_squeezed = tf.squeeze(y_true, axis=-1)
-            y_true_indices = tf.cast(y_true_squeezed, tf.int32)
-            return tf.one_hot(y_true_indices, depth=num_classes, dtype=compute_dtype)
+        probs = F.softmax(logits, dim=1).clamp(epsilon, 1 - epsilon)
+        y_oh  = F.one_hot(targets, C).permute(0, 3, 1, 2).float()
+        ce    = -(y_oh * probs.log()).sum(dim=1)  # unweighted CE
+        pt    = (y_oh * probs).sum(dim=1)
+        focal = ce * (1 - pt).pow(gamma)
 
-        def process_error():
-            tf.print("Error: Expected y_true shape [..., 1], got ", y_true_shape)
-            return tf.one_hot(tf.zeros_like(y_true_shape[:-1]), depth=num_classes, dtype=compute_dtype)
+        if cw_tensor is not None:
+            pw = (y_oh * cw_tensor.to(device).view(1, C, 1, 1)).sum(dim=1)
+            focal = focal * pw
 
-        y_true_one_hot = tf.cond(is_sparse, process_sparse, process_error)
-
-        y_pred = tf.clip_by_value(y_pred, -100.0, 100.0)
-
-        if from_logits:
-            y_pred = tf.nn.softmax(y_pred, axis=-1)
-
-        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
-
-        focal_weight = tf.pow(1.0 - tf.cast(y_pred, tf.float32), gamma)
-        focal_ce = -tf.reduce_mean(
-            tf.cast(focal_weight * y_true_one_hot, tf.float32) * tf.math.log(tf.cast(y_pred, tf.float32)),
-            axis=-1
-        )
-
-        if class_weights is not None:
-            weights = tf.reduce_sum(y_true_one_hot * class_weights, axis=-1)
-            focal_ce = focal_ce * tf.cast(weights, tf.float32)
-
-        focal_ce = tf.cast(focal_ce, compute_dtype)
-        tf.debugging.assert_all_finite(focal_ce, "NaN or Inf in focal_loss")
-        return tf.reduce_mean(focal_ce)
+        assert torch.isfinite(focal).all(), "NaN/Inf in focal_loss"
+        return focal.mean()
 
     return loss
 
 
 def dice_loss(class_weights=None, from_logits=True, epsilon=1e-5):
-    compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+    """Return a callable Dice loss (standalone)."""
+    cw_tensor = None
     if class_weights is not None:
-        class_weights = tf.constant(class_weights, dtype=compute_dtype)
+        cw_tensor = torch.tensor(class_weights, dtype=torch.float32)
 
-    def loss(y_true, y_pred):
-        y_true_shape = tf.shape(y_true)
-        y_pred_shape = tf.shape(y_pred)
-        num_classes = y_pred_shape[-1]
+    def loss(logits, targets):
+        if targets.dim() == 4:
+            targets = targets.squeeze(1)
+        targets = targets.long()
 
-        y_true_rank = tf.rank(y_true)
-        y_pred_rank = tf.rank(y_pred)
-        is_sparse = tf.logical_and(
-            tf.equal(y_true_rank, y_pred_rank - 1),
-            tf.equal(y_true_shape[-1], 1)
-        )
+        B, C, H, W = logits.shape
+        device = logits.device
 
-        def process_sparse():
-            y_true_squeezed = tf.squeeze(y_true, axis=-1)
-            y_true_indices = tf.cast(y_true_squeezed, tf.int32)
-            return tf.one_hot(y_true_indices, depth=num_classes, dtype=compute_dtype)
+        probs = F.softmax(logits, dim=1).clamp(epsilon, 1 - epsilon)
+        y_oh  = F.one_hot(targets, C).permute(0, 3, 1, 2).float()
 
-        def process_error():
-            tf.print("Error: Expected y_true shape [..., 1], got ", y_true_shape)
-            return tf.one_hot(tf.zeros_like(y_true_shape[:-1]), depth=num_classes, dtype=compute_dtype)
+        y_flat = y_oh.view(B, C, -1)
+        p_flat = probs.view(B, C, -1)
+        inter  = (y_flat * p_flat).sum(2)
+        sum_y  = y_flat.sum(2)
+        sum_p  = p_flat.sum(2)
+        dice   = (2 * inter + epsilon) / (sum_y + sum_p + epsilon)  # [B, C]
 
-        y_true_one_hot = tf.cond(is_sparse, process_sparse, process_error)
-
-        y_pred = tf.clip_by_value(y_pred, -100.0, 100.0)
-
-        if from_logits:
-            y_pred = tf.nn.softmax(y_pred, axis=-1)
-
-        intersection = tf.reduce_sum(y_true_one_hot * y_pred, axis=[1, 2])
-        union = tf.reduce_sum(y_true_one_hot, axis=[1, 2]) + tf.reduce_sum(y_pred, axis=[1, 2])
-        dice = (2. * intersection + epsilon) / (union + epsilon)
-
-        if class_weights is not None:
-            dice = dice * class_weights
-            dice_loss = 1.0 - tf.reduce_mean(dice / tf.reduce_sum(class_weights))
+        if cw_tensor is not None:
+            cw = cw_tensor.to(device)
+            d  = 1 - (dice * cw.unsqueeze(0)).sum() / (cw.sum() * B)
         else:
-            dice_loss = 1.0 - tf.reduce_mean(dice)
+            d = 1 - dice.mean()
 
-        dice_loss = tf.cast(dice_loss, compute_dtype)
-        tf.debugging.assert_all_finite(dice_loss, "NaN or Inf in dice_loss")
-        return dice_loss
+        assert torch.isfinite(d), "NaN/Inf in dice_loss"
+        return d
 
     return loss
 
 
-def boundary_loss(class_weights=None, from_logits=True, epsilon=1e-5, boundary_weight=2.0):
-    compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+def boundary_loss(class_weights=None, from_logits=False, epsilon=1e-5, boundary_weight=2.0):
+    """Return a callable boundary loss using Sobel-based edge detection (standalone)."""
+    cw_tensor = None
     if class_weights is not None:
-        class_weights = tf.constant(class_weights, dtype=compute_dtype)
+        cw_tensor = torch.tensor(class_weights, dtype=torch.float32)
 
-    def loss(y_true, y_pred):
-        y_true_shape = tf.shape(y_true)
-        y_pred_shape = tf.shape(y_pred)
-        num_classes = tf.identity(y_pred_shape[-1])
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                            dtype=torch.float32).reshape(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                            dtype=torch.float32).reshape(1, 1, 3, 3)
 
-        y_true_rank = tf.rank(y_true)
-        y_pred_rank = tf.rank(y_pred)
-        is_sparse = tf.logical_and(
-            tf.equal(y_true_rank, y_pred_rank - 1),
-            tf.equal(y_true_shape[-1], 1)
-        )
+    def loss(logits, targets):
+        if targets.dim() == 4:
+            targets = targets.squeeze(1)
+        targets = targets.long()
 
-        def process_sparse():
-            y_true_squeezed = tf.squeeze(y_true, axis=-1)
-            y_true_indices = tf.cast(y_true_squeezed, tf.int32)
-            return y_true_indices, tf.one_hot(y_true_indices, depth=num_classes, dtype=compute_dtype)
+        B, C, H, W = logits.shape
+        device = logits.device
+        sx = sobel_x.to(device)
+        sy = sobel_y.to(device)
 
-        def process_error():
-            tf.print("Error: Expected y_true shape [..., 1], got ", y_true_shape)
-            placeholder_indices = tf.zeros(y_true_shape[:-1], dtype=tf.int32)
-            return placeholder_indices, tf.one_hot(placeholder_indices, depth=num_classes, dtype=compute_dtype)
+        probs = F.softmax(logits, dim=1) if from_logits else logits
+        probs = probs.clamp(epsilon, 1 - epsilon)
+        y_oh  = F.one_hot(targets, C).permute(0, 3, 1, 2).float()
 
-        y_true_indices, y_true_one_hot = tf.cond(is_sparse, process_sparse, process_error)
+        y_flat = y_oh.view(B * C, 1, H, W)
+        p_flat = probs.view(B * C, 1, H, W)
 
-        y_pred = tf.clip_by_value(y_pred, -100.0, 100.0)
+        ey_y = F.conv2d(y_flat, sx, padding=1).abs() + F.conv2d(y_flat, sy, padding=1).abs()
+        ey_p = F.conv2d(p_flat, sx, padding=1).abs() + F.conv2d(p_flat, sy, padding=1).abs()
 
-        if from_logits:
-            y_pred = tf.nn.softmax(y_pred, axis=-1)
+        edges_y = ey_y.view(B, C, H, W)
+        edges_p = ey_p.view(B, C, H, W)
 
-        sobel_x = tf.constant([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=tf.float32, shape=[3, 3, 1, 1])
-        sobel_y = tf.constant([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=tf.float32, shape=[3, 3, 1, 1])
+        edge_mag   = edges_y.sum(1, keepdim=True).clamp(0, 1)
+        rare_mask  = ((targets == 1) | (targets == 3)).float().unsqueeze(1)
+        bound_mask = edge_mag * (1 + rare_mask * (boundary_weight - 1))
 
-        batch_size = tf.shape(y_true_one_hot)[0]
-        height = tf.shape(y_true_one_hot)[1]
-        width = tf.shape(y_true_one_hot)[2]
+        bnd = ((edges_y - edges_p).pow(2) * bound_mask).mean()
+        if cw_tensor is not None:
+            pw  = (y_oh * cw_tensor.to(device).view(1, C, 1, 1)).sum(1).mean()
+            bnd = bnd * pw
 
-        y_true_reshape = tf.reshape(y_true_one_hot, [-1, height, width, 1])
-        y_pred_reshape = tf.reshape(y_pred, [-1, height, width, 1])
-
-        edge_x_true = tf.abs(tf.nn.conv2d(y_true_reshape, sobel_x, strides=[1, 1, 1, 1], padding='SAME'))
-        edge_y_true = tf.abs(tf.nn.conv2d(y_true_reshape, sobel_y, strides=[1, 1, 1, 1], padding='SAME'))
-        edge_x_pred = tf.abs(tf.nn.conv2d(y_pred_reshape, sobel_x, strides=[1, 1, 1, 1], padding='SAME'))
-        edge_y_pred = tf.abs(tf.nn.conv2d(y_pred_reshape, sobel_y, strides=[1, 1, 1, 1], padding='SAME'))
-
-        y_true_edges_reshape = edge_x_true + edge_y_true
-        y_pred_edges_reshape = edge_x_pred + edge_y_pred
-
-        y_true_edges = tf.reshape(y_true_edges_reshape, [batch_size, height, width, -1])
-        y_pred_edges = tf.reshape(y_pred_edges_reshape, [batch_size, height, width, -1])
-
-        rare_class_mask = tf.cast(tf.logical_or(tf.equal(y_true_indices, 1), tf.equal(y_true_indices, 3)), tf.float32)
-        rare_class_mask = tf.expand_dims(rare_class_mask, axis=-1)
-
-        edge_magnitude = tf.reduce_sum(y_true_edges, axis=-1, keepdims=True)
-        boundary_mask = tf.clip_by_value(edge_magnitude, 0, 1) * (1.0 + rare_class_mask * (boundary_weight - 1.0))
-
-        boundary_loss = tf.reduce_mean(tf.square(y_true_edges - y_pred_edges) * boundary_mask)
-
-        if class_weights is not None:
-            weights = tf.reduce_sum(y_true_one_hot * class_weights, axis=-1)
-            boundary_loss = boundary_loss * tf.reduce_mean(tf.cast(weights, tf.float32))
-
-        boundary_loss = tf.cast(boundary_loss, compute_dtype)
-        tf.debugging.assert_all_finite(boundary_loss, "NaN or Inf in boundary_loss")
-        return boundary_loss
+        assert torch.isfinite(bnd), "NaN/Inf in boundary_loss"
+        return bnd
 
     return loss
 
@@ -246,202 +172,242 @@ def boundary_loss(class_weights=None, from_logits=True, epsilon=1e-5, boundary_w
 # ---------------------------------------------------------------------------
 # Lovász-Softmax  (directly optimises mean IoU)
 # ---------------------------------------------------------------------------
-def _lovasz_grad(gt_sorted):
-    """Compute gradient of the Lovász extension w.r.t. sorted errors."""
-    p = tf.shape(gt_sorted)[0]
-    gts = tf.reduce_sum(gt_sorted)
-    intersection = gts - tf.cumsum(gt_sorted)
-    union = gts + tf.cast(tf.range(1, p + 1), tf.float32) - tf.cumsum(gt_sorted)
-    jaccard = 1.0 - intersection / union
-    jaccard = tf.concat([jaccard[:1], jaccard[1:] - jaccard[:-1]], axis=0)
+def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
+    """Gradient of the Lovász extension w.r.t. sorted errors."""
+    p          = gt_sorted.shape[0]
+    gts        = gt_sorted.sum()
+    intersection = gts - gt_sorted.cumsum(0)
+    union        = gts + torch.arange(1, p + 1, dtype=torch.float32, device=gt_sorted.device) - gt_sorted.cumsum(0)
+    jaccard      = 1.0 - intersection / union
+    jaccard      = torch.cat([jaccard[:1], jaccard[1:] - jaccard[:-1]])
     return jaccard
 
 
-def lovasz_softmax_flat(probas, labels, num_classes=5):
+def lovasz_softmax_flat(probas: torch.Tensor, labels: torch.Tensor, num_classes: int = 5) -> torch.Tensor:
     """
-    Multi-class Lovász-Softmax loss (flat version, operates on 1-D tensors).
+    Multi-class Lovász-Softmax loss.
 
     Parameters
     ----------
-    probas : (P, C) float — predicted probabilities per pixel per class
-    labels : (P,) int   — ground truth class indices
+    probas : (P, C) float  — per-pixel predicted probabilities
+    labels : (P,)   long   — ground-truth class indices
     """
     losses = []
     for c in range(num_classes):
-        fg = tf.cast(tf.equal(labels, c), tf.float32)  # foreground for class c
-        if tf.reduce_sum(fg) == 0:
+        fg     = (labels == c).float()
+        if fg.sum() == 0:
             continue
-        errors = tf.abs(fg - probas[:, c])
-        errors_sorted, perm = tf.nn.top_k(errors, k=tf.shape(errors)[0])
-        fg_sorted = tf.gather(fg, perm)
-        grad = _lovasz_grad(fg_sorted)
-        losses.append(tf.tensordot(errors_sorted, tf.stop_gradient(grad), 1))
+        errors        = (fg - probas[:, c]).abs()
+        errors_sorted, perm = errors.sort(descending=True)
+        fg_sorted     = fg[perm]
+        grad          = _lovasz_grad(fg_sorted)
+        losses.append(torch.dot(errors_sorted, grad.detach()))
     if not losses:
-        return tf.constant(0.0, dtype=tf.float32)
-    return tf.reduce_mean(tf.stack(losses))
+        return probas.sum() * 0.0
+    return torch.stack(losses).mean()
 
 
-def lovasz_softmax_loss(from_logits=True, num_classes=5):
-    """Return a Keras-compatible Lovász-Softmax loss function."""
+def lovasz_softmax_loss(from_logits: bool = True, num_classes: int = 5):
+    """Return a callable Lovász-Softmax loss."""
 
-    def loss(y_true, y_pred):
+    def loss(logits, targets):
+        if targets.dim() == 4:
+            targets = targets.squeeze(1)
+        targets = targets.long()
+
         if from_logits:
-            probas = tf.nn.softmax(y_pred, axis=-1)
+            probas = F.softmax(logits, dim=1)
         else:
-            probas = y_pred
-        probas = tf.cast(probas, tf.float32)
+            probas = logits
 
-        y_true_sq = tf.squeeze(y_true, axis=-1)
-        y_true_flat = tf.cast(tf.reshape(y_true_sq, [-1]), tf.int32)
-        probas_flat = tf.reshape(probas, [-1, num_classes])
-
-        return lovasz_softmax_flat(probas_flat, y_true_flat, num_classes)
+        B, C, H, W = probas.shape
+        probas_flat = probas.permute(0, 2, 3, 1).reshape(-1, C)
+        labels_flat = targets.reshape(-1)
+        return lovasz_softmax_flat(probas_flat, labels_flat, num_classes)
 
     return loss
 
 
 # ---------------------------------------------------------------------------
-# Hybrid Segmentation Loss  (improved)
+# Hybrid Segmentation Loss  (main loss used in training)
 # ---------------------------------------------------------------------------
-class HybridSegmentationLoss(tf.keras.losses.Loss):
+class HybridSegmentationLoss(nn.Module):
     """
-    Combined segmentation loss with label smoothing, corrected focal weighting,
-    and optional boundary & Lovász-Softmax components.
+    Combined segmentation loss: CE + Focal + Dice + Boundary (+ optional Lovász).
 
-    Changes from original
-    ---------------------
-    1. Label smoothing applied before CE / focal computation.
-    2. Focal modulator applied to UNWEIGHTED CE, class weights applied after.
-    3. Boundary loss re-enabled by default (boundary_weight=0.1).
-    4. Lovász-Softmax can be enabled via lovasz_weight > 0.
+    Changes from original TF version
+    ---------------------------------
+    1. Label smoothing applied to targets before all components.
+    2. Focal modulator on UNWEIGHTED CE; class weights applied after (bug-fix).
+    3. Boundary Sobel kernels registered as buffers for correct device placement.
+    4. Pure PyTorch — no TF dependency.
+    5. Input format: logits [B, C, H, W], targets [B, H, W] long.
     """
 
     def __init__(
         self,
         class_weights=None,
-        ce_weight=0.35,
-        focal_weight=0.25,
-        dice_weight=0.3,
-        boundary_weight=0.1,
-        lovasz_weight=0.0,
-        gamma=2.0,
-        label_smoothing=0.1,
-        boundary_boost=2.5,
-        epsilon=1e-7,
-        from_logits=True,
-        name="hybrid_segmentation_loss",
+        ce_weight: float = 0.35,
+        focal_weight: float = 0.25,
+        dice_weight: float = 0.3,
+        boundary_weight: float = 0.1,
+        lovasz_weight: float = 0.0,
+        gamma: float = 2.0,
+        label_smoothing: float = 0.1,
+        boundary_boost: float = 2.5,
+        epsilon: float = 1e-7,
+        from_logits: bool = True,
     ):
-        super().__init__(name=name)
-        self.class_weights = class_weights
-        self.ce_weight = ce_weight
-        self.focal_weight = focal_weight
-        self.dice_weight = dice_weight
+        super().__init__()
+        self.ce_weight       = ce_weight
+        self.focal_weight    = focal_weight
+        self.dice_weight     = dice_weight
         self.boundary_weight = boundary_weight
-        self.lovasz_weight = lovasz_weight
-        self.gamma = gamma
+        self.lovasz_weight   = lovasz_weight
+        self.gamma           = gamma
         self.label_smoothing = label_smoothing
-        self.boundary_boost = boundary_boost
-        self.epsilon = epsilon
-        self.from_logits = from_logits
+        self.boundary_boost  = boundary_boost
+        self.epsilon         = epsilon
+        self.from_logits     = from_logits
 
-    def call(self, y_true, y_pred):
-        compute_dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+        if class_weights is not None:
+            self.register_buffer(
+                'class_weights',
+                torch.tensor(class_weights, dtype=torch.float32),
+            )
+        else:
+            self.class_weights = None
+
+        # Sobel kernels for boundary loss — registered as buffers so they
+        # automatically move to the correct device with .to(device).
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                                dtype=torch.float32).reshape(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                                dtype=torch.float32).reshape(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+        # Pre-build Lovász closure once — avoids recreating it every forward pass
+        self._lov_fn = lovasz_softmax_loss(from_logits=False)
+
+    # ------------------------------------------------------------------
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        logits  : [B, C, H, W]  float  — raw logits (before softmax)
+        targets : [B, H, W]     long   — class indices 0 … C-1
+        """
+        if targets.dim() == 4:
+            targets = targets.squeeze(1)
+        targets = targets.long()
+
+        B, C, H, W = logits.shape
 
         if self.from_logits:
-            probs = tf.nn.softmax(y_pred, axis=-1)
+            probs = F.softmax(logits, dim=1)
         else:
-            probs = y_pred
+            probs = logits
+        probs = probs.clamp(self.epsilon, 1 - self.epsilon)
 
-        probs = tf.clip_by_value(probs, self.epsilon, 1.0 - self.epsilon)
-        num_classes = tf.shape(y_pred)[-1]
+        # One-hot  [B, C, H, W]
+        y_oh = F.one_hot(targets, C).permute(0, 3, 1, 2).float()
 
-        # One-hot encode
-        y_true_processed = tf.reshape(y_true, [-1, tf.shape(y_true)[1], tf.shape(y_true)[2]])
-        y_true_one_hot = tf.one_hot(tf.cast(y_true_processed, tf.int32), depth=num_classes)
-
-        # ---- Label smoothing (applied to targets) ----------------------------
+        # Label smoothing
         if self.label_smoothing > 0:
-            smooth = self.label_smoothing
-            y_true_smoothed = y_true_one_hot * (1.0 - smooth) + smooth / tf.cast(num_classes, tf.float32)
+            y_sm = y_oh * (1 - self.label_smoothing) + self.label_smoothing / C
         else:
-            y_true_smoothed = y_true_one_hot
+            y_sm = y_oh
 
-        # ---- UNWEIGHTED cross-entropy (for focal) ----------------------------
-        unweighted_ce = -tf.reduce_sum(
-            y_true_smoothed * tf.math.log(probs), axis=-1
-        )
+        # ---- Unweighted CE (for focal) -----------------------------------
+        unweighted_ce = -(y_sm * probs.log()).sum(dim=1)  # [B, H, W]
 
-        # ---- Class-weighted cross-entropy ------------------------------------
+        # ---- Class-weighted CE ------------------------------------------
         if self.class_weights is not None:
-            cw = tf.cast(tf.constant(self.class_weights), compute_dtype)
-            pixel_weights = tf.reduce_sum(y_true_one_hot * cw, axis=-1)
-            weighted_ce = unweighted_ce * pixel_weights
+            pw         = (y_oh * self.class_weights.view(1, C, 1, 1)).sum(dim=1)
+            weighted_ce = unweighted_ce * pw
         else:
             weighted_ce = unweighted_ce
-            pixel_weights = None
+            pw          = None
 
-        # ---- Focal loss (modulator on UNWEIGHTED CE, then class-weight) ------
+        # ---- Focal -------------------------------------------------------
         if self.focal_weight > 0:
-            true_class_probs = tf.reduce_sum(y_true_one_hot * probs, axis=-1)
-            focal_mod = tf.pow(1.0 - true_class_probs, self.gamma)
-            focal_loss = unweighted_ce * focal_mod
-            if pixel_weights is not None:
-                focal_loss = focal_loss * pixel_weights
+            pt       = (y_oh * probs).sum(dim=1)         # true-class prob
+            focal_mod = (1 - pt).pow(self.gamma)
+            focal    = unweighted_ce * focal_mod
+            if pw is not None:
+                focal = focal * pw
         else:
-            focal_loss = unweighted_ce * 0
+            focal = torch.zeros(1, device=logits.device)
 
-        # ---- Dice loss -------------------------------------------------------
+        # ---- Dice --------------------------------------------------------
         if self.dice_weight > 0:
-            y_flat = tf.reshape(
-                y_true_one_hot,
-                [-1, tf.shape(y_true_one_hot)[1] * tf.shape(y_true_one_hot)[2], num_classes],
-            )
-            p_flat = tf.reshape(
-                probs,
-                [-1, tf.shape(probs)[1] * tf.shape(probs)[2], num_classes],
-            )
-            intersection = tf.reduce_sum(y_flat * p_flat, axis=1)
-            sum_y = tf.reduce_sum(y_flat, axis=1)
-            sum_p = tf.reduce_sum(p_flat, axis=1)
-            dice = (2.0 * intersection + self.epsilon) / (sum_y + sum_p + self.epsilon)
-
+            y_flat    = y_oh.view(B, C, -1)
+            p_flat    = probs.view(B, C, -1)
+            inter     = (y_flat * p_flat).sum(2)
+            sum_y     = y_flat.sum(2)
+            sum_p     = p_flat.sum(2)
+            dice      = (2 * inter + self.epsilon) / (sum_y + sum_p + self.epsilon)  # [B, C]
             if self.class_weights is not None:
-                cw = tf.cast(tf.constant(self.class_weights), compute_dtype)
-                dice = dice * cw
-                dice_loss = 1.0 - tf.reduce_sum(dice) / tf.reduce_sum(cw)
+                cw        = self.class_weights
+                dice_loss = 1 - (dice * cw.unsqueeze(0)).sum() / (cw.sum() * B)
             else:
-                dice_loss = 1.0 - tf.reduce_mean(dice)
+                dice_loss = 1 - dice.mean()
         else:
-            dice_loss = tf.constant(0.0, dtype=compute_dtype)
+            dice_loss = torch.zeros(1, device=logits.device)
 
-        # ---- Boundary loss ---------------------------------------------------
+        # ---- Boundary ----------------------------------------------------
         if self.boundary_weight > 0:
-            bnd_fn = boundary_loss(
-                class_weights=(self.class_weights if self.class_weights else None),
-                from_logits=False,  # already converted to probs
-                boundary_weight=self.boundary_boost,
-            )
-            # Re-pack y_true to expected shape
-            y_true_for_bnd = tf.expand_dims(y_true_processed, axis=-1)
-            bnd_loss = bnd_fn(y_true_for_bnd, probs)
+            bnd_loss = self._boundary(y_oh, probs, targets)
         else:
-            bnd_loss = tf.constant(0.0, dtype=compute_dtype)
+            bnd_loss = torch.zeros(1, device=logits.device)
 
-        # ---- Lovász-Softmax --------------------------------------------------
+        # ---- Lovász-Softmax (optional) -----------------------------------
         if self.lovasz_weight > 0:
-            lov_fn = lovasz_softmax_loss(from_logits=False, num_classes=num_classes)
-            y_true_for_lov = tf.expand_dims(y_true_processed, axis=-1)
-            lov_loss = lov_fn(y_true_for_lov, probs)
+            lov_loss = self._lov_fn(probs, targets)
         else:
-            lov_loss = tf.constant(0.0, dtype=compute_dtype)
+            lov_loss = torch.zeros(1, device=logits.device)
 
-        # ---- Combine ---------------------------------------------------------
-        total_loss = (
-            self.ce_weight * tf.reduce_mean(weighted_ce)
-            + self.focal_weight * tf.reduce_mean(focal_loss)
-            + self.dice_weight * dice_loss
-            + self.boundary_weight * tf.cast(bnd_loss, compute_dtype)
-            + self.lovasz_weight * tf.cast(lov_loss, compute_dtype)
+        # ---- Combine -----------------------------------------------------
+        total = (
+            self.ce_weight       * weighted_ce.mean()
+            + self.focal_weight  * focal.mean()
+            + self.dice_weight   * dice_loss
+            + self.boundary_weight * bnd_loss
+            + self.lovasz_weight * lov_loss
         )
+        return total
 
-        return total_loss
+    def _boundary(
+        self,
+        y_oh: torch.Tensor,
+        probs: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        B, C, H, W = y_oh.shape
+        y_flat = y_oh.reshape(B * C, 1, H, W)
+        p_flat = probs.reshape(B * C, 1, H, W)
+
+        sx = self.sobel_x  # type: ignore[assignment]
+        sy = self.sobel_y  # type: ignore[assignment]
+        assert isinstance(sx, torch.Tensor) and isinstance(sy, torch.Tensor)
+        ey_y = (F.conv2d(y_flat, sx, padding=1).abs() +
+                F.conv2d(y_flat, sy, padding=1).abs())
+        ey_p = (F.conv2d(p_flat, sx, padding=1).abs() +
+                F.conv2d(p_flat, sy, padding=1).abs())
+
+        edges_y = ey_y.view(B, C, H, W)
+        edges_p = ey_p.view(B, C, H, W)
+
+        edge_mag   = edges_y.sum(1, keepdim=True).clamp(0, 1)
+        rare_mask  = ((targets == 1) | (targets == 3)).float().unsqueeze(1)
+        bound_mask = edge_mag * (1 + rare_mask * (self.boundary_boost - 1))
+
+        # Weight boundary loss per-pixel by class weight BEFORE taking the mean
+        if self.class_weights is not None:
+            per_pixel_weight = (y_oh * self.class_weights.view(1, C, 1, 1)).sum(dim=1, keepdim=True)  # [B,1,H,W]
+            bnd = ((edges_y - edges_p).pow(2) * bound_mask * per_pixel_weight).mean()
+        else:
+            bnd = ((edges_y - edges_p).pow(2) * bound_mask).mean()
+
+        return bnd

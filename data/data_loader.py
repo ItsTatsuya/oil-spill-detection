@@ -1,33 +1,36 @@
 """
-Data loading pipeline for oil spill segmentation.
+Data loading pipeline for oil spill segmentation — PyTorch implementation.
 
-Key improvements over the original:
-- Proper train/val/test split (val carved from training data, test reserved for final eval)
+Key design:
+- OilSpillDataset: torch.utils.data.Dataset subclass
+- Training: load at original resolution → random patch crop → augmentation in __getitem__
+- Val / test: resize to IMG_SIZE, no augmentation
 - Class weights computed from actual pixel distribution (inverse-frequency), cached to disk
-- Patch sampling from original-resolution images (no redundant resize-then-crop)
-- No .cache() on training set so stochastic augmentation produces fresh samples every epoch
-- Removed fixed shuffle seed so reshuffling is different each epoch
+- DataLoader with pin_memory=True and num_workers for fast GPU transfers
 """
 
 import os
-import logging
 import glob
+import random
+import logging
 
 import cv2
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import mixed_precision  # type: ignore
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+from data.augmentation import augment_single_sample
 
 logger = logging.getLogger('oil_spill')
 
-policy = mixed_precision.global_policy()
 
-logging.getLogger('tensorflow').setLevel(logging.ERROR)
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-import absl.logging
-absl.logging.set_verbosity(absl.logging.ERROR)
+def _worker_init_fn(worker_id: int) -> None:  # noqa: ARG001
+    """Seed each DataLoader worker independently to prevent identical augmentation."""
+    seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(seed)
+    random.seed(seed)
 
-IMG_SIZE = 384
+IMG_SIZE   = 384
 NUM_CLASSES = 5
 
 
@@ -35,12 +38,7 @@ NUM_CLASSES = 5
 # Class weight computation (inverse-frequency from actual labels)
 # ---------------------------------------------------------------------------
 def analyze_class_distribution(label_paths, num_classes=NUM_CLASSES, cache_path=None):
-    """
-    Compute inverse-frequency class weights from actual label statistics.
-
-    If *cache_path* is given and already exists, weights are loaded from disk
-    instead of recomputing. Otherwise they are computed and saved.
-    """
+    """Compute inverse-frequency class weights from actual label statistics."""
     if cache_path and os.path.exists(cache_path):
         weights = np.load(cache_path)
         logger.info("Loaded cached class weights from %s", cache_path)
@@ -54,11 +52,11 @@ def analyze_class_distribution(label_paths, num_classes=NUM_CLASSES, cache_path=
             continue
         label = np.clip(label, 0, num_classes - 1)
         for c in range(num_classes):
-            counts[c] += np.sum(label == c)
+            counts[c] += int(np.sum(label == c))
 
     freq = counts / (counts.sum() + 1e-12)
     raw_weights = 1.0 / (freq + 1e-6)
-    raw_weights /= raw_weights.sum()  # normalise so they sum to 1
+    raw_weights /= raw_weights.sum()
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
@@ -70,134 +68,173 @@ def analyze_class_distribution(label_paths, num_classes=NUM_CLASSES, cache_path=
 
 
 # ---------------------------------------------------------------------------
-# Patch sampling from original resolution
+# Patch sampling (pure NumPy, called from Dataset.__getitem__)
 # ---------------------------------------------------------------------------
-@tf.function
-def sample_patches(image, label, patch_size=IMG_SIZE):
+def sample_patches(image: np.ndarray, label: np.ndarray, patch_size: int = IMG_SIZE,
+                   rng=None):
     """
-    Random crop of *patch_size* × *patch_size* from the (possibly larger) image.
+    Random crop of *patch_size* × *patch_size* from (possibly larger) image.
 
-    With 50 % probability the crop is centred on an Oil-Spill (class 1) or
-    Ship (class 3) pixel, which up-samples rare classes without duplication.
-    If the image is smaller than the patch, it is padded.
+    With 50% probability the crop is centred on an Oil-Spill (class 1) or
+    Ship (class 3) pixel to up-sample rare classes.
+
+    Parameters
+    ----------
+    image : [H, W, C]  float32  (or [H, W] for grayscale)
+    label : [H, W]     uint8
+    rng   : np.random.Generator  (pass for reproducibility; uses global state otherwise)
+
+    Returns
+    -------
+    img_crop   : [H', W', C] (or [H', W'])
+    label_crop : [H', W']
     """
-    h = tf.shape(image)[0]
-    w = tf.shape(image)[1]
+    if rng is None:
+        rng = np.random.default_rng()
 
-    # Pad if needed
-    pad_h = tf.maximum(patch_size - h, 0)
-    pad_w = tf.maximum(patch_size - w, 0)
+    h, w = label.shape[:2]
+
+    # Pad if smaller than patch
+    pad_h = max(patch_size - h, 0)
+    pad_w = max(patch_size - w, 0)
     if pad_h > 0 or pad_w > 0:
-        image = tf.pad(image, [[0, pad_h], [0, pad_w], [0, 0]])
-        label = tf.pad(label, [[0, pad_h], [0, pad_w], [0, 0]])
-        h = tf.shape(image)[0]
-        w = tf.shape(image)[1]
+        if image.ndim == 3:
+            image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)))
+        else:
+            image = np.pad(image, ((0, pad_h), (0, pad_w)))
+        label = np.pad(label, ((0, pad_h), (0, pad_w)))
+        h, w = label.shape[:2]
 
-    def _class_centred_crop():
-        label_sq = tf.cast(tf.squeeze(label, axis=-1), tf.int32)
-        has_ship = tf.reduce_any(tf.equal(label_sq, 3))
-        has_oil = tf.reduce_any(tf.equal(label_sq, 1))
+    def random_crop():
+        top  = rng.integers(0, h - patch_size + 1)
+        left = rng.integers(0, w - patch_size + 1)
+        return top, left
 
-        target_class = tf.cond(has_ship, lambda: 3, lambda: 1)
-        has_target = tf.logical_or(has_ship, has_oil)
+    def class_centred_crop(cls):
+        ys, xs = np.where(label == cls)
+        if len(ys) == 0:
+            return random_crop()
+        idx  = rng.integers(0, len(ys))
+        cy, cx = int(ys[idx]), int(xs[idx])
+        half = patch_size // 2
+        top  = int(np.clip(cy - half, 0, h - patch_size))
+        left = int(np.clip(cx - half, 0, w - patch_size))
+        return top, left
 
-        indices = tf.where(tf.equal(label_sq, target_class))
-        n_idx = tf.shape(indices)[0]
-        valid = tf.logical_and(has_target, n_idx > 0)
+    if rng.random() < 0.5:
+        has_ship = np.any(label == 3)
+        has_oil  = np.any(label == 1)
+        if has_ship:
+            top, left = class_centred_crop(3)
+        elif has_oil:
+            top, left = class_centred_crop(1)
+        else:
+            top, left = random_crop()
+    else:
+        top, left = random_crop()
 
-        def _crop_around():
-            rid = tf.random.uniform((), 0, n_idx, dtype=tf.int32)
-            cy = tf.cast(indices[rid, 0], tf.int32)
-            cx = tf.cast(indices[rid, 1], tf.int32)
-            half = patch_size // 2
-            top = tf.clip_by_value(cy - half, 0, h - patch_size)
-            left = tf.clip_by_value(cx - half, 0, w - patch_size)
-            return (
-                tf.image.crop_to_bounding_box(image, top, left, patch_size, patch_size),
-                tf.image.crop_to_bounding_box(label, top, left, patch_size, patch_size),
+    if image.ndim == 3:
+        img_crop = image[top:top + patch_size, left:left + patch_size, :]
+    else:
+        img_crop = image[top:top + patch_size, left:left + patch_size]
+    lbl_crop = label[top:top + patch_size, left:left + patch_size]
+    return img_crop, lbl_crop
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+class OilSpillDataset(Dataset):
+    """
+    PyTorch Dataset for oil spill SAR segmentation.
+
+    Parameters
+    ----------
+    image_files  : list of str
+    label_files  : list of str
+    split        : 'train' | 'val' | 'test'
+    patch_size   : int   (training: random crop to this size; val/test: resize)
+    augment      : bool  (apply stochastic augmentation in __getitem__)
+    """
+
+    def __init__(self, image_files, label_files, split='train',
+                 patch_size=IMG_SIZE, augment=True):
+        if len(image_files) != len(label_files):
+            raise ValueError(
+                f"Image/label count mismatch: {len(image_files)} vs {len(label_files)}"
             )
+        self.image_files = image_files
+        self.label_files = label_files
+        self.split       = split
+        self.patch_size  = patch_size
+        self.augment     = augment and (split == 'train')
+        self._rng        = np.random.default_rng()
 
-        def _random_crop():
-            top = tf.random.uniform((), 0, h - patch_size + 1, dtype=tf.int32)
-            left = tf.random.uniform((), 0, w - patch_size + 1, dtype=tf.int32)
-            return (
-                tf.image.crop_to_bounding_box(image, top, left, patch_size, patch_size),
-                tf.image.crop_to_bounding_box(label, top, left, patch_size, patch_size),
-            )
+    def __len__(self):
+        return len(self.image_files)
 
-        return tf.cond(valid, _crop_around, _random_crop)
+    def __getitem__(self, idx):
+        # ---- load image (grayscale SAR) ---
+        img_path = self.image_files[idx]
+        lbl_path = self.label_files[idx]
 
-    def _random_crop():
-        top = tf.random.uniform((), 0, h - patch_size + 1, dtype=tf.int32)
-        left = tf.random.uniform((), 0, w - patch_size + 1, dtype=tf.int32)
-        return (
-            tf.image.crop_to_bounding_box(image, top, left, patch_size, patch_size),
-            tf.image.crop_to_bounding_box(label, top, left, patch_size, patch_size),
-        )
+        img_bgr = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img_bgr is None:
+            img_bgr = np.zeros((self.patch_size, self.patch_size), dtype=np.uint8)
 
-    return tf.cond(tf.random.uniform(()) < 0.5, _class_centred_crop, _random_crop)
+        lbl = cv2.imread(lbl_path, cv2.IMREAD_GRAYSCALE)
+        if lbl is None:
+            lbl = np.zeros((self.patch_size, self.patch_size), dtype=np.uint8)
 
+        img = img_bgr.astype(np.float32) / 255.0           # [H, W]  float32
+        lbl = np.clip(lbl, 0, NUM_CLASSES - 1).astype(np.int64)
 
-# ---------------------------------------------------------------------------
-# Image + label parsing  (no resize — keep original resolution for patch crop)
-# ---------------------------------------------------------------------------
-def parse_image_label_original(image_path, label_path):
-    """Load image and label at ORIGINAL resolution (for random-crop training)."""
-    image = tf.io.read_file(image_path)
-    image = tf.image.decode_jpeg(image, channels=1)
-    image = tf.cast(image, tf.float32) / 255.0
+        if self.split == 'train':
+            # ---------- random patch crop at original resolution ----------
+            img, lbl = sample_patches(img, lbl, self.patch_size, self._rng)
+        else:
+            # ---------- resize to fixed size for val / test ---------------
+            img = cv2.resize(img, (self.patch_size, self.patch_size),
+                             interpolation=cv2.INTER_LINEAR)
+            lbl = cv2.resize(lbl.astype(np.uint8), (self.patch_size, self.patch_size),
+                             interpolation=cv2.INTER_NEAREST).astype(np.int64)
 
-    label = tf.io.read_file(label_path)
-    label = tf.image.decode_png(label, channels=1)
-    label = tf.cast(label, tf.uint8)
-    label = tf.clip_by_value(label, 0, NUM_CLASSES - 1)
-    return image, label
+        # Convert to tensors: image [C=1, H, W], label [H, W]
+        img_t = torch.from_numpy(img[None]).float()         # [1, H, W]
+        lbl_t = torch.from_numpy(lbl).long()                # [H, W]
 
+        # ---- augmentation (training only) --------------------------------
+        if self.augment:
+            img_t, lbl_t = augment_single_sample(img_t, lbl_t)
 
-def parse_image_label_resized(image_path, label_path):
-    """Load image and label resized to IMG_SIZE (for val / test)."""
-    image = tf.io.read_file(image_path)
-    image = tf.image.decode_jpeg(image, channels=1)
-    image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
-    image = tf.cast(image, tf.float32) / 255.0
-
-    label = tf.io.read_file(label_path)
-    label = tf.image.decode_png(label, channels=1)
-    label = tf.image.resize(label, [IMG_SIZE, IMG_SIZE], method='nearest')
-    label = tf.cast(label, tf.uint8)
-    label = tf.clip_by_value(label, 0, NUM_CLASSES - 1)
-    return image, label
+        return img_t, lbl_t
 
 
 # ---------------------------------------------------------------------------
-# Dataset builder
+# DataLoader factory
 # ---------------------------------------------------------------------------
 def load_dataset(
-    data_dir='dataset',
-    split='train',
-    batch_size=16,
-    val_split=0.15,
-    class_weights_cache='dataset/class_weights.npy',
+    data_dir: str = 'dataset',
+    split: str = 'train',
+    batch_size: int = 16,
+    val_split: float = 0.15,
+    class_weights_cache: str = 'dataset/class_weights.npy',
+    num_workers: int = 4,
+    patch_size: int = IMG_SIZE,
 ):
     """
-    Build a tf.data pipeline.
+    Build a DataLoader for the given split.
 
-    Splits
-    ------
-    * ``train``  – training portion (1 - val_split) of dataset/train, with
-      random crop & shuffling.  No .cache() so augmentation is fresh each epoch.
-    * ``val``    – held-out portion (val_split) of dataset/train.  Deterministic.
-    * ``test``   – dataset/test.  Deterministic.  Reserved for final evaluation.
+    Returns
+    -------
+    loader         : DataLoader
+    class_weights   : dict {class_idx: weight}  or None (non-training splits)
+    num_batches     : int
     """
     if split not in ('train', 'val', 'test'):
-        raise ValueError(f"Invalid split: {split}. Choose from 'train', 'val', 'test'.")
+        raise ValueError(f"Invalid split '{split}'. Choose from 'train', 'val', 'test'.")
 
-    # ---- resolve file lists ---------------------------------------------------
-    if split in ('train', 'val'):
-        base_dir = os.path.join(data_dir, 'train')
-    else:
-        base_dir = os.path.join(data_dir, 'test')
-
+    base_dir  = os.path.join(data_dir, 'train' if split in ('train', 'val') else 'test')
     image_dir = os.path.join(base_dir, 'images')
     label_dir = os.path.join(base_dir, 'labels_1D')
 
@@ -210,10 +247,10 @@ def load_dataset(
             f"{len(image_files)} images vs {len(label_files)} labels"
         )
 
-    # ---- train / val split (file-level, deterministic) -----------------------
+    # ---- deterministic train / val split ---------------------------------
     if split in ('train', 'val'):
         n_total = len(image_files)
-        n_val = max(1, int(val_split * n_total))
+        n_val   = max(1, int(val_split * n_total))
         if split == 'val':
             image_files = image_files[-n_val:]
             label_files = label_files[-n_val:]
@@ -221,55 +258,40 @@ def load_dataset(
             image_files = image_files[:-n_val]
             label_files = label_files[:-n_val]
 
-    num_samples = len(image_files)
-    num_batches = num_samples // batch_size + (1 if num_samples % batch_size > 0 else 0)
-
-    # ---- class weights (only needed for training) ----------------------------
+    # ---- class weights (training only) -----------------------------------
     class_weights = None
     if split == 'train':
         class_weights = analyze_class_distribution(
-            label_files, num_classes=NUM_CLASSES, cache_path=class_weights_cache
+            label_files, num_classes=NUM_CLASSES,
+            cache_path=class_weights_cache,
         )
 
-    # ---- build pipeline ------------------------------------------------------
-    dataset = tf.data.Dataset.from_tensor_slices((image_files, label_files))
+    # ---- dataset & loader ------------------------------------------------
+    augment = (split == 'train')
+    dataset = OilSpillDataset(
+        image_files, label_files,
+        split=split,
+        patch_size=patch_size,
+        augment=augment,
+    )
 
-    opts = tf.data.Options()
-    opts.experimental_optimization.apply_default_optimizations = True
+    # On Windows: num_workers > 0 requires if __name__ == '__main__' guard in script.
+    # Use persistent_workers only when num_workers > 0.
+    effective_workers = num_workers
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split == 'train'),
+        num_workers=effective_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=(split == 'train'),
+        persistent_workers=(effective_workers > 0),
+        worker_init_fn=_worker_init_fn if effective_workers > 0 else None,
+    )
 
-    if split == 'train':
-        # Parse at original resolution → random-crop → shuffle → batch
-        dataset = dataset.map(parse_image_label_original, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.map(
-            lambda img, lbl: sample_patches(img, lbl, IMG_SIZE),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-        dataset = dataset.map(
-            lambda x, y: (tf.cast(x, tf.float32), y),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-        dataset = dataset.shuffle(buffer_size=min(2000, num_samples))
-        dataset = dataset.batch(batch_size, drop_remainder=True)
-        # NO .cache() — augmentation must be stochastic each epoch
-        opts.experimental_optimization.map_parallelization = True
-        opts.experimental_optimization.map_fusion = True
-        opts.experimental_optimization.parallel_batch = True
-        opts.deterministic = False
-        dataset = dataset.with_options(opts)
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    else:
-        # Val / test: resize to fixed size, cache for speed
-        dataset = dataset.map(parse_image_label_resized, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.map(
-            lambda x, y: (tf.cast(x, policy.compute_dtype), y),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-        dataset = dataset.batch(batch_size, drop_remainder=True)
-        dataset = dataset.with_options(opts)
-        dataset = dataset.cache().prefetch(tf.data.AUTOTUNE)
-
+    num_batches = len(loader)
     print(
-        f"Loaded {split} dataset: {num_samples} samples, "
+        f"Loaded {split} dataset: {len(dataset)} samples, "
         f"{num_batches} batches (batch_size={batch_size})"
     )
-    return dataset, class_weights, num_batches
+    return loader, class_weights, num_batches
