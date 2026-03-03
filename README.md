@@ -3,7 +3,7 @@
 **Semantic segmentation of Synthetic Aperture Radar (SAR) satellite images for automated oil spill detection in maritime environments.**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![TensorFlow 2.19](https://img.shields.io/badge/TensorFlow-2.19-orange.svg)](https://www.tensorflow.org/)
+[![PyTorch 2.2+](https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## Abstract
@@ -58,10 +58,10 @@ Class weights are computed from inverse pixel frequency across the training set 
 | Epochs            | 600 max                                                  |
 | Early stopping    | Patience = 30 (monitored on val mIoU)                    |
 | Weight decay      | 1 × 10⁻⁴                                                 |
-| Gradient clipping | clipnorm = 1.0                                           |
-| EMA               | Exponential moving average, decay = 0.999                |
-| Mixed precision   | float16 compute, float32 variables (XLA JIT)             |
-| Distribution      | TensorFlow MirroredStrategy (8 replicas)                 |
+| Gradient clipping | `clip_grad_norm_` max-norm = 1.0                         |
+| EMA               | Exponential moving average, decay = 0.999 (`torch-ema`)  |
+| Mixed precision   | PyTorch AMP (`autocast` + `GradScaler`)                  |
+| Distribution      | PyTorch DDP via `torchrun --nproc_per_node=N`            |
 | Reproducibility   | Global seed = 42                                         |
 
 ### Data Pipeline
@@ -84,7 +84,7 @@ Class weights are computed from inverse pixel frequency across the training set 
 | Gaussian blur    | 5×5, σ ∈ [0.5, 1.5]                          |     20%     |
 | Cutout           | 1–3 patches, 5–15% of image each             |     30%     |
 
-Validation and test sets are resized to 384×384 deterministically (no augmentation, cached in memory).
+Validation and test sets are resized to 384×384 deterministically (no augmentation). The pipeline uses PyTorch `DataLoader` with configurable worker processes (`num_workers = 4`).
 
 ### Inference
 
@@ -157,18 +157,18 @@ The evaluation script computes:
 ```
 oil-spill-detection/
 ├── config.py                       # Centralised hyperparameter dataclasses
-├── utils.py                        # TF setup, reproducibility, colour maps
-├── train.py                        # Distributed training with EMA & callbacks
+├── utils.py                        # Reproducibility, colour maps (pure PyTorch)
+├── train.py                        # Training loop with AMP, DDP, EMA & TensorBoard
 ├── evaluate.py                     # Full evaluation + metric reporting
 ├── working.md                      # Detailed pipeline documentation & flowchart
 ├── data/
 │   ├── __init__.py
-│   ├── data_loader.py              # Train/val/test split, class weights, tf.data
+│   ├── data_loader.py              # Train/val/test split, class weights, DataLoader
 │   ├── augmentation.py             # SAR-specific augmentation transforms
 │   └── test_time_augmentation.py   # TTA engine for inference
 ├── model/
 │   ├── __init__.py
-│   ├── model.py                    # SegFormer-B2 architecture (unchanged)
+│   ├── model.py                    # SegFormer-B2 architecture (pure PyTorch)
 │   ├── loss.py                     # Hybrid loss (CE + Focal + Dice + Boundary)
 │   ├── metrics.py                  # IoU, accuracy, FWIoU, Kappa, bootstrap CI
 │   └── prediction.py              # Multi-scale predictor with optional TTA
@@ -183,7 +183,7 @@ oil-spill-detection/
 
 - Python ≥ 3.10
 - NVIDIA GPU(s) with CUDA 12.x and cuDNN 9.x
-- TensorFlow ≥ 2.19
+- PyTorch ≥ 2.2 with matching CUDA toolkit
 
 ### Installation
 
@@ -193,18 +193,24 @@ git clone https://github.com/ItsTatsuya/oil-spill-detection.git
 cd oil-spill-detection
 
 # Install dependencies
-pip install tensorflow numpy opencv-python matplotlib tqdm
+pip install -r requirements.txt
 ```
+
+The `requirements.txt` installs: `torch`, `torchvision`, `timm`, `torchmetrics`, `huggingface-hub`, `torch-ema`, `tensorboard`, `numpy`, `opencv-python`, `matplotlib`, and `tqdm`.
 
 Place the ROBORDER dataset under `dataset/` following the directory structure shown above.
 
 ### Training
 
 ```bash
+# Single GPU or CPU
 python train.py
+
+# Multi-GPU (e.g. 2 GPUs on one machine)
+torchrun --nproc_per_node=2 train.py
 ```
 
-All hyperparameters are controlled via `config.py`. The script automatically detects available GPUs and configures `MirroredStrategy`. Checkpoints, logs, and the best model weights are saved to `checkpoints/` and `logs/`.
+All hyperparameters are controlled via `config.py`. The script auto-detects available GPUs and launches single-GPU, multi-GPU DDP, or CPU runs accordingly. Checkpoints (`.pt`), TensorBoard logs, and the best model weights are saved to `checkpoints/` and `logs/`.
 
 ### Evaluation
 
@@ -212,7 +218,7 @@ All hyperparameters are controlled via `config.py`. The script automatically det
 python evaluate.py
 ```
 
-By default, evaluation loads the best checkpoint from `checkpoints/segformer_b2_best.weights.h5`, runs multi-scale TTA, and writes results to `evaluation_results.md`.
+By default, evaluation loads the best checkpoint from `checkpoints/segformer_b2_best.pt`, runs multi-scale TTA, and writes results to `evaluation_results.md`.
 
 ---
 
