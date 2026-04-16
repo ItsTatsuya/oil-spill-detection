@@ -43,7 +43,7 @@ sar_features:
     enabled: true
 
 training:
-  num_epochs: 100
+  num_epochs: 600
   batch_size_per_gpu: 2
   gradient_accumulation_steps: 8
   effective_batch_size: 16
@@ -57,8 +57,8 @@ training:
   validate_every_n_epochs: 5
   save_every_n_epochs: 10
   keep_top_k_ema_checkpoints: 3
-  checkpoint_dir: ./checkpoints/segformer-b3-restart
-  log_dir: ./logs/segformer-b3-restart
+  checkpoint_dir: ./checkpoints/segformer-b3-balanced
+  log_dir: ./logs/segformer-b3-balanced
   gradient_clip_norm: 1.0
   progressive_schedule:
     1: 640
@@ -74,18 +74,17 @@ training:
 
 optimizer:
   name: adamw
-  lr: 5.0e-06
-  head_lr_mult: 10.0
+  lr: 2.0e-05
+  head_lr_mult: 3.0
   weight_decay: 0.01
   fused: auto
   betas: [0.9, 0.999]
   eps: 1.0e-08
 
-
 scheduler:
   type: cosine
   warmup_epochs: 5
-  min_lr: 5.0e-07
+  min_lr: 2.0e-06
 
 augmentation:
   train:
@@ -120,26 +119,31 @@ loss:
   ce_ignore_index: -100
   ce_label_smoothing: 0.03
   hybrid_loss_weights:
-    ce: 0.9
-    dice: 2.0
-    jaccard: 4.2
-    focal: 1
+    ce: 0.8
+    dice: 1.0
+    jaccard: 0.0
+    focal: 0.5
   focal:
     gamma: 2.0
-    alpha: [1.0, 1.5, 1.5, 4.0, 2.0]
+    alpha: inverse_frequency
   dice:
     smooth: 1.0
   lovasz:
-    weight: 0.75
+    weight: 0.35
     ramp_start_epoch: 21
     ramp_end_epoch: 80
   boundary:
-    weight: 0.15
+    weight: 0.50
     ramp_start_epoch: 21
     ramp_end_epoch: 80
     downsample_factor: 4
   confusion_penalty:
-    weight: 0.12
+    weight: 0.18
+    penalize_pairs:
+      - [1, 2]
+      - [0, 1]
+      - [0, 2]
+    pair_weights: [1.6, 0.25, 0.45]
     ramp_start_epoch: 150
     ramp_end_epoch: 260
     margin_start: 0.1
@@ -149,21 +153,19 @@ loss:
 
 curriculum:
   phase_1:
-    epochs: [1, 100]
-    ship_oversample_factor: 1.0
-    oil_spill_oversample_factor: 1.0
-    look_alike_oversample_factor: 1.0
-  # phase_2:
-  #   epochs: [51, 120]
-  #   ship_oversample_factor: 1.5
-  #   oil_spill_oversample_factor: 1.1
-  #   look_alike_oversample_factor: 1.1
-  # phase_3:
-  #   epochs: [121, 600]
-  #   ship_oversample_factor: 1.0
-  #   oil_spill_oversample_factor: 1.0
-  #   look_alike_oversample_factor: 1.0
-  #   ship_sampling_floor_multiplier: 1.0
+    epochs: [1, 50]
+    ship_oversample_factor: 2.5
+  phase_2:
+    epochs: [51, 120]
+    ship_oversample_factor: 3.0
+    oil_spill_oversample_factor: 1.2
+    look_alike_oversample_factor: 1.1
+  phase_3:
+    epochs: [121, 600]
+    ship_oversample_factor: 2.2
+    oil_spill_oversample_factor: 1.25
+    look_alike_oversample_factor: 1.25
+    ship_sampling_floor_multiplier: 1.0
 
 inference:
   tta:
@@ -186,4 +188,4 @@ inference:
 evaluation:
   profile: full
   save_predictions: true
-  prediction_dir: ./predictions/segformer-b3-restart
+  prediction_dir: ./predictions/segformer-b3-balanced
