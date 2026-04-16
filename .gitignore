@@ -1,0 +1,18 @@
+__pycache__/
+.venv/
+logs/
+.pytest_cache/
+tests/
+
+# artifacts
+checkpoints/
+dataset/
+ship_crops/
+sar_cache/
+sar_stats/
+sar_stats.json
+predictions/
+pretrained/
+evaluation_output/
+
+results_paper_ablation/

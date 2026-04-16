@@ -1,0 +1,71 @@
+dataset:
+  root: ./dataset
+  train_split: 0.9
+  split_seed: 42
+
+model:
+  architecture: segformer
+  segformer_decoder: hf_mlp
+  pretrained_name: nvidia/segformer-b0-finetuned-ade-512-512
+  num_channels: 4
+  num_labels: 5
+  channel_init: rgb_mean_inflate
+
+sar_features:
+  channel_1: amplitude
+  channel_2: local_variance
+  channel_3: gradient_magnitude
+  channel_4: glcm_contrast
+  channel_schema_version: vv_singleband_4ch
+training:
+  num_epochs: 4
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 1
+  num_workers: 0
+  val_num_workers: 0
+  persistent_workers: false
+  pin_memory: false
+  precision: fp32
+  validate_every_n_epochs: 2
+  save_every_n_epochs: 2
+  checkpoint_dir: ./checkpoints/debug
+  log_dir: ./logs/debug
+  progressive_schedule:
+    1: 128
+    2: 256
+  model_ema:
+    enabled: true
+    decay: 0.9998
+    update_after_step: 0
+    use_for_validation: false
+    save_best_ema: false
+
+optimizer:
+  lr: 6.0e-05
+  head_lr_mult: 10.0
+  weight_decay: 0.01
+
+scheduler:
+  warmup_epochs: 1
+  min_lr: 1.0e-06
+
+augmentation:
+  train:
+    crop_size: 128
+    copy_paste:
+      enabled: false
+    speckle_noise:
+      enabled: false
+  test:
+    resize: 128
+
+loss:
+  hybrid_loss_weights:
+    ce: 1.0
+    dice: 1.0
+    jaccard: 0.0
+    focal: 0.0
+
+evaluation:
+  save_predictions: false
+  prediction_dir: ./predictions/debug
