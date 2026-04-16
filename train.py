@@ -52,15 +52,6 @@ def parse_args():
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
     )
     resume_group.add_argument(
-        "--fine-tune",
-        type=str,
-        default=None,
-        help=(
-            "Path to checkpoint to initialize weights from without restoring "
-            "optimizer/scheduler/epoch state."
-        ),
-    )
-    resume_group.add_argument(
         "--no-resume",
         "-no-resume",
         "--no-auto-resume",
@@ -224,9 +215,7 @@ def main():
         exp_logger=exp_logger,
     )
 
-    if args.fine_tune:
-        trainer.load_checkpoint(args.fine_tune, restore_training_state=False)
-    elif args.resume:
+    if args.resume:
         trainer.load_checkpoint(args.resume)
     elif args.no_resume:
         exp_logger.info("Resume disabled; starting from scratch.")

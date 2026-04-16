@@ -447,12 +447,7 @@ class Trainer:
             "last_val_metrics": dict(self._last_val_metrics),
         }
 
-    def load_checkpoint(
-        self,
-        checkpoint_path: Optional[str] = None,
-        *,
-        restore_training_state: bool = True,
-    ) -> None:
+    def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> None:
         if checkpoint_path is None:
             latest = self.checkpoint_cb.find_latest()
             if latest is None:
@@ -463,30 +458,13 @@ class Trainer:
         info = self.checkpoint_cb.load(
             checkpoint_path=checkpoint_path,
             model=self.model,
-            optimizer=self.optimizer if restore_training_state else None,
-            scheduler=self.scheduler if restore_training_state else None,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
             current_config=self.config,
-            scaler=self.scaler if restore_training_state else None,
-            loss_fn=self.loss_fn if restore_training_state else None,
-            model_ema=self.model_ema if restore_training_state else None,
+            scaler=self.scaler,
+            loss_fn=self.loss_fn,
+            model_ema=self.model_ema,
         )
-        if not restore_training_state:
-            self.start_epoch = 1
-            self.global_step = 0
-            self.best_val_miou = 0.0
-            self._best_val_miou_for_patience = 0.0
-            self._epochs_since_improvement = 0
-            self._last_improvement_epoch = 0
-            self._last_val_metrics = {}
-            self._last_val_metrics_by_profile = {}
-            if self.curriculum_loader_factory is not None:
-                self.curriculum_loader_factory.set_phase_epoch_offset(0)
-            logger.info(
-                "Loaded model weights from checkpoint for fine-tuning. "
-                "Training state reset (start_epoch=1, global_step=0)."
-            )
-            return
-
         self.start_epoch = int(info["epoch"]) + 1
         self.global_step = int(info.get("global_step", 0))
         trainer_state = info.get("trainer_state", {}) or {}
