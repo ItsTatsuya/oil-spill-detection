@@ -20,7 +20,6 @@ def _worker_init_fn(worker_id: int) -> None:
 
 
 class DistributedWeightedSampler(torch.utils.data.Sampler):
-
     def __init__(
         self,
         dataset: Any,
@@ -61,7 +60,6 @@ class DistributedWeightedSampler(torch.utils.data.Sampler):
 
 
 class CurriculumDataLoaderFactory:
-
     def __init__(
         self,
         dataset: Any,
@@ -117,6 +115,7 @@ class CurriculumDataLoaderFactory:
         self._current_phase = None
 
         self._phase_override: Optional[int] = None
+        self._phase_epoch_offset = 0
 
         self._cached_loader: Optional[DataLoader] = None
         self._cached_phase: Optional[int] = None
@@ -135,6 +134,11 @@ class CurriculumDataLoaderFactory:
         self._cached_loader = None
         self._cached_phase = None
         self._cached_transform_id = None
+
+    def _to_phase_epoch(self, epoch: int) -> int:
+        if self._phase_epoch_offset <= 0:
+            return int(epoch)
+        return max(int(epoch) - self._phase_epoch_offset, 1)
 
     def _build_loader_for_phase(self, phase: int) -> DataLoader:
         phase_weights = self._get_phase_weights(phase)
@@ -246,6 +250,7 @@ class CurriculumDataLoaderFactory:
         return counts
 
     def get_phase(self, epoch: int) -> int:
+        phase_epoch = self._to_phase_epoch(epoch)
         stagger_1_to_2 = self.curriculum_cfg.get("phase_1_to_2", {})
         stagger_2_to_3 = self.curriculum_cfg.get("phase_2_to_3", {})
 
@@ -256,16 +261,16 @@ class CurriculumDataLoaderFactory:
             sampling_start_phase3 = int(
                 stagger_2_to_3.get("sampling_epoch", self._phase2_end + 1)
             )
-            if epoch < sampling_start_phase2:
+            if phase_epoch < sampling_start_phase2:
                 return 1
-            elif epoch < sampling_start_phase3:
+            elif phase_epoch < sampling_start_phase3:
                 return 2
             else:
                 return 3
 
-        if epoch <= self._phase1_end:
+        if phase_epoch <= self._phase1_end:
             return 1
-        elif epoch <= self._phase2_end:
+        elif phase_epoch <= self._phase2_end:
             return 2
         else:
             return 3
@@ -278,7 +283,7 @@ class CurriculumDataLoaderFactory:
         )
 
         if phase != self._current_phase:
-            self._log_phase_transition(phase, epoch)
+            self._log_phase_transition(phase, epoch, self._to_phase_epoch(epoch))
             self._current_phase = phase
 
         transform_id = id(getattr(self.dataset, "transform", None))
@@ -313,6 +318,19 @@ class CurriculumDataLoaderFactory:
         if old != phase:
             self.clear_cache()
             logger.info(f"DataLoader sampling phase override: {old!r} -> {phase!r}")
+
+    def set_phase_epoch_offset(self, epoch_offset: int) -> None:
+        old_offset = self._phase_epoch_offset
+        new_offset = max(int(epoch_offset), 0)
+        self._phase_epoch_offset = new_offset
+        if old_offset != new_offset:
+            self.clear_cache()
+            self._current_phase = None
+            logger.info(
+                "Curriculum epoch offset updated: %d -> %d",
+                old_offset,
+                new_offset,
+            )
 
     def _get_phase_weights(self, phase: int) -> np.ndarray:
         phase_cfg = self.curriculum_cfg.get(f"phase_{phase}", {})
@@ -363,7 +381,9 @@ class CurriculumDataLoaderFactory:
         weights = weights / weights.sum()
         return weights
 
-    def _log_phase_transition(self, new_phase: int, epoch: int) -> None:
+    def _log_phase_transition(
+        self, new_phase: int, epoch: int, phase_epoch: int
+    ) -> None:
         if new_phase == 2:
             phase2_cfg = self.curriculum_cfg.get("phase_2", {})
             n_ship = len(self._ship_image_indices)
@@ -389,4 +409,18 @@ class CurriculumDataLoaderFactory:
                 f"oil={phase1_cfg.get('oil_spill_oversample_factor', 1.0)}x, "
                 f"look_alike={phase1_cfg.get('look_alike_oversample_factor', 1.0)}x)"
             )
-        logger.info(f"=== Curriculum Phase {new_phase} (epoch {epoch}): {desc} ===")
+        if phase_epoch != epoch:
+            logger.info(
+                "=== Curriculum Phase %d (epoch %d, curriculum_epoch %d): %s ===",
+                new_phase,
+                epoch,
+                phase_epoch,
+                desc,
+            )
+        else:
+            logger.info(
+                "=== Curriculum Phase %d (epoch %d): %s ===",
+                new_phase,
+                epoch,
+                desc,
+            )
