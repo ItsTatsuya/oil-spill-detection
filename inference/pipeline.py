@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 import numpy as np
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 
 from inference.multiscale import MultiScaleInference
 from inference.tta import TestTimeAugmentation
+
+logger = logging.getLogger(__name__)
 
 
 class InferencePipeline:
@@ -22,10 +25,21 @@ class InferencePipeline:
 
         tta_enabled = bool(tta_cfg.get("enabled", False))
         ms_enabled = bool(ms_cfg.get("enabled", False))
+        configured_tta_enabled = tta_enabled
+        configured_ms_enabled = ms_enabled
 
         if self.profile == "fast":
             tta_enabled = False
             ms_enabled = False
+            if configured_tta_enabled or configured_ms_enabled:
+                logger.warning(
+                    "Inference profile 'fast' disables TTA/multiscale "
+                    "(configured tta=%s, multiscale=%s -> effective tta=%s, multiscale=%s).",
+                    configured_tta_enabled,
+                    configured_ms_enabled,
+                    tta_enabled,
+                    ms_enabled,
+                )
 
         self.tta: Optional[TestTimeAugmentation] = None
         if tta_enabled:
@@ -51,9 +65,7 @@ class InferencePipeline:
 
     def estimate_forward_passes_per_image(self) -> int:
         scale_count = len(self.multiscale.scales) if self.multiscale is not None else 1
-        tta_count = (
-            len(self.tta.augmentation_types) if self.tta is not None else 1
-        )
+        tta_count = len(self.tta.augmentation_types) if self.tta is not None else 1
         return int(scale_count * tta_count)
 
     def describe_profile(self) -> dict:

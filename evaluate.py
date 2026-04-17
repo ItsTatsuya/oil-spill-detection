@@ -73,7 +73,7 @@ def main():
     )
 
     config = load_config(args.config)
-    config["evaluation"]["prediction_dir"] = args.output_dir
+    config.setdefault("evaluation", {})["prediction_dir"] = args.output_dir
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = build_model(config)

@@ -216,7 +216,9 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     ):
         raise ValueError("model.channel_init must be 'rgb_mean_inflate'.")
     channels = resolve_sar_channel_names(config)
-    invalid_channels = [name for name in channels if name not in _SUPPORTED_SAR_CHANNELS]
+    invalid_channels = [
+        name for name in channels if name not in _SUPPORTED_SAR_CHANNELS
+    ]
     if invalid_channels:
         raise ValueError(
             "sar_features channels must be chosen from "
@@ -232,6 +234,31 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "model.num_channels must match the active SAR channel schema length: "
             f"num_channels={num_channels}, channels={channels}"
         )
+
+    train_profile = (
+        str(config.get("training", {}).get("validation_profile", "fast"))
+        .strip()
+        .lower()
+    )
+    eval_profile = (
+        str(config.get("evaluation", {}).get("profile", "full")).strip().lower()
+    )
+    inference_cfg = config.get("inference", {})
+    tta_enabled = bool(inference_cfg.get("tta", {}).get("enabled", False))
+    multiscale_enabled = bool(inference_cfg.get("multiscale", {}).get("enabled", False))
+
+    if train_profile == "fast" and (tta_enabled or multiscale_enabled):
+        warnings_list.append(
+            "training.validation_profile='fast' disables inference.tta.enabled and "
+            "inference.multiscale.enabled during training validation."
+        )
+
+    if train_profile in {"fast", "full"} and eval_profile in {"fast", "full"}:
+        if train_profile != eval_profile:
+            warnings_list.append(
+                "training.validation_profile differs from evaluation.profile; this is "
+                "allowed but can produce different train-time vs final-eval metrics."
+            )
     return warnings_list
 
 

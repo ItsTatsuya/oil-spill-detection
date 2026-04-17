@@ -62,8 +62,8 @@ training:
   gradient_clip_norm: 1.0
   progressive_schedule:
     1: 640
-  early_stop_start_epoch: 350
-  early_stop_patience_epochs: 100
+  early_stop_start_epoch: 475
+  early_stop_patience_epochs: 50
   early_stop_min_delta: 0.0005
   model_ema:
     enabled: false
@@ -125,7 +125,7 @@ loss:
     focal: 0.5
   focal:
     gamma: 2.0
-    alpha: inverse_frequency
+    alpha: null
   dice:
     smooth: 1.0
   lovasz:
@@ -133,17 +133,18 @@ loss:
     ramp_start_epoch: 21
     ramp_end_epoch: 80
   boundary:
-    weight: 0.50
+    weight: 0.60
     ramp_start_epoch: 21
     ramp_end_epoch: 80
     downsample_factor: 4
   confusion_penalty:
-    weight: 0.18
+    weight: 0.20
     penalize_pairs:
-      - [1, 2]
-      - [0, 1]
-      - [0, 2]
-    pair_weights: [1.6, 0.25, 0.45]
+      - [1, 2]    # Oil vs Look-alike
+      - [0, 1]    # Sea vs Oil
+      - [0, 2]    # Sea vs Look-alike
+      - [0, 4]    # Sea vs Land (The Coastline Fix)
+    pair_weights: [2.0, 0.25, 0.45, 0.80]
     ramp_start_epoch: 150
     ramp_end_epoch: 260
     margin_start: 0.1
@@ -162,16 +163,25 @@ curriculum:
     look_alike_oversample_factor: 1.1
   phase_3:
     epochs: [121, 250]
+    # The Confusion Penalty triggers here to separate Oil/Look-alike
     ship_oversample_factor: 2.2
     oil_spill_oversample_factor: 1.25
     look_alike_oversample_factor: 1.25
     ship_sampling_floor_multiplier: 1.0
   phase_4:
-    epochs: [251, 600]
-    ship_oversample_factor: 1.5
+    epochs: [251, 450]
+    # The Soft Landing: Start re-introducing Land images naturally
+    ship_oversample_factor: 1.30
     oil_spill_oversample_factor: 1.05
     look_alike_oversample_factor: 1.05
     ship_sampling_floor_multiplier: 1.0
+  phase_5:
+    epochs: [451, 600]
+    # The Coastline Finish: 100% natural distribution to perfect the Land class
+    ship_oversample_factor: 1.0
+    oil_spill_oversample_factor: 1.0
+    look_alike_oversample_factor: 1.0
+    ship_sampling_floor_multiplier: 0.0 # Remove the floor constraint!
 
 inference:
   tta:

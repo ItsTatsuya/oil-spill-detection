@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 class ModelEMA:
-
     def __init__(
         self,
         model: nn.Module,
@@ -79,7 +78,6 @@ class ModelEMA:
 
 
 class CheckpointCallback:
-
     def __init__(
         self,
         checkpoint_dir: str,
@@ -105,7 +103,9 @@ class CheckpointCallback:
             try:
                 checkpoint = torch.load(path, map_location="cpu", weights_only=False)
             except Exception as exc:  # pragma: no cover - best effort recovery path
-                logger.warning("Skipping unreadable top-k EMA checkpoint %s: %s", path, exc)
+                logger.warning(
+                    "Skipping unreadable top-k EMA checkpoint %s: %s", path, exc
+                )
                 continue
             records.append(
                 {
@@ -286,6 +286,7 @@ class CheckpointCallback:
         scaler: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
         model_ema: Optional[ModelEMA] = None,
+        ignore_loss_state: bool = False,
     ) -> Dict[str, Any]:
         path = Path(checkpoint_path)
         if not path.exists():
@@ -337,8 +338,14 @@ class CheckpointCallback:
             )
 
         if loss_fn is not None and "loss_fn_state_dict" in checkpoint:
-            loss_fn.load_state_dict(checkpoint["loss_fn_state_dict"])
-            logger.info("Restored CombinedLoss EMA state from checkpoint.")
+            if ignore_loss_state:
+                logger.info(
+                    "Ignored CombinedLoss state from checkpoint due to --ignore-loss-state flag. "
+                    "Using YAML config."
+                )
+            else:
+                loss_fn.load_state_dict(checkpoint["loss_fn_state_dict"])
+                logger.info("Restored CombinedLoss state from checkpoint.")
 
         if model_ema is not None and "ema_state_dict" in checkpoint:
             model_ema.load_state_dict(checkpoint["ema_state_dict"])

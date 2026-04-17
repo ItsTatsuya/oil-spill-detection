@@ -63,6 +63,11 @@ def parse_args():
         "--debug", action="store_true", help="Run a short debug training loop"
     )
     parser.add_argument(
+        "--ignore-loss-state",
+        action="store_true",
+        help="Skip loading the loss state_dict from the checkpoint.",
+    )
+    parser.add_argument(
         "--run-final-eval",
         action="store_true",
         help="Run an explicit final evaluation after training. Disabled by default to avoid test leakage.",
@@ -157,12 +162,42 @@ def main():
         train_dataset.select_indices(list(range(min(32, len(train_dataset)))))
         val_dataset.select_indices(list(range(min(8, len(val_dataset)))))
 
-    split_pixel_counts = compute_dataset_pixel_counts(train_dataset.metadata)
-    config.setdefault("dataset", {})["pixel_counts"] = split_pixel_counts
-    exp_logger.info(
-        f"Resolved dataset.pixel_counts from active train split ({len(train_dataset)} images): "
-        f"{split_pixel_counts}"
+    train_cfg = config.setdefault("training", {})
+    dataset_cfg = config.setdefault("dataset", {})
+    pixel_counts_source = (
+        str(train_cfg.get("pixel_counts_source", "split")).strip().lower()
     )
+    if pixel_counts_source not in {"split", "config"}:
+        exp_logger.warning(
+            f"Unknown training.pixel_counts_source={pixel_counts_source!r}. Falling back to 'split'."
+        )
+        pixel_counts_source = "split"
+
+    if pixel_counts_source == "split":
+        split_pixel_counts = compute_dataset_pixel_counts(train_dataset.metadata)
+        dataset_cfg["pixel_counts"] = split_pixel_counts
+        exp_logger.info(
+            f"Resolved dataset.pixel_counts from active train split ({len(train_dataset)} images): {split_pixel_counts}"
+        )
+    else:
+        configured_counts = dataset_cfg.get("pixel_counts")
+        if not isinstance(configured_counts, dict):
+            split_pixel_counts = compute_dataset_pixel_counts(train_dataset.metadata)
+            dataset_cfg["pixel_counts"] = split_pixel_counts
+            pixel_counts_source = "split"
+            exp_logger.warning(
+                "training.pixel_counts_source='config' requested but dataset.pixel_counts is missing or invalid. "
+                "Falling back to split-derived counts."
+            )
+            exp_logger.info(
+                f"Resolved dataset.pixel_counts from active train split ({len(train_dataset)} images): {split_pixel_counts}"
+            )
+        else:
+            exp_logger.info(
+                "Using dataset.pixel_counts from config (training.pixel_counts_source='config')."
+            )
+
+    train_cfg["pixel_counts_source"] = pixel_counts_source
 
     if not Path(stats_path).exists():
         exp_logger.info("Fitting SAR feature encoder on training images...")
@@ -216,11 +251,14 @@ def main():
     )
 
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        trainer.load_checkpoint(
+            args.resume,
+            ignore_loss_state=args.ignore_loss_state,
+        )
     elif args.no_resume:
         exp_logger.info("Resume disabled; starting from scratch.")
     else:
-        trainer.load_checkpoint()
+        trainer.load_checkpoint(ignore_loss_state=args.ignore_loss_state)
 
     trainer.train()
 

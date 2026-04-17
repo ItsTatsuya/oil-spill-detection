@@ -119,6 +119,27 @@ class Trainer:
                 self.primary_validation_profile,
             )
             self.primary_validation_profile = "fast"
+        self.evaluation_profile = (
+            str(config.get("evaluation", {}).get("profile", "full")).strip().lower()
+        )
+        if self.evaluation_profile not in {"fast", "full"}:
+            logger.warning(
+                "Unknown evaluation.profile=%r. Falling back to 'full'.",
+                self.evaluation_profile,
+            )
+            self.evaluation_profile = "full"
+        logger.info(
+            "Training validation profile=%s; evaluation profile=%s.",
+            self.primary_validation_profile,
+            self.evaluation_profile,
+        )
+        if self.primary_validation_profile != self.evaluation_profile:
+            logger.warning(
+                "training.validation_profile (%s) differs from evaluation.profile (%s). "
+                "This is allowed but can yield different train-time vs final-eval metrics.",
+                self.primary_validation_profile,
+                self.evaluation_profile,
+            )
         self.best_val_miou = 0.0
         self._best_val_miou_for_patience = 0.0
         self.start_epoch = 1
@@ -439,15 +460,23 @@ class Trainer:
         }
 
     def _build_resume_state(self) -> dict[str, Any]:
+        pixel_counts_source = str(
+            self.config.get("training", {}).get("pixel_counts_source", "split")
+        )
         return {
             "best_val_miou": float(self.best_val_miou),
             "epochs_since_improvement": int(self._epochs_since_improvement),
             "last_improvement_epoch": int(self._last_improvement_epoch),
             "best_val_miou_for_patience": float(self._best_val_miou_for_patience),
             "last_val_metrics": dict(self._last_val_metrics),
+            "pixel_counts_source": pixel_counts_source,
         }
 
-    def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> None:
+    def load_checkpoint(
+        self,
+        checkpoint_path: Optional[str] = None,
+        ignore_loss_state: bool = False,
+    ) -> None:
         if checkpoint_path is None:
             latest = self.checkpoint_cb.find_latest()
             if latest is None:
@@ -464,6 +493,7 @@ class Trainer:
             scaler=self.scaler,
             loss_fn=self.loss_fn,
             model_ema=self.model_ema,
+            ignore_loss_state=ignore_loss_state,
         )
         self.start_epoch = int(info["epoch"]) + 1
         self.global_step = int(info.get("global_step", 0))
@@ -481,6 +511,15 @@ class Trainer:
         self._last_improvement_epoch = int(
             trainer_state.get("last_improvement_epoch", 0)
         )
+        checkpoint_pixel_counts_source = trainer_state.get("pixel_counts_source")
+        if isinstance(checkpoint_pixel_counts_source, str):
+            self.config.setdefault("training", {})["pixel_counts_source"] = (
+                checkpoint_pixel_counts_source
+            )
+            logger.info(
+                "Resumed training.pixel_counts_source=%s from checkpoint metadata.",
+                checkpoint_pixel_counts_source,
+            )
         if isinstance(trainer_state.get("last_val_metrics"), dict):
             self._last_val_metrics = dict(trainer_state["last_val_metrics"])
         if isinstance(info.get("val_metrics_by_profile"), dict):

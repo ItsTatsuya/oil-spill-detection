@@ -1,6 +1,7 @@
 import logging
 import math
 import random
+import re
 import time
 from typing import Any, Mapping, Optional, Sequence
 
@@ -20,7 +21,6 @@ def _worker_init_fn(worker_id: int) -> None:
 
 
 class DistributedWeightedSampler(torch.utils.data.Sampler):
-
     def __init__(
         self,
         dataset: Any,
@@ -61,7 +61,6 @@ class DistributedWeightedSampler(torch.utils.data.Sampler):
 
 
 class CurriculumDataLoaderFactory:
-
     def __init__(
         self,
         dataset: Any,
@@ -90,12 +89,7 @@ class CurriculumDataLoaderFactory:
 
         self.curriculum_cfg = config.get("curriculum", {})
         self.sampler_seed = int(config.get("dataset", {}).get("split_seed", 42))
-        self._phase1_end = self.curriculum_cfg.get("phase_1", {}).get(
-            "epochs", [1, 50]
-        )[1]
-        self._phase2_end = self.curriculum_cfg.get("phase_2", {}).get(
-            "epochs", [51, 150]
-        )[1]
+        self._phase_ranges = self._parse_phase_ranges()
 
         pixel_counts = config.get("dataset", {}).get("pixel_counts")
         if pixel_counts is None:
@@ -121,6 +115,40 @@ class CurriculumDataLoaderFactory:
         self._cached_loader: Optional[DataLoader] = None
         self._cached_phase: Optional[int] = None
         self._cached_transform_id: Optional[int] = None
+
+    def _parse_phase_ranges(self) -> list[tuple[int, int, int]]:
+        phase_ranges: list[tuple[int, int, int]] = []
+        phase_key_re = re.compile(r"^phase_(\d+)$")
+        for key, phase_cfg in self.curriculum_cfg.items():
+            if not isinstance(key, str):
+                continue
+            match = phase_key_re.match(key)
+            if match is None or not isinstance(phase_cfg, Mapping):
+                continue
+            phase = int(match.group(1))
+            epochs = phase_cfg.get("epochs")
+            if not isinstance(epochs, Sequence) or len(epochs) < 2:
+                continue
+            start_epoch = int(epochs[0])
+            end_epoch = int(epochs[1])
+            phase_ranges.append((phase, start_epoch, end_epoch))
+
+        if phase_ranges:
+            phase_ranges.sort(key=lambda item: item[0])
+            return phase_ranges
+
+        training_epochs = int(self.config.get("training", {}).get("num_epochs", 1))
+        if training_epochs <= 0:
+            training_epochs = 1
+
+        if self.curriculum_cfg:
+            raise ValueError(
+                "curriculum is configured but no valid phase_N.epochs entries were found. "
+                "Define curriculum phases like phase_1: {epochs: [start, end]}"
+            )
+
+        # No curriculum provided: use a single config-driven phase over the full run.
+        return [(1, 1, training_epochs)]
 
     def _shutdown_loader_workers(self, loader: Optional[DataLoader]) -> None:
         if loader is None:
@@ -162,7 +190,7 @@ class CurriculumDataLoaderFactory:
             )
 
         sampler = WeightedRandomSampler(
-            weights=phase_weights,
+            weights=phase_weights.tolist(),
             num_samples=len(self.dataset),
             replacement=True,
         )
@@ -246,29 +274,13 @@ class CurriculumDataLoaderFactory:
         return counts
 
     def get_phase(self, epoch: int) -> int:
-        stagger_1_to_2 = self.curriculum_cfg.get("phase_1_to_2", {})
-        stagger_2_to_3 = self.curriculum_cfg.get("phase_2_to_3", {})
+        for phase, start_epoch, end_epoch in self._phase_ranges:
+            if start_epoch <= epoch <= end_epoch:
+                return phase
 
-        if stagger_1_to_2:
-            sampling_start_phase2 = int(
-                stagger_1_to_2.get("sampling_epoch", self._phase1_end + 1)
-            )
-            sampling_start_phase3 = int(
-                stagger_2_to_3.get("sampling_epoch", self._phase2_end + 1)
-            )
-            if epoch < sampling_start_phase2:
-                return 1
-            elif epoch < sampling_start_phase3:
-                return 2
-            else:
-                return 3
-
-        if epoch <= self._phase1_end:
-            return 1
-        elif epoch <= self._phase2_end:
-            return 2
-        else:
-            return 3
+        if epoch < self._phase_ranges[0][1]:
+            return self._phase_ranges[0][0]
+        return self._phase_ranges[-1][0]
 
     def get_dataloader(self, epoch: int) -> DataLoader:
         phase = (
@@ -353,7 +365,7 @@ class CurriculumDataLoaderFactory:
                 sample_boost += max(look_alike_boost - 1.0, 0.0)
             weights[idx] *= sample_boost
 
-        if phase == 3 and ship_sampling_floor_multiplier > 1.0:
+        if ship_sampling_floor_multiplier > 1.0:
             for idx in self._ship_image_indices:
                 base_weight = self._per_image_weights[idx]
                 floor_weight = base_weight * ship_sampling_floor_multiplier
@@ -364,29 +376,13 @@ class CurriculumDataLoaderFactory:
         return weights
 
     def _log_phase_transition(self, new_phase: int, epoch: int) -> None:
-        if new_phase == 2:
-            phase2_cfg = self.curriculum_cfg.get("phase_2", {})
-            n_ship = len(self._ship_image_indices)
-            desc = (
-                f"Ship-enriched sampling ({n_ship} ship images "
-                f"ship={phase2_cfg.get('ship_oversample_factor', 3.0)}x, "
-                f"oil={phase2_cfg.get('oil_spill_oversample_factor', 1.0)}x, "
-                f"look_alike={phase2_cfg.get('look_alike_oversample_factor', 1.0)}x)"
-            )
-        elif new_phase == 3:
-            phase3_cfg = self.curriculum_cfg.get("phase_3", {})
-            desc = (
-                "Inverse-frequency rare-class rebalance "
-                f"(ship={phase3_cfg.get('ship_oversample_factor', 2.0)}x, "
-                f"oil={phase3_cfg.get('oil_spill_oversample_factor', 1.0)}x, "
-                f"look_alike={phase3_cfg.get('look_alike_oversample_factor', 1.0)}x)"
-            )
-        else:
-            phase1_cfg = self.curriculum_cfg.get("phase_1", {})
-            desc = (
-                "Standard sampling with inverse-frequency class weights "
-                f"(ship={phase1_cfg.get('ship_oversample_factor', 2.0)}x, "
-                f"oil={phase1_cfg.get('oil_spill_oversample_factor', 1.0)}x, "
-                f"look_alike={phase1_cfg.get('look_alike_oversample_factor', 1.0)}x)"
-            )
+        phase_cfg = self.curriculum_cfg.get(f"phase_{new_phase}", {})
+        n_ship = len(self._ship_image_indices)
+        desc = (
+            f"Configured phase sampling ({n_ship} ship images "
+            f"ship={phase_cfg.get('ship_oversample_factor', 1.0)}x, "
+            f"oil={phase_cfg.get('oil_spill_oversample_factor', 1.0)}x, "
+            f"look_alike={phase_cfg.get('look_alike_oversample_factor', 1.0)}x, "
+            f"ship_floor={phase_cfg.get('ship_sampling_floor_multiplier', 1.0)}x)"
+        )
         logger.info(f"=== Curriculum Phase {new_phase} (epoch {epoch}): {desc} ===")
