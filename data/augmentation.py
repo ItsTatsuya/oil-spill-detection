@@ -80,6 +80,7 @@ class ClassAwareCropper:
         self.config = config
         train_cfg = config.get("augmentation", {}).get("train", {})
         self.crop_strategy = str(train_cfg.get("crop_strategy", "random")).lower()
+        self.ignore_index = int(config.get("loss", {}).get("ce_ignore_index", -100))
         probs = train_cfg.get("class_aware_crop_probs", {})
         self.class_probs = {
             "ship": float(probs.get("ship", 0.25)),
@@ -256,7 +257,8 @@ class ClassAwareCropper:
         mask_padded = np.pad(
             mask,
             ((pad_top, pad_bottom), (pad_left, pad_right)),
-            mode="edge",
+            mode="constant",
+            constant_values=self.ignore_index,
         )
         return np.ascontiguousarray(image_padded), np.ascontiguousarray(mask_padded)
 

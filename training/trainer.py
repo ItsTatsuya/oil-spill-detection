@@ -168,6 +168,7 @@ class Trainer:
 
     def _build_optimizer(self) -> optim.Optimizer:
         opt_cfg = self.config.get("optimizer", {})
+        optimizer_name = str(opt_cfg.get("name", "adamw")).strip().lower()
         base_lr = float(opt_cfg.get("lr", 6e-5))
         head_lr_mult = float(opt_cfg.get("head_lr_mult", 10.0))
         head_lr = base_lr * head_lr_mult
@@ -254,30 +255,56 @@ class Trainer:
             )
             use_fused = False
 
-        adamw_kwargs: dict[str, Any] = {
+        optimizer_kwargs: dict[str, Any] = {
             "lr": base_lr,
             "weight_decay": float(opt_cfg.get("weight_decay", 0.01)),
-            "betas": tuple(opt_cfg.get("betas", [0.9, 0.999])),
-            "eps": float(opt_cfg.get("eps", 1e-8)),
         }
-        if use_fused:
-            adamw_kwargs["fused"] = True
+        if optimizer_name in {"adamw", "adam"}:
+            optimizer_kwargs["betas"] = tuple(opt_cfg.get("betas", [0.9, 0.999]))
+            optimizer_kwargs["eps"] = float(opt_cfg.get("eps", 1e-8))
+            if optimizer_name == "adamw" and use_fused:
+                optimizer_kwargs["fused"] = True
+        elif optimizer_name == "sgd":
+            if use_fused:
+                logger.warning(
+                    "optimizer.fused is only supported for AdamW in this trainer; ignoring it for SGD."
+                )
+            optimizer_kwargs["momentum"] = float(opt_cfg.get("momentum", 0.9))
+            optimizer_kwargs["nesterov"] = bool(opt_cfg.get("nesterov", True))
+        else:
+            logger.warning(
+                "Unknown optimizer.name=%r. Falling back to 'adamw'.",
+                optimizer_name,
+            )
+            optimizer_name = "adamw"
+            optimizer_kwargs["betas"] = tuple(opt_cfg.get("betas", [0.9, 0.999]))
+            optimizer_kwargs["eps"] = float(opt_cfg.get("eps", 1e-8))
+            if use_fused:
+                optimizer_kwargs["fused"] = True
+
+        optimizer_cls = {
+            "adamw": optim.AdamW,
+            "adam": optim.Adam,
+            "sgd": optim.SGD,
+        }[optimizer_name]
 
         try:
-            optimizer = optim.AdamW(param_groups, **adamw_kwargs)
+            optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
         except (TypeError, RuntimeError) as exc:
-            if "fused" in adamw_kwargs:
+            if optimizer_name == "adamw" and "fused" in optimizer_kwargs:
                 logger.warning(
                     "Fused AdamW unavailable in this torch/runtime (%s). Falling back to standard AdamW.",
                     exc,
                 )
-                adamw_kwargs.pop("fused", None)
-                optimizer = optim.AdamW(param_groups, **adamw_kwargs)
+                optimizer_kwargs.pop("fused", None)
+                optimizer = optim.AdamW(param_groups, **optimizer_kwargs)
             else:
                 raise
 
         logger.info(
-            "Using AdamW optimizer (fused=%s).", bool(adamw_kwargs.get("fused"))
+            "Using %s optimizer (fused=%s).",
+            optimizer_name.upper(),
+            bool(optimizer_kwargs.get("fused")),
         )
         return optimizer
 
@@ -529,8 +556,6 @@ class Trainer:
                 if isinstance(metrics, dict)
             }
         checkpoint_profile = info.get("primary_validation_profile")
-        if isinstance(checkpoint_profile, str):
-            self.primary_validation_profile = checkpoint_profile
         if self.primary_validation_profile in self._last_val_metrics_by_profile:
             self._last_val_metrics = dict(
                 self._last_val_metrics_by_profile[self.primary_validation_profile]
@@ -539,8 +564,13 @@ class Trainer:
             first_profile, first_metrics = next(
                 iter(self._last_val_metrics_by_profile.items())
             )
-            self.primary_validation_profile = str(first_profile)
             self._last_val_metrics = dict(first_metrics)
+            if isinstance(checkpoint_profile, str):
+                logger.info(
+                    "Keeping current validation profile '%s'; checkpoint history only has '%s'.",
+                    self.primary_validation_profile,
+                    first_profile,
+                )
         logger.info(
             "Resumed from epoch %d with best val mIoU %.2f%%",
             self.start_epoch - 1,

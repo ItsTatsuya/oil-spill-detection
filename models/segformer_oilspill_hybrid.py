@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,12 +11,6 @@ def _resolve_group_norm_groups(num_channels: int, max_groups: int = 32) -> int:
         if num_channels % groups == 0:
             return groups
     return 1
-
-
-def _round_up_to_multiple(value: int, divisor: int) -> int:
-    return max(divisor, int(math.ceil(value / max(divisor, 1))) * max(divisor, 1))
-
-
 class ConvGNAct(nn.Sequential):
     def __init__(
         self,
@@ -75,20 +67,12 @@ class GroupedCBAMEnhancer(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
-        if channels % num_groups != 0:
-            raise ValueError(
-                f"channels={channels} must be divisible by num_groups={num_groups}"
-            )
-        reduced = _round_up_to_multiple(
-            max(channels // max(reduction_ratio, 1), num_groups),
-            num_groups,
-        )
+        reduced = max(channels // max(reduction_ratio, 1), 1)
         self.channel_mlp = nn.Sequential(
             nn.Conv2d(
                 channels,
                 reduced,
                 kernel_size=1,
-                groups=num_groups,
                 bias=False,
             ),
             nn.GELU(),
@@ -96,10 +80,8 @@ class GroupedCBAMEnhancer(nn.Module):
                 reduced,
                 channels,
                 kernel_size=1,
-                groups=num_groups,
                 bias=True,
             ),
-            nn.Sigmoid(),
         )
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(
@@ -116,7 +98,9 @@ class GroupedCBAMEnhancer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         avg_pool = F.adaptive_avg_pool2d(x, output_size=1)
         max_pool = F.adaptive_max_pool2d(x, output_size=1)
-        channel_gate = self.channel_mlp(avg_pool + max_pool)
+        avg_out = self.channel_mlp(avg_pool)
+        max_out = self.channel_mlp(max_pool)
+        channel_gate = torch.sigmoid(avg_out + max_out)
         channel_refined = x * channel_gate
 
         spatial_input = torch.cat(
@@ -222,15 +206,23 @@ class OilSpillHybridDecoder(nn.Module):
     def __init__(self, config: SegformerConfig, decoder_cfg: dict) -> None:
         super().__init__()
         hidden_sizes = list(config.hidden_sizes)
-        decoder_channels = int(decoder_cfg.get("channels", 192))
+        decoder_channels = int(
+            decoder_cfg.get("channels", getattr(config, "decoder_hidden_size", 256))
+        )
         gce_groups = int(decoder_cfg.get("gce_groups", 8))
         gce_reduction = int(decoder_cfg.get("gce_reduction", 4))
         spatial_kernel = int(decoder_cfg.get("spatial_kernel", 7))
         aspp_dilations = [int(v) for v in decoder_cfg.get("aspp_dilations", [1, 6, 12, 18])]
         dropout = float(decoder_cfg.get("dropout", 0.1))
-        aux_heads = {
-            str(level).lower() for level in decoder_cfg.get("esem_aux_heads", ["s16", "s8"])
-        }
+        aux_enabled = bool(decoder_cfg.get("auxiliary_enabled", False))
+        aux_heads = (
+            {
+                str(level).lower()
+                for level in decoder_cfg.get("esem_aux_heads", ["s16", "s8"])
+            }
+            if aux_enabled
+            else set()
+        )
 
         self.projections = nn.ModuleList(
             [

@@ -253,12 +253,6 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "inference.multiscale.enabled during training validation."
         )
 
-    if train_profile in {"fast", "full"} and eval_profile in {"fast", "full"}:
-        if train_profile != eval_profile:
-            warnings_list.append(
-                "training.validation_profile differs from evaluation.profile; this is "
-                "allowed but can produce different train-time vs final-eval metrics."
-            )
     return warnings_list
 
 

@@ -10,6 +10,15 @@ from constants import SHIP_CLASS_IDX
 logger = logging.getLogger(__name__)
 
 
+def _normalize_crop_source_image(image: np.ndarray) -> np.ndarray:
+    img_float = image.astype(np.float32)
+    if np.issubdtype(image.dtype, np.integer):
+        max_value = float(np.iinfo(image.dtype).max)
+        if max_value > 1.0:
+            img_float = img_float / max_value
+    return img_float
+
+
 def extract_ship_crops_from_image(
     image: np.ndarray,
     mask: np.ndarray,
@@ -27,9 +36,7 @@ def extract_ship_crops_from_image(
     )
 
     crops = []
-    img_float = image.astype(np.float32)
-    if img_float.max() > 1.0:
-        img_float = img_float / 255.0
+    img_float = _normalize_crop_source_image(image)
 
     for label_id in range(1, num_labels):  
         component = labels == label_id

@@ -350,8 +350,19 @@ class PredictionVisualizer:
         log_file: str,
         save_path: str,
         phase_boundaries: Optional[List[int]] = None,
+        baseline_miou: Optional[float] = None,
+        baseline_label: Optional[str] = None,
     ) -> None:
         phase_boundaries = phase_boundaries or [50, 150]
+        if baseline_miou is None:
+            baseline_miou = self.config.get("visualization", {}).get(
+                "training_curve_baseline_miou"
+            )
+        if baseline_label is None and baseline_miou is not None:
+            baseline_label = self.config.get("visualization", {}).get(
+                "training_curve_baseline_label",
+                f"Baseline ({float(baseline_miou):.2f}%)",
+            )
 
         epochs = []
         train_losses = []
@@ -475,14 +486,15 @@ class PredictionVisualizer:
         axes[1].set_title("Validation mIoU", fontsize=13, fontweight="bold")
         axes[1].grid(True, alpha=0.3)
 
-        axes[1].axhline(
-            y=65.06,
-            color="r",
-            linestyle="--",
-            alpha=0.7,
-            label="DeepLabv3+ Baseline (65.06%)",
-            linewidth=1.5,
-        )
+        if baseline_miou is not None:
+            axes[1].axhline(
+                y=float(baseline_miou),
+                color="r",
+                linestyle="--",
+                alpha=0.7,
+                label=baseline_label or f"Baseline ({float(baseline_miou):.2f}%)",
+                linewidth=1.5,
+            )
 
         axes[1].legend(fontsize=10)
 

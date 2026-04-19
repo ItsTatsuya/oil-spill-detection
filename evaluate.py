@@ -1,6 +1,7 @@
 import argparse
 import copy
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -14,6 +15,28 @@ from training.split import build_train_val_indices
 from utils.config import load_config, resolve_sar_stats_path, resolve_train_split
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_device() -> torch.device:
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return torch.device(f"cuda:{local_rank}")
+
+
+def _load_checkpoint_state_dict(
+    checkpoint: dict,
+    *,
+    use_ema_weights: bool,
+) -> tuple[dict, str]:
+    if use_ema_weights and "ema_state_dict" in checkpoint:
+        return (
+            checkpoint["ema_state_dict"]["shadow_state_dict"],
+            "ema_state_dict.shadow_state_dict",
+        )
+    return checkpoint["model_state_dict"], "model_state_dict"
 
 
 def parse_args():
@@ -75,7 +98,7 @@ def main():
     config = load_config(args.config)
     config.setdefault("evaluation", {})["prediction_dir"] = args.output_dir
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device()
     model = build_model(config)
 
     ckpt_path = Path(args.checkpoint)
@@ -83,9 +106,10 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     checkpoint = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
-    if args.use_ema_weights and "ema_state_dict" in checkpoint:
-        state_dict = checkpoint["ema_state_dict"]["shadow_state_dict"]
+    state_dict, state_dict_source = _load_checkpoint_state_dict(
+        checkpoint,
+        use_ema_weights=args.use_ema_weights,
+    )
 
     # Remove '_orig_mod.' prefix added by torch.compile
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
@@ -93,6 +117,11 @@ def main():
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
+    logger.info(
+        "Loaded checkpoint weights from %s onto %s.",
+        state_dict_source,
+        device,
+    )
 
     stats_path = resolve_sar_stats_path(config)
     sar_encoder = SARFeatureEncoder(config, stats_path=str(stats_path))

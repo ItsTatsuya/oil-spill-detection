@@ -37,6 +37,19 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _select_checkpoint_state_dict(
+    checkpoint: dict,
+    *,
+    prefer_ema: bool,
+) -> tuple[dict, str]:
+    if prefer_ema and "ema_state_dict" in checkpoint:
+        return (
+            checkpoint["ema_state_dict"]["shadow_state_dict"],
+            "ema_state_dict.shadow_state_dict",
+        )
+    return checkpoint["model_state_dict"], "model_state_dict"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train SAR semantic segmentation model"
@@ -272,7 +285,20 @@ def main():
         if best_ckpt.exists():
             ckpt = torch.load(str(best_ckpt), map_location="cpu", weights_only=False)
             unwrapped = model.module if hasattr(model, "module") else model
-            unwrapped.load_state_dict(ckpt["model_state_dict"])
+            state_dict, state_dict_source = _select_checkpoint_state_dict(
+                ckpt,
+                prefer_ema=bool(
+                    config.get("training", {})
+                    .get("model_ema", {})
+                    .get("enabled", False)
+                ),
+            )
+            unwrapped.load_state_dict(state_dict)
+            exp_logger.info(
+                "Final evaluation loaded %s from %s.",
+                state_dict_source,
+                best_ckpt.name,
+            )
         if args.final_eval_split == "test":
             eval_dataset = OilSpillDataset(
                 root=dataset_root,

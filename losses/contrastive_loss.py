@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,7 +14,6 @@ LOOKALIKE_CLASS = 2
 
 
 class OilLookalikeContrastiveLoss(nn.Module):
-
     def __init__(
         self,
         temperature: float = 0.07,
@@ -25,60 +25,22 @@ class OilLookalikeContrastiveLoss(nn.Module):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
 
-    def _sample_class_pixels(
-        self,
-        proj_feats: torch.Tensor,
-        labels: torch.Tensor,
-        class_idx: int,
-    ) -> torch.Tensor | None:
-        _, _, h, w = proj_feats.shape
-        labels_ds = F.interpolate(
-            labels.float().unsqueeze(1),
-            size=(h, w),
-            mode="nearest",
-        ).squeeze(1).long()
-        class_mask = labels_ds == class_idx
-        if not class_mask.any():
-            return None
-
-        feats_hwd = proj_feats.permute(0, 2, 3, 1)
-        selected = feats_hwd[class_mask]
-        n = selected.shape[0]
-        if n > self.max_pixels:
-            idx = torch.randperm(n, device=selected.device)[: self.max_pixels]
-            selected = selected[idx]
-        return selected
+        warnings.warn(
+            "OilLookalikeContrastiveLoss is deprecated. Use ConfusionAwareContrastiveLoss instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._delegate = ConfusionAwareContrastiveLoss(
+            temperature=self.temperature,
+            min_pixels=self.min_pixels,
+            sea_max_pixels=0,
+            oil_max_pixels=self.max_pixels,
+            look_max_pixels=self.max_pixels,
+            boundary_negative_margin_px=0,
+        )
 
     def forward(self, proj_feats: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        proj_norm = F.normalize(proj_feats, dim=1)
-
-        oil_feats = self._sample_class_pixels(proj_norm, labels, OIL_CLASS)
-        la_feats = self._sample_class_pixels(proj_norm, labels, LOOKALIKE_CLASS)
-
-        if oil_feats is None or la_feats is None:
-            return proj_feats.sum() * 0.0
-        if oil_feats.shape[0] < self.min_pixels or la_feats.shape[0] < self.min_pixels:
-            return proj_feats.sum() * 0.0
-
-        oil_sim = (oil_feats @ oil_feats.T) / self.temperature
-        cross_sim = (oil_feats @ la_feats.T) / self.temperature
-
-        n_oil = oil_feats.shape[0]
-        eye_mask = torch.eye(n_oil, dtype=torch.bool, device=oil_feats.device)
-
-        losses = []
-        for i in range(n_oil):
-            pos = oil_sim[i][~eye_mask[i]]
-            neg = cross_sim[i]
-            if pos.numel() == 0:
-                continue
-            pos_exp = torch.exp(pos).sum()
-            neg_exp = torch.exp(neg).sum()
-            losses.append(-torch.log(pos_exp / (pos_exp + neg_exp + 1e-8)))
-
-        if not losses:
-            return proj_feats.sum() * 0.0
-        return torch.stack(losses).mean()
+        return self._delegate(proj_feats, labels, seg_logits=None)
 
 
 @dataclass(frozen=True)
@@ -88,7 +50,6 @@ class ContrastiveBatch:
 
 
 class ConfusionAwareContrastiveLoss(nn.Module):
-
     def __init__(
         self,
         temperature: float = 0.07,
@@ -117,7 +78,11 @@ class ConfusionAwareContrastiveLoss(nn.Module):
 
         proj_norm = F.normalize(proj_feats, dim=1)
         labels_ds = self._resize_labels(labels, proj_feats.shape[-2:])
-        probs_ds = self._resize_probs(seg_logits, proj_feats.shape[-2:]) if seg_logits is not None else None
+        probs_ds = (
+            self._resize_probs(seg_logits, proj_feats.shape[-2:])
+            if seg_logits is not None
+            else None
+        )
 
         oil_feats = self._sample_class_pixels(
             proj_norm,
@@ -225,11 +190,17 @@ class ConfusionAwareContrastiveLoss(nn.Module):
         height, width = labels_ds.shape[-2:]
         margin_y = max(
             1,
-            int(round(self.boundary_negative_margin_px * height / max(original_hw[0], 1))),
+            int(
+                round(
+                    self.boundary_negative_margin_px * height / max(original_hw[0], 1)
+                )
+            ),
         )
         margin_x = max(
             1,
-            int(round(self.boundary_negative_margin_px * width / max(original_hw[1], 1))),
+            int(
+                round(self.boundary_negative_margin_px * width / max(original_hw[1], 1))
+            ),
         )
         margin = max(margin_y, margin_x)
         kernel = 2 * margin + 1
@@ -240,8 +211,7 @@ class ConfusionAwareContrastiveLoss(nn.Module):
                 kernel_size=kernel,
                 stride=1,
                 padding=margin,
-            )
-            .squeeze(1)
+            ).squeeze(1)
             > 0
         )
         near_boundary = near_boundary & sea_mask
@@ -293,9 +263,9 @@ class ConfusionAwareContrastiveLoss(nn.Module):
 
         exp_logits = torch.exp(logits) * logits_mask.float()
         log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
-        mean_log_prob_pos = (
-            positive_mask.float() * log_prob
-        ).sum(dim=1) / positive_counts.clamp(min=1).float()
+        mean_log_prob_pos = (positive_mask.float() * log_prob).sum(
+            dim=1
+        ) / positive_counts.clamp(min=1).float()
 
         valid = positive_counts > 0
         return -mean_log_prob_pos[valid].mean()

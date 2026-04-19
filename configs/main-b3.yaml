@@ -25,13 +25,13 @@ dataset:
 model:
   architecture: segformer
   segformer_decoder: hf_mlp
-  pretrained_name: nvidia/segformer-b2-finetuned-ade-512-512
+  pretrained_name: nvidia/segformer-b3-finetuned-ade-512-512
   require_local_pretrained: true
   pretrained_cache_dir: ./models/pretrained
   num_channels: 4
   num_labels: 5
   channel_init: rgb_mean_inflate
-  decoder_channels: 256
+  decoder_channels: 768
 
 sar_features:
   channel_1: amplitude
@@ -43,34 +43,34 @@ sar_features:
     enabled: true
 
 training:
-  num_epochs: 300
+  num_epochs: 400
   batch_size_per_gpu: 2
-  gradient_accumulation_steps: 4
-  effective_batch_size: 8
+  gradient_accumulation_steps: 8
+  effective_batch_size: 16
   num_workers: 6
   val_num_workers: 4
   cache_dataloaders_by_phase: true
   persistent_workers: true
   pin_memory: true
   precision: bf16
-  validation_profile: full
+  validation_profile: fast
   validate_every_n_epochs: 5
   save_every_n_epochs: 10
   keep_top_k_ema_checkpoints: 3
-  checkpoint_dir: ./checkpoints/segformer_b2
-  log_dir: ./logs/segformer_b2
+  checkpoint_dir: ./checkpoints/main_b3
+  log_dir: ./logs/main_b3
   gradient_clip_norm: 1.0
   progressive_schedule:
     1: 640
-  early_stop_start_epoch: 140
-  early_stop_patience_epochs: 35
+  early_stop_start_epoch: 250
+  early_stop_patience_epochs: 50
   early_stop_min_delta: 0.0005
   model_ema:
-    enabled: true
+    enabled: false
     decay: 0.9998
     update_after_step: 0
-    use_for_validation: true
-    save_best_ema: true
+    use_for_validation: false
+    save_best_ema: false
 
 optimizer:
   name: adamw
@@ -137,7 +137,12 @@ loss:
     ramp_end_epoch: 80
     downsample_factor: 4
   confusion_penalty:
-    weight: 0.12
+    weight: 0.15
+    penalize_pairs:
+      - [1, 2]                # Oil vs Look-alike
+      - [0, 1]                # Sea vs Oil
+      - [0, 2]                # Sea vs Look-alike
+    pair_weights: [1.6, 0.25, 0.65]  # <-- 0.65 attacks the 824k false Sea/Look-alike pixels
     ramp_start_epoch: 150
     ramp_end_epoch: 260
     margin_start: 0.1
@@ -155,7 +160,7 @@ curriculum:
     oil_spill_oversample_factor: 1.2
     look_alike_oversample_factor: 1.1
   phase_3:
-    epochs: [121, 300]
+    epochs: [121, 400]
     ship_oversample_factor: 2.2
     oil_spill_oversample_factor: 1.35
     look_alike_oversample_factor: 1.0
@@ -163,7 +168,7 @@ curriculum:
 
 inference:
   tta:
-    enabled: true
+    enabled: false
     augmentation_types:
       - original
       - horizontal_flip
@@ -175,11 +180,11 @@ inference:
       - hflip_rotate_270
     aggregation: mean_softmax
   multiscale:
-    enabled: true
+    enabled: false
     scales: [0.75, 1.0, 1.25]
     aggregation: mean_softmax
 
 evaluation:
-  profile: full
+  profile: fast
   save_predictions: true
-  prediction_dir: ./predictions/segformer_b2
+  prediction_dir: ./predictions/main_b3

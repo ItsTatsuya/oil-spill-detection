@@ -14,11 +14,11 @@ def extract_boundaries(
 ) -> torch.Tensor:
     B, H, W = mask.shape
 
-    invalid_mask = (mask < 0) | (mask >= num_classes)  
+    invalid_mask = (mask < 0) | (mask >= num_classes)
 
     safe_mask = mask.long().clamp(0, num_classes - 1)
-    one_hot = F.one_hot(safe_mask, num_classes).float()  
-    one_hot = one_hot.permute(0, 3, 1, 2)  
+    one_hot = F.one_hot(safe_mask, num_classes).float()
+    one_hot = one_hot.permute(0, 3, 1, 2)
 
     one_hot = one_hot * (~invalid_mask).unsqueeze(1).float()
 
@@ -40,7 +40,6 @@ def extract_boundaries(
 
 
 class BoundaryLoss(nn.Module):
-
     def __init__(
         self,
         num_classes: int = 5,
@@ -93,18 +92,25 @@ class BoundaryLoss(nn.Module):
         boundary_fine = extract_boundaries(targets, self.theta0, self.num_classes)
         boundary_coarse = extract_boundaries(targets, self.theta, self.num_classes)
 
-        boundary = (boundary_fine + boundary_coarse).clamp(0.0, 1.0)  
+        boundary = (boundary_fine + boundary_coarse).clamp(0.0, 1.0)
+        boundary_mass = boundary.sum(dim=1, keepdim=True)
+        boundary_pixels = boundary_mass > 0
 
-        if boundary.sum() < 1.0:
+        if not boundary_pixels.any():
             return probs.new_tensor(0.0)
 
-        with torch.amp.autocast(probs.device.type, enabled=False):
-            bce = F.binary_cross_entropy(
-                probs.float().clamp(1e-6, 1.0 - 1e-6),
-                boundary.float(),
-                reduction="none",
-            )  
+        target_dist = boundary / boundary_mass.clamp(min=1.0)
 
-        boundary_loss = (bce * boundary).sum() / boundary.sum().clamp(min=1.0)
+        with torch.amp.autocast(probs.device.type, enabled=False):
+            per_class_kl = F.kl_div(
+                probs.float().clamp(min=1e-6).log(),
+                target_dist.float(),
+                reduction="none",
+            )
+            per_pixel_kl = per_class_kl.sum(dim=1, keepdim=True)
+
+        boundary_loss = (
+            per_pixel_kl * boundary_pixels.float()
+        ).sum() / boundary_pixels.float().sum().clamp(min=1.0)
 
         return boundary_loss

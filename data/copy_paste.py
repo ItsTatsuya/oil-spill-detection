@@ -59,6 +59,7 @@ class CopyPasteAugmentation:
         self.match_local_intensity = bool(
             copy_paste_cfg.get("match_local_intensity", False)
         )
+        self.ignore_index = int(config.get("loss", {}).get("ce_ignore_index", -100))
 
         lib_path = library_path or resolve_ship_library_path(config)
         self.library_path = Path(lib_path)
@@ -290,12 +291,16 @@ class CopyPasteAugmentation:
     ) -> Tuple[Optional[int], Optional[int]]:
         allowed_target_mask = np.isin(mask, list(self.allowed_target_classes))
         for _ in range(50):  
-            y = np.random.randint(0, H - ch)
-            x = np.random.randint(0, W - cw)
+            max_y = max(H - ch, 0)
+            max_x = max(W - cw, 0)
+            y = 0 if max_y == 0 else int(np.random.randint(0, max_y + 1))
+            x = 0 if max_x == 0 else int(np.random.randint(0, max_x + 1))
 
             patch_mask = mask[y : y + ch, x : x + cw]
             target_pixels = patch_mask[ship_mask]
             if target_pixels.size == 0:
+                continue
+            if np.any(target_pixels == self.ignore_index):
                 continue
             if np.any(target_pixels == LAND_CLASS_IDX):
                 continue

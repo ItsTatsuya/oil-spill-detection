@@ -25,13 +25,13 @@ dataset:
 model:
   architecture: segformer
   segformer_decoder: hf_mlp
-  pretrained_name: nvidia/segformer-b3-finetuned-ade-512-512
+  pretrained_name: nvidia/segformer-b2-finetuned-ade-512-512
   require_local_pretrained: true
   pretrained_cache_dir: ./models/pretrained
   num_channels: 4
   num_labels: 5
   channel_init: rgb_mean_inflate
-  decoder_channels: 256
+  decoder_channels: 768
 
 sar_features:
   channel_1: amplitude
@@ -43,9 +43,9 @@ sar_features:
     enabled: true
 
 training:
-  num_epochs: 600
-  batch_size_per_gpu: 2
-  gradient_accumulation_steps: 8
+  num_epochs: 400
+  batch_size_per_gpu: 4
+  gradient_accumulation_steps: 4
   effective_batch_size: 16
   num_workers: 6
   val_num_workers: 4
@@ -54,15 +54,15 @@ training:
   pin_memory: true
   precision: bf16
   validation_profile: fast
-  validate_every_n_epochs: 5
+  validate_every_n_epochs: 2
   save_every_n_epochs: 10
   keep_top_k_ema_checkpoints: 3
-  checkpoint_dir: ./checkpoints/segformer-b3-v2
-  log_dir: ./logs/segformer-b3-v2
+  checkpoint_dir: ./checkpoints/main_b2
+  log_dir: ./logs/main_b2
   gradient_clip_norm: 1.0
   progressive_schedule:
     1: 640
-  early_stop_start_epoch: 475
+  early_stop_start_epoch: 250
   early_stop_patience_epochs: 50
   early_stop_min_delta: 0.0005
   model_ema:
@@ -70,14 +70,13 @@ training:
     decay: 0.9998
     update_after_step: 0
     use_for_validation: false
-    save_best_ema: true
+    save_best_ema: false
 
 optimizer:
   name: adamw
-  lr: 2.0e-05
-  head_lr_mult: 3.0
+  lr: 3.0e-05
+  head_lr_mult: 10.0
   weight_decay: 0.01
-  fused: auto
   betas: [0.9, 0.999]
   eps: 1.0e-08
 
@@ -129,21 +128,21 @@ loss:
   dice:
     smooth: 1.0
   lovasz:
-    weight: 0.35
+    weight: 0.75
     ramp_start_epoch: 21
     ramp_end_epoch: 80
   boundary:
-    weight: 0.60
+    weight: 0.15
     ramp_start_epoch: 21
     ramp_end_epoch: 80
     downsample_factor: 4
   confusion_penalty:
-    weight: 0.18
+    weight: 0.15
     penalize_pairs:
-      - [1, 2]    # Oil vs Look-alike
-      - [0, 1]    # Sea vs Oil
-      - [0, 2]    # Sea vs Look-alike
-    pair_weights: [1.6, 0.25, 0.45]
+      - [1, 2]                # Oil vs Look-alike
+      - [0, 1]                # Sea vs Oil
+      - [0, 2]                # Sea vs Look-alike
+    pair_weights: [1.6, 0.25, 0.65]  # <-- 0.65 attacks the 824k false Sea/Look-alike pixels
     ramp_start_epoch: 150
     ramp_end_epoch: 260
     margin_start: 0.1
@@ -161,26 +160,11 @@ curriculum:
     oil_spill_oversample_factor: 1.2
     look_alike_oversample_factor: 1.1
   phase_3:
-    epochs: [121, 250]
-    # The Confusion Penalty triggers here to separate Oil/Look-alike
+    epochs: [121, 400]
     ship_oversample_factor: 2.2
-    oil_spill_oversample_factor: 1.25
-    look_alike_oversample_factor: 1.25
-    ship_sampling_floor_multiplier: 1.0
-  phase_4:
-    epochs: [251, 450]
-    # The Soft Landing: Start re-introducing Land images naturally
-    ship_oversample_factor: 1.30
-    oil_spill_oversample_factor: 1.05
-    look_alike_oversample_factor: 1.05
-    ship_sampling_floor_multiplier: 1.0
-  phase_5:
-    epochs: [451, 600]
-    # The Coastline Finish: 100% natural distribution to perfect the Land class
-    ship_oversample_factor: 1.0
-    oil_spill_oversample_factor: 1.0
+    oil_spill_oversample_factor: 1.35
     look_alike_oversample_factor: 1.0
-    ship_sampling_floor_multiplier: 0.0 # Remove the floor constraint!
+    ship_sampling_floor_multiplier: 1.0
 
 inference:
   tta:
@@ -201,6 +185,6 @@ inference:
     aggregation: mean_softmax
 
 evaluation:
-  profile: full
+  profile: fast
   save_predictions: true
-  prediction_dir: ./predictions/segformer-b3-v2
+  prediction_dir: ./predictions/main_b2

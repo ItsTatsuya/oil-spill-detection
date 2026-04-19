@@ -69,7 +69,11 @@ class SegmentationMetrics:
 
         iou_per_class = tp / (tp + fp + fn + 1e-6)
         row_sums = cm.sum(axis=1)  
-        present = row_sums > 0
+        col_sums = cm.sum(axis=0)
+        # Count classes that appear either in the ground truth or in predictions.
+        # This penalizes hallucinated minority classes on empty scenes instead of
+        # excluding them from the mean IoU.
+        present = (row_sums > 0) | (col_sums > 0)
         mean_iou = float(iou_per_class[present].mean()) if present.any() else 0.0
 
         precision_per_class = tp / (tp + fp + 1e-6)

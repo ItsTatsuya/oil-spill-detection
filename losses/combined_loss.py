@@ -23,9 +23,9 @@ class CombinedLoss(nn.Module):
             if isinstance(dataset_counts, dict):
                 if all(name in dataset_counts for name in CLASS_NAMES):
                     pixel_counts = [int(dataset_counts[name]) for name in CLASS_NAMES]
-            elif isinstance(dataset_counts, (list, tuple)) and len(dataset_counts) == len(
-                CLASS_NAMES
-            ):
+            elif isinstance(dataset_counts, (list, tuple)) and len(
+                dataset_counts
+            ) == len(CLASS_NAMES):
                 pixel_counts = [int(value) for value in dataset_counts]
         hybrid_cfg = loss_cfg.get("hybrid_loss_weights", {})
         self.ce_weight = float(hybrid_cfg.get("ce", 1.0))
@@ -40,8 +40,11 @@ class CombinedLoss(nn.Module):
             int(idx) for idx in loss_cfg.get("ohem_class_indices", [])
         ]
         self.ohem_start_epoch = int(loss_cfg.get("ohem_start_epoch", 0))
+        dice_cfg = loss_cfg.get("dice", {})
         self.dice_loss = DiceLoss(
-            smooth=float(loss_cfg.get("dice", {}).get("smooth", 1.0))
+            smooth=float(dice_cfg.get("smooth", 1.0)),
+            ignore_index=self.ce_ignore_index,
+            aggregation=str(dice_cfg.get("aggregation", "per_image")),
         )
         self.focal_loss = FocalLoss(
             gamma=float(loss_cfg.get("focal", {}).get("gamma", 2.0)),
@@ -50,9 +53,7 @@ class CombinedLoss(nn.Module):
         )
         self.boundary_weight = float(loss_cfg.get("boundary", {}).get("weight", 0.0))
         boundary_cfg = loss_cfg.get("boundary", {})
-        self.boundary_ramp_start = int(
-            boundary_cfg.get("ramp_start_epoch", 0)
-        )
+        self.boundary_ramp_start = int(boundary_cfg.get("ramp_start_epoch", 0))
         self.boundary_ramp_end = int(
             boundary_cfg.get("ramp_end_epoch", self.boundary_ramp_start)
         )
@@ -63,12 +64,8 @@ class CombinedLoss(nn.Module):
             downsample_factor=int(boundary_cfg.get("downsample_factor", 1)),
         )
         confusion_cfg = loss_cfg.get("confusion_penalty", {})
-        self.confusion_weight = float(
-            confusion_cfg.get("weight", 0.0)
-        )
-        self.confusion_ramp_start = int(
-            confusion_cfg.get("ramp_start_epoch", 0)
-        )
+        self.confusion_weight = float(confusion_cfg.get("weight", 0.0))
+        self.confusion_ramp_start = int(confusion_cfg.get("ramp_start_epoch", 0))
         self.confusion_ramp_end = int(
             confusion_cfg.get("ramp_end_epoch", self.confusion_ramp_start)
         )
@@ -182,7 +179,11 @@ class CombinedLoss(nn.Module):
             if self.jaccard_weight > 0.0
             else logits.new_zeros(())
         )
-        return self.ce_weight * ce + self.dice_weight * dice + self.jaccard_weight * jaccard
+        return (
+            self.ce_weight * ce
+            + self.dice_weight * dice
+            + self.jaccard_weight * jaccard
+        )
 
     def get_boundary_weight(self, epoch: int) -> float:
         return self._scheduled_weight(
@@ -338,7 +339,18 @@ class CombinedLoss(nn.Module):
         targets: torch.Tensor,
     ) -> torch.Tensor:
         num_classes = probs.shape[1]
-        one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        valid_mask = targets != self.ce_ignore_index
+        if not valid_mask.any():
+            return probs.new_zeros(())
+
+        safe_targets = targets.clamp(min=0, max=num_classes - 1)
+        one_hot = (
+            F.one_hot(safe_targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        )
+        valid_mask_f = valid_mask.unsqueeze(1).float()
+        one_hot = one_hot * valid_mask_f
+        probs = probs * valid_mask_f
+
         intersection = (probs * one_hot).sum(dim=(0, 2, 3))
         union = (probs + one_hot - probs * one_hot).sum(dim=(0, 2, 3)).clamp(min=1e-6)
         return (1.0 - (intersection / union)).mean()

@@ -61,8 +61,7 @@ training:
   log_dir: ./logs/segformer_b2
   gradient_clip_norm: 1.0
   progressive_schedule:
-    1: 512
-    250: 576
+  1: 640
   early_stop_start_epoch: 220
   early_stop_patience_epochs: 45
   early_stop_min_delta: 0.0002
@@ -164,7 +163,7 @@ curriculum:
 
 inference:
   tta:
-    enabled: true
+    enabled: false
     augmentation_types:
       - original
       - horizontal_flip
@@ -176,7 +175,7 @@ inference:
       - hflip_rotate_270
     aggregation: mean_softmax
   multiscale:
-    enabled: true
+    enabled: false
     scales: [0.75, 1.0, 1.25]
     aggregation: mean_softmax
 

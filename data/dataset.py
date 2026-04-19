@@ -60,6 +60,25 @@ def rgb_mask_to_class_index(
     return class_indices.reshape(H, W)
 
 
+def remap_ignore_labels(
+    mask: np.ndarray,
+    *,
+    ignore_index: int,
+    mask_ignore_values: tuple[int, ...],
+) -> np.ndarray:
+    remapped = np.asarray(mask, dtype=np.int64).copy()
+    for raw_value in mask_ignore_values:
+        remapped[remapped == int(raw_value)] = ignore_index
+    valid = (remapped == ignore_index) | ((remapped >= 0) & (remapped < NUM_CLASSES))
+    if not np.all(valid):
+        invalid_values = np.unique(remapped[~valid]).tolist()
+        raise ValueError(
+            f"Mask contains unsupported class indices: {invalid_values}. "
+            f"Expected 0..{NUM_CLASSES - 1} or ignore values {mask_ignore_values}."
+        )
+    return np.ascontiguousarray(remapped)
+
+
 class OilSpillDataset(Dataset):
 
     @staticmethod
@@ -95,6 +114,15 @@ class OilSpillDataset(Dataset):
         dataset_cfg = config.get("dataset", {})
         self.class_colors = self._resolve_class_colors(dataset_cfg)
         self.allow_missing_masks = bool(dataset_cfg.get("allow_missing_masks", False))
+        self.ignore_index = int(config.get("loss", {}).get("ce_ignore_index", -100))
+        raw_ignore_values = dataset_cfg.get("mask_ignore_values")
+        if raw_ignore_values is None:
+            raw_ignore_values = dataset_cfg.get("mask_ignore_value")
+        if raw_ignore_values is None:
+            raw_ignore_values = [255] if self.ignore_index < 0 else [self.ignore_index]
+        elif not isinstance(raw_ignore_values, (list, tuple, set)):
+            raw_ignore_values = [raw_ignore_values]
+        self.mask_ignore_values = tuple(int(value) for value in raw_ignore_values)
         self.feature_cache_enabled = bool(
             config.get("sar_features", {}).get("cache", {}).get("enabled", False)
         )
@@ -388,7 +416,10 @@ class OilSpillDataset(Dataset):
             )
 
         if self.transform is not None:
-            transformed = self.transform(image=working_image, mask=mask.astype(np.uint8))
+            transformed = self.transform(
+                image=working_image,
+                mask=mask.astype(np.int32, copy=False),
+            )
             working_image = np.asarray(transformed["image"], dtype=np.float32)
             mask = np.asarray(transformed["mask"], dtype=np.int64)
 
@@ -547,10 +578,15 @@ class OilSpillDataset(Dataset):
         lbl_rgb = self.label_paths[idx]
 
         if lbl_1d is not None:
-            mask = cv2.imread(str(lbl_1d), cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(str(lbl_1d), cv2.IMREAD_UNCHANGED)
             if mask is not None:
-                mask = mask.astype(np.int64).clip(0, NUM_CLASSES - 1)
-                return mask
+                if mask.ndim == 3:
+                    mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+                return remap_ignore_labels(
+                    mask,
+                    ignore_index=self.ignore_index,
+                    mask_ignore_values=self.mask_ignore_values,
+                )
 
         if lbl_rgb is not None:
             rgb = cv2.imread(str(lbl_rgb))

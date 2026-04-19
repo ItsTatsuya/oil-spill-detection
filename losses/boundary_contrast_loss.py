@@ -11,7 +11,6 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 class BoundaryContrastLoss(nn.Module):
-
     def __init__(
         self,
         oil_class_idx: int = 1,
@@ -55,7 +54,9 @@ class BoundaryContrastLoss(nn.Module):
                 dtype=mask.dtype,
             )
             return kmorph.dilation(mask, kernel)
-        return F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=self.boundary_width)
+        return F.max_pool2d(
+            mask, kernel_size=kernel_size, stride=1, padding=self.boundary_width
+        )
 
     def _erode(self, mask: torch.Tensor) -> torch.Tensor:
         return 1.0 - self._dilate(1.0 - mask)
@@ -82,8 +83,12 @@ class BoundaryContrastLoss(nn.Module):
 
         for i in range(b):
             mask_i = labels_ds[i]
-            oil_region = (mask_i == self.oil_class_idx).float().unsqueeze(0).unsqueeze(0)
-            boundary_band = self._build_boundary_band(oil_region).squeeze(0).squeeze(0) > 0.5
+            oil_region = (
+                (mask_i == self.oil_class_idx).float().unsqueeze(0).unsqueeze(0)
+            )
+            boundary_band = (
+                self._build_boundary_band(oil_region).squeeze(0).squeeze(0) > 0.5
+            )
 
             oil_pixels = (mask_i == self.oil_class_idx) & boundary_band
             look_pixels = (mask_i == self.look_alike_class_idx) & boundary_band
@@ -94,8 +99,12 @@ class BoundaryContrastLoss(nn.Module):
                 continue
 
             sample_count = min(self.max_samples, oil_feat.shape[0], look_feat.shape[0])
-            oil_perm = torch.randperm(oil_feat.shape[0], device=oil_feat.device)[:sample_count]
-            look_perm = torch.randperm(look_feat.shape[0], device=look_feat.device)[:sample_count]
+            oil_perm = torch.randperm(oil_feat.shape[0], device=oil_feat.device)[
+                :sample_count
+            ]
+            look_perm = torch.randperm(look_feat.shape[0], device=look_feat.device)[
+                :sample_count
+            ]
 
             oil_feat = oil_feat[oil_perm]
             look_feat = look_feat[look_perm]
@@ -103,7 +112,7 @@ class BoundaryContrastLoss(nn.Module):
             oil_feat = F.normalize(oil_feat, p=2, dim=1)
             look_feat = F.normalize(look_feat, p=2, dim=1)
 
-            cosine_pairs = F.cosine_similarity(oil_feat, look_feat, dim=1)
+            cosine_pairs = torch.mm(oil_feat, look_feat.t())
             batch_losses.append(F.relu(cosine_pairs - self.margin).mean())
 
         if not batch_losses:

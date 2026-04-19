@@ -190,6 +190,8 @@ def _build_hf_config(
     hf_config.num_channels = num_channels
     hf_config.return_dict = True
     hf_config.output_hidden_states = False
+    if "decoder_channels" in model_cfg and hasattr(hf_config, "decoder_hidden_size"):
+        hf_config.decoder_hidden_size = int(model_cfg["decoder_channels"])
     hf_config.semantic_loss_ignore_index = int(
         config.get("loss", {}).get("ce_ignore_index", -100)
     )
@@ -306,11 +308,10 @@ def _build_custom_segformer_model(config: dict) -> CustomSegformerModel:
     hf_config = _build_hf_config(spec, config, pretrained_source, local_files_only)
 
     decoder_dim = int(model_cfg.get("decoder_channels", 256))
-    decoder_dropout = float(model_cfg.get("decoder_dropout", 0.1))
     model = CustomSegformerModel(
         hf_config,
         decoder_dim=decoder_dim,
-        dropout_prob=decoder_dropout,
+        dropout_prob=0.1,
     )
 
     num_channels = int(model_cfg.get("num_channels", 4))
@@ -354,7 +355,9 @@ def _build_oilspill_hybrid_segformer_model(config: dict) -> SegformerOilSpillHyb
     pretrained_source, local_files_only = _resolve_pretrained_source(config)
     hf_config = _build_hf_config(spec, config, pretrained_source, local_files_only)
 
-    decoder_cfg = model_cfg.get("hybrid_decoder", {})
+    decoder_cfg = dict(model_cfg.get("hybrid_decoder", {}))
+    auxiliary_cfg = config.get("loss", {}).get("auxiliary", {})
+    decoder_cfg.setdefault("auxiliary_enabled", bool(auxiliary_cfg.get("enabled", False)))
     model = SegformerOilSpillHybridModel(hf_config, decoder_cfg)
 
     num_channels = int(model_cfg.get("num_channels", 4))
