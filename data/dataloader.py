@@ -80,6 +80,16 @@ class CurriculumDataLoaderFactory:
         self.num_workers = train_cfg.get("num_workers", 8)
         self.pin_memory = train_cfg.get("pin_memory", True)
         self.cache_by_phase = bool(train_cfg.get("cache_dataloaders_by_phase", True))
+        self.land_rich_min_fraction = self._safe_ratio(
+            train_cfg.get("land_rich_min_fraction", 0.08),
+            key="training.land_rich_min_fraction",
+            default=0.08,
+        )
+        self.land_rich_sampling_floor_ratio = self._safe_ratio(
+            train_cfg.get("land_rich_sampling_floor_ratio", 0.0),
+            key="training.land_rich_sampling_floor_ratio",
+            default=0.0,
+        )
         self.persistent_workers = bool(
             train_cfg.get(
                 "persistent_workers",
@@ -104,8 +114,17 @@ class CurriculumDataLoaderFactory:
         self._ship_image_indices = [
             i for i, meta in enumerate(dataset.metadata) if meta["has_ship"]
         ]
+        self._land_rich_indices = self._resolve_land_rich_indices(
+            min_fraction=self.land_rich_min_fraction
+        )
         logger.info(
             f"Ship images in training set: {len(self._ship_image_indices)}/{len(dataset)}"
+        )
+        logger.info(
+            "Land-rich sampling candidates: %d/%d (min_land_fraction=%.4f)",
+            len(self._land_rich_indices),
+            len(dataset),
+            self.land_rich_min_fraction,
         )
 
         self._current_phase = None
@@ -353,6 +372,22 @@ class CurriculumDataLoaderFactory:
         ship_sampling_floor_multiplier = float(
             phase_cfg.get("ship_sampling_floor_multiplier", 1.0)
         )
+        land_rich_min_fraction = self._safe_ratio(
+            phase_cfg.get("land_rich_min_fraction", self.land_rich_min_fraction),
+            key=f"curriculum.phase_{phase}.land_rich_min_fraction",
+            default=self.land_rich_min_fraction,
+        )
+        land_rich_sampling_floor_ratio = self._safe_ratio(
+            phase_cfg.get(
+                "land_rich_sampling_floor_ratio",
+                self.land_rich_sampling_floor_ratio,
+            ),
+            key=f"curriculum.phase_{phase}.land_rich_sampling_floor_ratio",
+            default=self.land_rich_sampling_floor_ratio,
+        )
+        land_rich_sampling_floor_ratio = float(
+            min(0.95, max(0.0, land_rich_sampling_floor_ratio))
+        )
 
         weights = self._per_image_weights.copy()
         for idx, meta in enumerate(self.dataset.metadata):
@@ -372,17 +407,104 @@ class CurriculumDataLoaderFactory:
                 if weights[idx] < floor_weight:
                     weights[idx] = floor_weight
 
+        land_rich_indices = self._resolve_land_rich_indices(
+            min_fraction=land_rich_min_fraction
+        )
+        if land_rich_sampling_floor_ratio > 0.0 and land_rich_indices:
+            land_idx = np.asarray(land_rich_indices, dtype=np.int64)
+            land_mask = np.zeros(len(weights), dtype=bool)
+            land_mask[land_idx] = True
+
+            total_mass = float(weights.sum())
+            land_mass = float(weights[land_mask].sum())
+            if total_mass <= 0.0 or land_mass <= 0.0:
+                weights[land_mask] = weights[land_mask] + 1e-8
+                total_mass = float(weights.sum())
+                land_mass = float(weights[land_mask].sum())
+
+            if total_mass > 0.0 and land_mass > 0.0:
+                land_ratio = land_mass / total_mass
+            else:
+                land_ratio = 0.0
+
+            if land_ratio < land_rich_sampling_floor_ratio:
+                non_land_mass = float(weights[~land_mask].sum())
+                if non_land_mass > 0.0:
+                    denom = (1.0 - land_rich_sampling_floor_ratio) * max(
+                        land_mass, 1e-12
+                    )
+                    scale_land = (land_rich_sampling_floor_ratio * non_land_mass) / max(
+                        denom, 1e-12
+                    )
+                    weights[land_mask] *= max(scale_land, 1.0)
+
         weights = weights / weights.sum()
         return weights
+
+    def _resolve_land_rich_indices(self, min_fraction: float) -> list[int]:
+        land_rich_indices: list[int] = []
+        for idx, meta in enumerate(self.dataset.metadata):
+            pixel_fractions = meta.get("pixel_fractions", {})
+            land_fraction = 0.0
+            if isinstance(pixel_fractions, Mapping):
+                land_fraction = float(pixel_fractions.get("land", 0.0))
+            elif isinstance(pixel_fractions, Sequence) and len(pixel_fractions) == len(
+                CLASS_NAMES
+            ):
+                land_fraction = float(pixel_fractions[CLASS_NAMES.index("land")])
+
+            if land_fraction >= min_fraction:
+                land_rich_indices.append(idx)
+
+        if land_rich_indices:
+            return land_rich_indices
+
+        return [
+            idx
+            for idx, meta in enumerate(self.dataset.metadata)
+            if bool(meta.get("has_land", False))
+        ]
+
+    def _safe_ratio(self, raw_value: Any, *, key: str, default: float) -> float:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; defaulting to %.4f", key, raw_value, default)
+            return float(default)
+        if not np.isfinite(value):
+            logger.warning(
+                "Non-finite %s=%r; defaulting to %.4f", key, raw_value, default
+            )
+            return float(default)
+        return float(value)
 
     def _log_phase_transition(self, new_phase: int, epoch: int) -> None:
         phase_cfg = self.curriculum_cfg.get(f"phase_{new_phase}", {})
         n_ship = len(self._ship_image_indices)
+        land_min_fraction = self._safe_ratio(
+            phase_cfg.get("land_rich_min_fraction", self.land_rich_min_fraction),
+            key=f"curriculum.phase_{new_phase}.land_rich_min_fraction",
+            default=self.land_rich_min_fraction,
+        )
+        land_floor = self._safe_ratio(
+            phase_cfg.get(
+                "land_rich_sampling_floor_ratio",
+                self.land_rich_sampling_floor_ratio,
+            ),
+            key=f"curriculum.phase_{new_phase}.land_rich_sampling_floor_ratio",
+            default=self.land_rich_sampling_floor_ratio,
+        )
+        n_land_rich = len(
+            self._resolve_land_rich_indices(min_fraction=land_min_fraction)
+        )
         desc = (
             f"Configured phase sampling ({n_ship} ship images "
             f"ship={phase_cfg.get('ship_oversample_factor', 1.0)}x, "
             f"oil={phase_cfg.get('oil_spill_oversample_factor', 1.0)}x, "
             f"look_alike={phase_cfg.get('look_alike_oversample_factor', 1.0)}x, "
-            f"ship_floor={phase_cfg.get('ship_sampling_floor_multiplier', 1.0)}x)"
+            f"ship_floor={phase_cfg.get('ship_sampling_floor_multiplier', 1.0)}x, "
+            f"land_rich_floor={land_floor:.2f}, "
+            f"land_rich_min_frac={land_min_fraction:.3f}, "
+            f"land_rich_candidates={n_land_rich})"
         )
         logger.info(f"=== Curriculum Phase {new_phase} (epoch {epoch}): {desc} ===")

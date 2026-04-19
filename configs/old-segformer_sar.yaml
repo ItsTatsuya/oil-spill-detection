@@ -43,7 +43,7 @@ sar_features:
     enabled: true
 
 training:
-  num_epochs: 400
+  num_epochs: 300
   batch_size_per_gpu: 4
   gradient_accumulation_steps: 4
   effective_batch_size: 16
@@ -52,27 +52,25 @@ training:
   cache_dataloaders_by_phase: true
   persistent_workers: true
   pin_memory: true
-  land_rich_sampling_floor_ratio: 0.15
-  land_rich_min_fraction: 0.08
   precision: bf16
-  validation_profile: fast
-  validate_every_n_epochs: 2
+  validation_profile: full
+  validate_every_n_epochs: 5
   save_every_n_epochs: 10
   keep_top_k_ema_checkpoints: 3
-  checkpoint_dir: ./checkpoints/main_b2
-  log_dir: ./logs/main_b2
+  checkpoint_dir: ./checkpoints/segformer_b2
+  log_dir: ./logs/segformer_b2
   gradient_clip_norm: 1.0
   progressive_schedule:
     1: 640
-  early_stop_start_epoch: 250
-  early_stop_patience_epochs: 50
+  early_stop_start_epoch: 140
+  early_stop_patience_epochs: 35
   early_stop_min_delta: 0.0005
   model_ema:
-    enabled: false
+    enabled: true
     decay: 0.9998
     update_after_step: 0
-    use_for_validation: false
-    save_best_ema: false
+    use_for_validation: true
+    save_best_ema: true
 
 optimizer:
   name: adamw
@@ -95,8 +93,7 @@ augmentation:
       ship: 0.20
       oil_spill: 0.35
       look_alike: 0.25
-      land: 0.15
-      random: 0.05
+      random: 0.20
     horizontal_flip_prob: 0.5
     vertical_flip_prob: 0.3
     rotation_degrees: 15
@@ -114,8 +111,6 @@ augmentation:
         - oil_spill
       min_allowed_target_fraction: 0.85
       match_local_intensity: true
-      land_overlap_paste_prob: 0.10
-      max_land_overlap_fraction: 0.20
   test:
     resize: 640
 
@@ -142,12 +137,7 @@ loss:
     ramp_end_epoch: 80
     downsample_factor: 4
   confusion_penalty:
-    weight: 0.15
-    penalize_pairs:
-      - [1, 2]                # Oil vs Look-alike
-      - [0, 1]                # Sea vs Oil
-      - [0, 2]                # Sea vs Look-alike
-    pair_weights: [1.6, 0.25, 0.65]  # <-- 0.65 attacks the 824k false Sea/Look-alike pixels
+    weight: 0.12
     ramp_start_epoch: 150
     ramp_end_epoch: 260
     margin_start: 0.1
@@ -165,7 +155,7 @@ curriculum:
     oil_spill_oversample_factor: 1.2
     look_alike_oversample_factor: 1.1
   phase_3:
-    epochs: [121, 400]
+    epochs: [121, 300]
     ship_oversample_factor: 2.2
     oil_spill_oversample_factor: 1.35
     look_alike_oversample_factor: 1.0
@@ -192,4 +182,4 @@ inference:
 evaluation:
   profile: fast
   save_predictions: true
-  prediction_dir: ./predictions/main_b2
+  prediction_dir: ./predictions/segformer_b2

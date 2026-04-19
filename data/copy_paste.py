@@ -19,24 +19,22 @@ LAND_CLASS_IDX = 4
 
 
 class ShipCrop:
-
     def __init__(
         self,
         image_patch: np.ndarray,
         mask_patch: np.ndarray,
         source_path: str,
-        bbox: Tuple[int, int, int, int],  
+        bbox: Tuple[int, int, int, int],
         pixel_count: int,
     ) -> None:
-        self.image_patch = image_patch  
-        self.mask_patch = mask_patch  
+        self.image_patch = image_patch
+        self.mask_patch = mask_patch
         self.source_path = source_path
         self.bbox = bbox
         self.pixel_count = pixel_count
 
 
 class CopyPasteAugmentation:
-
     _LIBRARY_VERSION = 5
 
     def __init__(self, config: dict, library_path: Optional[str] = None) -> None:
@@ -52,12 +50,22 @@ class CopyPasteAugmentation:
         allowed_classes = copy_paste_cfg.get(
             "allowed_target_classes", ["sea_surface", "oil_spill"]
         )
-        self.allowed_target_classes = self._resolve_allowed_target_classes(allowed_classes)
+        self.allowed_target_classes = self._resolve_allowed_target_classes(
+            allowed_classes
+        )
         self.min_allowed_target_fraction = float(
             copy_paste_cfg.get("min_allowed_target_fraction", 0.85)
         )
         self.match_local_intensity = bool(
             copy_paste_cfg.get("match_local_intensity", False)
+        )
+        self.land_overlap_paste_prob = self._safe_probability(
+            copy_paste_cfg.get("land_overlap_paste_prob", 0.0),
+            key="augmentation.train.copy_paste.land_overlap_paste_prob",
+        )
+        self.max_land_overlap_fraction = self._safe_probability(
+            copy_paste_cfg.get("max_land_overlap_fraction", 0.2),
+            key="augmentation.train.copy_paste.max_land_overlap_fraction",
         )
         self.ignore_index = int(config.get("loss", {}).get("ce_ignore_index", -100))
 
@@ -123,11 +131,11 @@ class CopyPasteAugmentation:
                 ship_binary, connectivity=8
             )
 
-            for label_id in range(1, num_labels):  
+            for label_id in range(1, num_labels):
                 component_mask = labels == label_id
                 pixel_count = int(component_mask.sum())
 
-                if pixel_count < 3:  
+                if pixel_count < 3:
                     continue
 
                 rows = np.where(component_mask.any(axis=1))[0]
@@ -242,6 +250,7 @@ class CopyPasteAugmentation:
                 cw,
                 H,
                 W,
+                allow_land_overlap=(np.random.random() < self.land_overlap_paste_prob),
             )
             if paste_y is None:
                 continue
@@ -288,9 +297,12 @@ class CopyPasteAugmentation:
         cw: int,
         H: int,
         W: int,
+        allow_land_overlap: bool = False,
     ) -> Tuple[Optional[int], Optional[int]]:
         allowed_target_mask = np.isin(mask, list(self.allowed_target_classes))
-        for _ in range(50):  
+        if allow_land_overlap:
+            allowed_target_mask = allowed_target_mask | (mask == LAND_CLASS_IDX)
+        for _ in range(50):
             max_y = max(H - ch, 0)
             max_x = max(W - cw, 0)
             y = 0 if max_y == 0 else int(np.random.randint(0, max_y + 1))
@@ -302,13 +314,18 @@ class CopyPasteAugmentation:
                 continue
             if np.any(target_pixels == self.ignore_index):
                 continue
-            if np.any(target_pixels == LAND_CLASS_IDX):
+            land_overlap_fraction = float(np.mean(target_pixels == LAND_CLASS_IDX))
+            if not allow_land_overlap and land_overlap_fraction > 0.0:
+                continue
+            if (
+                allow_land_overlap
+                and land_overlap_fraction > self.max_land_overlap_fraction
+            ):
                 continue
             if np.any(target_pixels == SHIP_CLASS_IDX):
                 continue
-            if (
-                LOOK_ALIKE_CLASS_IDX not in self.allowed_target_classes
-                and np.any(target_pixels == LOOK_ALIKE_CLASS_IDX)
+            if LOOK_ALIKE_CLASS_IDX not in self.allowed_target_classes and np.any(
+                target_pixels == LOOK_ALIKE_CLASS_IDX
             ):
                 continue
             allowed_fraction = float(
@@ -319,6 +336,17 @@ class CopyPasteAugmentation:
             return y, x
 
         return None, None
+
+    def _safe_probability(self, raw_value: Any, *, key: str) -> float:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; defaulting to 0.0", key, raw_value)
+            return 0.0
+        if not np.isfinite(value):
+            logger.warning("Non-finite %s=%r; defaulting to 0.0", key, raw_value)
+            return 0.0
+        return float(np.clip(value, 0.0, 1.0))
 
     def _paste_with_blur(
         self,
@@ -338,7 +366,7 @@ class CopyPasteAugmentation:
             sigmaX=kernel_size / 2,
         )
         if image.ndim == 3:
-            blend_weight = blend_weight[:, :, np.newaxis]  
+            blend_weight = blend_weight[:, :, np.newaxis]
 
         blend_weight = blend_weight.clip(0.0, 1.0)
 
@@ -380,4 +408,3 @@ class CopyPasteAugmentation:
         matched = (patch_float - patch_mean) / np.maximum(patch_std, 1e-6)
         matched = matched * np.maximum(target_std, 1e-6) + target_mean
         return matched.clip(0.0, 1.0).astype(np.float32)
-

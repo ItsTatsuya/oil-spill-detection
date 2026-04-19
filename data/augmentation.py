@@ -20,6 +20,7 @@ RARE_CLASS_TO_INDEX = {
     "oil_spill": CLASS_NAMES.index("oil_spill"),
     "look_alike": CLASS_NAMES.index("look_alike"),
     "ship": CLASS_NAMES.index("ship"),
+    "land": CLASS_NAMES.index("land"),
 }
 
 
@@ -31,7 +32,10 @@ def get_input_normalize_stats(
         raise ValueError(f"num_channels must be positive, got {num_channels}")
     mean = [0.0] * num_channels
     std = [1.0] * num_channels
-    if amplitude_channel_index is not None and 0 <= amplitude_channel_index < num_channels:
+    if (
+        amplitude_channel_index is not None
+        and 0 <= amplitude_channel_index < num_channels
+    ):
         mean[amplitude_channel_index] = float(IMAGENET_MEAN[0])
         std[amplitude_channel_index] = float(IMAGENET_STD[0])
     return mean, std
@@ -39,7 +43,9 @@ def get_input_normalize_stats(
 
 def get_config_normalize_stats(config: dict) -> tuple[list[float], list[float]]:
     channel_names = resolve_sar_channel_names(config)
-    amplitude_idx = channel_names.index("amplitude") if "amplitude" in channel_names else None
+    amplitude_idx = (
+        channel_names.index("amplitude") if "amplitude" in channel_names else None
+    )
     return get_input_normalize_stats(
         resolve_model_num_channels(config),
         amplitude_channel_index=amplitude_idx,
@@ -58,7 +64,9 @@ class SpeckleNoise(ImageOnlyTransform):
     def apply(self, image: np.ndarray, scale: float = 0.1, **kwargs) -> np.ndarray:
         original_dtype = image.dtype
         img_float = image.astype(np.float32)
-        noise = np.random.rayleigh(scale=scale, size=img_float.shape[:2]).astype(np.float32)
+        noise = np.random.rayleigh(scale=scale, size=img_float.shape[:2]).astype(
+            np.float32
+        )
         noise = noise / (scale * np.sqrt(np.pi / 2.0))
         if img_float.ndim == 3:
             noise = noise[:, :, np.newaxis]
@@ -83,10 +91,15 @@ class ClassAwareCropper:
         self.ignore_index = int(config.get("loss", {}).get("ce_ignore_index", -100))
         probs = train_cfg.get("class_aware_crop_probs", {})
         self.class_probs = {
-            "ship": float(probs.get("ship", 0.25)),
-            "oil_spill": float(probs.get("oil_spill", 0.25)),
-            "look_alike": float(probs.get("look_alike", 0.25)),
-            "random": float(probs.get("random", 0.25)),
+            "ship": self._safe_nonnegative_prob(probs.get("ship", 0.25), "ship"),
+            "oil_spill": self._safe_nonnegative_prob(
+                probs.get("oil_spill", 0.25), "oil_spill"
+            ),
+            "look_alike": self._safe_nonnegative_prob(
+                probs.get("look_alike", 0.25), "look_alike"
+            ),
+            "land": self._safe_nonnegative_prob(probs.get("land", 0.0), "land"),
+            "random": self._safe_nonnegative_prob(probs.get("random", 0.25), "random"),
         }
 
     @property
@@ -105,13 +118,17 @@ class ClassAwareCropper:
 
         image_padded, mask_padded = self._pad_if_needed(image, mask, crop_size)
         if not self.enabled:
-            return self._random_crop(image_padded, mask_padded, crop_size, "random-context")
+            return self._random_crop(
+                image_padded, mask_padded, crop_size, "random-context"
+            )
 
         crop_mode = self._sample_crop_mode()
         class_name = crop_mode.replace("-centric", "")
         class_idx = RARE_CLASS_TO_INDEX.get(class_name)
         if class_idx is not None:
-            class_crop = self._class_crop(image_padded, mask_padded, crop_size, class_idx, crop_mode)
+            class_crop = self._class_crop(
+                image_padded, mask_padded, crop_size, class_idx, crop_mode
+            )
             if class_crop is not None:
                 return class_crop
 
@@ -131,12 +148,19 @@ class ClassAwareCropper:
         return self._random_crop(image_padded, mask_padded, crop_size, "random-context")
 
     def _sample_crop_mode(self) -> str:
-        modes = ["ship-centric", "oil_spill-centric", "look_alike-centric", "random-context"]
+        modes = [
+            "ship-centric",
+            "oil_spill-centric",
+            "look_alike-centric",
+            "land-centric",
+            "random-context",
+        ]
         weights = np.array(
             [
                 self.class_probs["ship"],
                 self.class_probs["oil_spill"],
                 self.class_probs["look_alike"],
+                self.class_probs["land"],
                 self.class_probs["random"],
             ],
             dtype=np.float64,
@@ -145,6 +169,25 @@ class ClassAwareCropper:
             return "random-context"
         weights = weights / weights.sum()
         return str(np.random.choice(modes, p=weights))
+
+    def _safe_nonnegative_prob(self, raw_value: Any, key: str) -> float:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid class_aware_crop_probs[%s]=%r; defaulting to 0.0",
+                key,
+                raw_value,
+            )
+            return 0.0
+        if not np.isfinite(value) or value < 0.0:
+            logger.warning(
+                "Non-finite or negative class_aware_crop_probs[%s]=%r; clamping to 0.0",
+                key,
+                raw_value,
+            )
+            return 0.0
+        return value
 
     def _sample_fallback_class(
         self,
@@ -173,7 +216,9 @@ class ClassAwareCropper:
         if positions.size == 0:
             return None
         center_y, center_x = positions[np.random.randint(len(positions))]
-        return self._crop_around_center(image, mask, crop_size, int(center_y), int(center_x), crop_mode)
+        return self._crop_around_center(
+            image, mask, crop_size, int(center_y), int(center_x), crop_mode
+        )
 
     def _random_crop(
         self,
@@ -270,8 +315,9 @@ class SARSegmentationAugmentation:
         self.train_cfg = aug_cfg.get("train", {})
         self.test_cfg = aug_cfg.get("test", {})
 
-    def get_train_transform(self, crop_size_override: Optional[int] = None) -> A.Compose:
-        crop_size = int(crop_size_override or self.train_cfg.get("crop_size", 512))
+    def get_train_transform(
+        self, crop_size_override: Optional[int] = None
+    ) -> A.Compose:
         rotation_deg = float(self.train_cfg.get("rotation_degrees", 15))
 
         transforms_list = [
@@ -322,7 +368,9 @@ class SARSegmentationAugmentation:
         return self.get_train_transform(crop_size_override=new_size)
 
 
-def get_progressive_crop_size(epoch: int, schedule: Optional[Dict[int, int]] = None) -> int:
+def get_progressive_crop_size(
+    epoch: int, schedule: Optional[Dict[int, int]] = None
+) -> int:
     if schedule is None:
         schedule = {1: 512, 41: 576}
     for threshold in sorted(schedule.keys(), reverse=True):
