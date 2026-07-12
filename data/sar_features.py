@@ -25,7 +25,8 @@ def compute_glcm_contrast(
     levels: int = 32,
     distances: list[int] | None = None,
     angles: list[float] | None = None,
-    stride: int = 64,
+    # stride=8 keeps texture spatial detail (old default 64 was too coarse for slicks).
+    stride: int = 8,
 ) -> np.ndarray:
     if distances is None:
         distances = [1]
@@ -126,6 +127,7 @@ class SARFeatureEncoder:
     def _resolve_stats_metadata(self) -> dict:
         dataset_cfg = self.config.get("dataset", {})
         dataset_root = Path(dataset_cfg.get("root", "./dataset")).expanduser().resolve()
+        glcm_stride = int(self.config.get("sar_features", {}).get("glcm_stride", 8))
         return {
             "signature": resolve_dataset_signature(self.config),
             "dataset_root": str(dataset_root),
@@ -134,6 +136,7 @@ class SARFeatureEncoder:
             "input_channels": int(resolve_model_num_channels(self.config)),
             "channel_schema_version": resolve_channel_schema_version(self.config),
             "channel_names": list(self.channel_names),
+            "glcm_stride": glcm_stride,
         }
 
     def _validate_loaded_metadata(self, stats: dict) -> None:
@@ -163,6 +166,23 @@ class SARFeatureEncoder:
             raise RuntimeError(
                 "SAR stats dataset root mismatch. "
                 f"File={file_dataset_root!r}, expected={expected['dataset_root']!r}."
+            )
+
+        file_glcm_stride = stats.get("glcm_stride")
+        if file_glcm_stride is not None and int(file_glcm_stride) != int(
+            expected["glcm_stride"]
+        ):
+            raise RuntimeError(
+                "SAR stats glcm_stride mismatch. "
+                f"File={file_glcm_stride!r}, expected={expected['glcm_stride']!r}. "
+                "Delete the stats file and regenerate after changing glcm_stride."
+            )
+        if file_glcm_stride is None and "glcm_contrast" in self.channel_names:
+            logger.warning(
+                "SAR stats file %s has no glcm_stride metadata. "
+                "Assuming it matches config glcm_stride=%s.",
+                self.stats_path,
+                expected["glcm_stride"],
             )
 
     def _compute_local_variance(self, amplitude: np.ndarray) -> np.ndarray:
@@ -249,7 +269,12 @@ class SARFeatureEncoder:
 
             variance = self._compute_local_variance(amplitude)
             gradient = self._compute_gradient_magnitude(amplitude)
-            glcm_contrast = compute_glcm_contrast(amplitude)
+            # Must match transform() stride — otherwise glcm_max is calibrated on a
+            # different spatial sampling than inference and silently mis-scales texture.
+            glcm_stride = int(
+                self.config.get("sar_features", {}).get("glcm_stride", 8)
+            )
+            glcm_contrast = compute_glcm_contrast(amplitude, stride=glcm_stride)
 
             all_variance_maxes.append(float(variance.max()))
             all_gradient_maxes.append(float(gradient.max()))
@@ -294,30 +319,45 @@ class SARFeatureEncoder:
             amplitude = amplitude.squeeze(-1)
         assert amplitude.ndim == 2, f"Expected 2D array, got shape {amplitude.shape}"
 
+        amp = amplitude.clip(0.0, 1.0).astype(np.float32, copy=False)
+        needed = set(self.channel_names)
         feature_map: dict[str, np.ndarray] = {
-            "amplitude": amplitude.clip(0.0, 1.0).astype(np.float32, copy=False),
+            "amplitude": amp,
         }
-        variance = self._compute_local_variance(amplitude)
-        feature_map["local_variance"] = (
-            (variance / self._variance_max).clip(0.0, 1.0).astype(np.float32, copy=False)
-        )
-
-        gradient = self._compute_gradient_magnitude(amplitude)
-        feature_map["gradient_magnitude"] = (
-            (gradient / self._gradient_max).clip(0.0, 1.0).astype(np.float32, copy=False)
-        )
-
-        glcm_contrast = compute_glcm_contrast(amplitude)
-        feature_map["glcm_contrast"] = (
-            (glcm_contrast / self._glcm_max).clip(0.0, 1.0).astype(np.float32, copy=False)
-        )
+        # Only compute expensive features that are actually requested so an
+        # amplitude-repeat 3-channel baseline stays cheap.
+        if "local_variance" in needed:
+            variance = self._compute_local_variance(amplitude)
+            feature_map["local_variance"] = (
+                (variance / self._variance_max)
+                .clip(0.0, 1.0)
+                .astype(np.float32, copy=False)
+            )
+        if "gradient_magnitude" in needed:
+            gradient = self._compute_gradient_magnitude(amplitude)
+            feature_map["gradient_magnitude"] = (
+                (gradient / self._gradient_max)
+                .clip(0.0, 1.0)
+                .astype(np.float32, copy=False)
+            )
+        if "glcm_contrast" in needed:
+            glcm_stride = int(
+                self.config.get("sar_features", {}).get("glcm_stride", 8)
+            )
+            glcm_contrast = compute_glcm_contrast(amplitude, stride=glcm_stride)
+            feature_map["glcm_contrast"] = (
+                (glcm_contrast / self._glcm_max)
+                .clip(0.0, 1.0)
+                .astype(np.float32, copy=False)
+            )
 
         try:
             ordered = [feature_map[name] for name in self.channel_names]
         except KeyError as exc:
             raise ValueError(
                 f"Unsupported SAR channel requested: {exc.args[0]!r}. "
-                f"Supported channels: {sorted(feature_map)}"
+                f"Supported channels: {sorted(feature_map)} "
+                f"(requested schema: {self.channel_names})"
             ) from exc
         features = np.stack(ordered, axis=-1)
 

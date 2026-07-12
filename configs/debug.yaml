@@ -1,71 +1,151 @@
+# Smoke test: SegFormer-B3 + 4-ch SAR texture (small crops / few epochs).
+# Uses the same B3 weights as main-config so no extra download is needed.
+#   python cleanup.py --yes
+#   python train.py --config configs/debug.yaml --no-resume
 dataset:
   root: ./dataset
+  num_classes: 5
+  class_names:
+    - sea_surface
+    - oil_spill
+    - look_alike
+    - ship
+    - land
   train_split: 0.9
   split_seed: 42
+  pixel_counts:
+    sea_surface: 639414373
+    oil_spill: 7294306
+    look_alike: 40574671
+    ship: 296259
+    land: 36357891
 
 model:
   architecture: segformer
   segformer_decoder: hf_mlp
-  pretrained_name: nvidia/segformer-b0-finetuned-ade-512-512
+  pretrained_name: nvidia/segformer-b3-finetuned-ade-512-512
+  require_local_pretrained: true
+  pretrained_cache_dir: ./models/pretrained
   num_channels: 4
   num_labels: 5
   channel_init: rgb_mean_inflate
+  decoder_channels: 768
 
 sar_features:
   channel_1: amplitude
   channel_2: local_variance
   channel_3: gradient_magnitude
   channel_4: glcm_contrast
-  channel_schema_version: vv_singleband_4ch
+  channel_schema_version: vv_sar_texture_4ch_v1
+  glcm_stride: 16          # coarser than main (8) for faster smoke
+  cache:
+    enabled: true
+
 training:
-  num_epochs: 4
+  num_epochs: 2
   batch_size_per_gpu: 2
   gradient_accumulation_steps: 1
-  num_workers: 0
+  num_workers: 2
   val_num_workers: 0
   persistent_workers: false
-  pin_memory: false
-  precision: fp32
-  validate_every_n_epochs: 2
-  save_every_n_epochs: 2
+  pin_memory: true
+  precision: bf16
+  torch_compile: false
+  validation_profile: fast
+  validate_every_n_epochs: 1
+  save_every_n_epochs: 1
   checkpoint_dir: ./checkpoints/debug
   log_dir: ./logs/debug
   progressive_schedule:
-    1: 128
-    2: 256
+    1: 320
+  early_stop_start_epoch: 999
+  early_stop_patience_epochs: 999
   model_ema:
     enabled: true
-    decay: 0.9998
+    decay: 0.99
     update_after_step: 0
-    use_for_validation: false
-    save_best_ema: false
+    update_every: 1
+    use_for_validation: true
+    save_best_ema: true
+    device: cpu
 
 optimizer:
-  lr: 6.0e-05
+  name: adamw
+  lr: 3.0e-05
   head_lr_mult: 10.0
   weight_decay: 0.01
+  fused: auto
 
 scheduler:
+  type: cosine
   warmup_epochs: 1
   min_lr: 1.0e-06
 
 augmentation:
   train:
-    crop_size: 128
+    crop_size: 320
+    crop_strategy: class_aware
+    class_aware_crop_probs:
+      ship: 0.28
+      oil_spill: 0.32
+      look_alike: 0.22
+      random: 0.18
+    horizontal_flip_prob: 0.5
+    vertical_flip_prob: 0.3
+    rotation_degrees: 10
     copy_paste:
       enabled: false
     speckle_noise:
       enabled: false
   test:
-    resize: 128
+    mode: native
 
 loss:
+  ce_ignore_index: -100
+  ce_label_smoothing: 0.0
+  ce_class_weights: median_frequency
   hybrid_loss_weights:
     ce: 1.0
     dice: 1.0
     jaccard: 0.0
-    focal: 0.0
+    focal: 0.2
+  focal:
+    gamma: 2.0
+    alpha: inverse_frequency
+  dice:
+    smooth: 1.0
+    class_weights: [0.6, 2.2, 1.6, 3.5, 1.0]
+  lovasz:
+    weight: 0.0
+  boundary:
+    weight: 0.0
+  confusion_penalty:
+    weight: 0.0
+
+curriculum:
+  phase_1:
+    epochs: [1, 2]
+    ship_oversample_factor: 2.0
+    oil_spill_oversample_factor: 1.2
+    look_alike_oversample_factor: 1.1
+    ship_sampling_floor_multiplier: 1.1
+
+inference:
+  whole_image:
+    enabled: true
+    align: 32
+  sliding_window:
+    enabled: true
+    crop_size: 320
+    stride: 160
+    batch_size: 2
+  tta:
+    enabled: false
+  multiscale:
+    enabled: false
 
 evaluation:
+  profile: fast
   save_predictions: false
   prediction_dir: ./predictions/debug
+

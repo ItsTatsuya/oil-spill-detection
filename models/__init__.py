@@ -4,9 +4,11 @@ from models.hf_segmentation import (
     adapt_pretrained_state_dict,
     inflate_rgb_weight_with_mean_channel,
 )
+from models.torchvision_seg import TorchvisionSegmentationModel
 
 __all__ = [
     "HFSegmentationModel",
+    "TorchvisionSegmentationModel",
     "adapt_pretrained_state_dict",
     "inflate_rgb_weight_with_mean_channel",
     "build_model",

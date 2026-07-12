@@ -5,12 +5,18 @@ __all__ = [
     "Evaluator",
     "TestTimeAugmentation",
     "MultiScaleInference",
+    "SlidingWindowInference",
+    "WholeImageInference",
+    "InferencePipeline",
 ]
 
 _EXPORTS = {
     "Evaluator": "inference.evaluator",
     "TestTimeAugmentation": "inference.tta",
     "MultiScaleInference": "inference.multiscale",
+    "SlidingWindowInference": "inference.sliding_window",
+    "WholeImageInference": "inference.whole_image",
+    "InferencePipeline": "inference.pipeline",
 }
 
 

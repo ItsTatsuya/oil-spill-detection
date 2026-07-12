@@ -4,7 +4,6 @@ from typing import Any
 __all__ = [
     "Trainer",
     "SegmentationMetrics",
-    "CurriculumScheduler",
     "CheckpointCallback",
     "build_train_val_indices",
 ]
@@ -12,7 +11,6 @@ __all__ = [
 _EXPORTS = {
     "Trainer": "training.trainer",
     "SegmentationMetrics": "training.metrics",
-    "CurriculumScheduler": "training.curriculum",
     "CheckpointCallback": "training.callbacks",
     "build_train_val_indices": "training.split",
 }

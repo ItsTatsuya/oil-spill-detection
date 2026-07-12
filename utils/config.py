@@ -34,15 +34,13 @@ _OBSOLETE_KEYS = {
     "model.input_channels": "model.input_channels was replaced by model.num_channels.",
     "model.ocr": "model.ocr was removed.",
     "model.logit_fusion": "model.logit_fusion was removed.",
-    "model.backbone": "DeepLab backbone configuration was removed.",
-    "model.backbone_variant": "DeepLab backbone configuration was removed.",
-    "model.pretrained": "Use model.pretrained_name instead of model.pretrained.",
-    "model.pretrained_dir": "model.pretrained_dir was removed. Hugging Face pretrained_name is the supported entry point.",
-    "model.aspp_channels": "DeepLab ASPP configuration was removed.",
-    "model.atrous_rates": "DeepLab ASPP configuration was removed.",
-    "model.aspp_dropout": "DeepLab ASPP configuration was removed.",
-    "model.fusion_channels": "DeepLab decoder configuration was removed.",
-    "model.decoder_dropout": "DeepLab decoder configuration was removed.",
+    "model.backbone_variant": "model.backbone_variant was removed.",
+    "model.pretrained_dir": "model.pretrained_dir was removed. Use model.pretrained (torchvision) or model.pretrained_name (Hugging Face).",
+    "model.aspp_channels": "Legacy ASPP channel override was removed.",
+    "model.atrous_rates": "Legacy atrous rate override was removed.",
+    "model.aspp_dropout": "Legacy ASPP dropout override was removed.",
+    "model.fusion_channels": "Legacy fusion channel override was removed.",
+    "model.decoder_dropout": "Legacy decoder dropout override was removed.",
     "model.use_ship_head": "Ship auxiliary heads were removed.",
     "model.ship_head_hidden": "Ship auxiliary heads were removed.",
     "model.ship_head_dropout": "Ship auxiliary heads were removed.",
@@ -134,10 +132,12 @@ def _resolve_dataset_signature(config: dict[str, Any]) -> str:
     split_seed = int(dataset_cfg.get("split_seed", 42))
     num_channels = resolve_model_num_channels(config)
     schema_version = resolve_channel_schema_version(config)
+    # Include GLCM stride so feature stats/cache invalidate when texture sampling changes.
+    glcm_stride = int(config.get("sar_features", {}).get("glcm_stride", 8))
     return (
         f"{dataset_name}__split-{train_split:g}"
         f"__seed-{split_seed}__ch-{num_channels}"
-        f"__schema-{schema_version}"
+        f"__schema-{schema_version}__glcm{glcm_stride}"
     )
 
 
@@ -224,9 +224,13 @@ def validate_config(config: dict[str, Any]) -> list[str]:
             "sar_features channels must be chosen from "
             f"{sorted(_SUPPORTED_SAR_CHANNELS)}, got invalid entries: {invalid_channels}"
         )
-    if len(set(channels)) != len(channels):
+    # Allow repeating amplitude (e.g. 3x amplitude for ImageNet stem transfer).
+    # Other handcrafted features must still be unique.
+    non_amp = [name for name in channels if name != "amplitude"]
+    if len(set(non_amp)) != len(non_amp):
         raise ValueError(
-            f"sar_features channels must be unique and ordered, got {channels}"
+            "Non-amplitude sar_features channels must be unique, got "
+            f"{channels}"
         )
     num_channels = resolve_model_num_channels(config)
     if channels and len(channels) != num_channels:
@@ -262,7 +266,7 @@ def load_config(config_path: str, validate: bool = True) -> dict[str, Any]:
         raise FileNotFoundError(
             f"Config file not found: {config_path}\n"
             "Run from the project root with a valid config path, for example: "
-            "python train.py --config configs/segformer_sar.yaml"
+            "python train.py --config configs/main-config.yaml"
         )
 
     with path.open("r", encoding="utf-8") as f:

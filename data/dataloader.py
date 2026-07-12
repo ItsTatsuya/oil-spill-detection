@@ -77,7 +77,7 @@ class CurriculumDataLoaderFactory:
 
         train_cfg = config.get("training", {})
         self.batch_size = train_cfg.get("batch_size_per_gpu", 8)
-        self.num_workers = train_cfg.get("num_workers", 8)
+        self.num_workers = int(train_cfg.get("num_workers", 8))
         self.pin_memory = train_cfg.get("pin_memory", True)
         self.cache_by_phase = bool(train_cfg.get("cache_dataloaders_by_phase", True))
         self.persistent_workers = bool(
@@ -86,6 +86,7 @@ class CurriculumDataLoaderFactory:
                 False,
             )
         )
+        self.prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
 
         self.curriculum_cfg = config.get("curriculum", {})
         self.sampler_seed = int(config.get("dataset", {}).get("split_seed", 42))
@@ -178,16 +179,7 @@ class CurriculumDataLoaderFactory:
                 replacement=True,
                 seed=self.sampler_seed,
             )
-            return DataLoader(
-                self.dataset,
-                batch_size=self.batch_size,
-                sampler=sampler,
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory,
-                drop_last=True,
-                worker_init_fn=_worker_init_fn,
-                persistent_workers=self.persistent_workers and self.num_workers > 0,
-            )
+            return self._make_loader(sampler=sampler, shuffle=False)
 
         sampler = WeightedRandomSampler(
             weights=phase_weights.tolist(),
@@ -195,16 +187,23 @@ class CurriculumDataLoaderFactory:
             replacement=True,
         )
 
-        return DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            sampler=sampler,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=True,
-            worker_init_fn=_worker_init_fn,
-            persistent_workers=self.persistent_workers and self.num_workers > 0,
-        )
+        return self._make_loader(sampler=sampler, shuffle=False)
+
+    def _make_loader(self, *, sampler, shuffle: bool) -> DataLoader:
+        kwargs: dict = {
+            "dataset": self.dataset,
+            "batch_size": self.batch_size,
+            "sampler": sampler,
+            "shuffle": shuffle if sampler is None else False,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "drop_last": True,
+            "worker_init_fn": _worker_init_fn,
+            "persistent_workers": self.persistent_workers and self.num_workers > 0,
+        }
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = max(self.prefetch_factor, 2)
+        return DataLoader(**kwargs)
 
     def _compute_image_weights(
         self, pixel_counts: Mapping[str, int] | Sequence[int]
@@ -365,7 +364,10 @@ class CurriculumDataLoaderFactory:
                 sample_boost += max(look_alike_boost - 1.0, 0.0)
             weights[idx] *= sample_boost
 
-        if ship_sampling_floor_multiplier > 1.0:
+        # Floor applies for any positive multiplier (configs historically used 1.0
+        # intending "at least base ship weight", which was previously a no-op
+        # because the check required multiplier > 1.0).
+        if ship_sampling_floor_multiplier > 0.0:
             for idx in self._ship_image_indices:
                 base_weight = self._per_image_weights[idx]
                 floor_weight = base_weight * ship_sampling_floor_multiplier

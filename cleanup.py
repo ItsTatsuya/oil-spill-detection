@@ -1,169 +1,209 @@
+#!/usr/bin/env python3
+"""Remove training artifacts for a clean restart.
+
+Deletes caches, stats, checkpoints, logs, and predictions by default.
+Does NOT touch the dataset, source code, or downloaded pretrained weights
+(unless --include-pretrained is passed).
+
+Examples:
+  python cleanup.py              # dry-run (prints what would be removed)
+  python cleanup.py --yes        # actually delete
+  python cleanup.py --yes --all  # also wipe __pycache__
+"""
+
 from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parent
 
-GROUPS = [
-    {
-        "label": "Standard Pre-Run Cleanup",
-        "paths": [
-            "checkpoints",
-            "logs",
-            "predictions",
-            "evaluation_output",
-            ".pytest_cache",
-        ],
-    },
-    {"label": "Checkpoints", "paths": ["checkpoints"]},
-    {"label": "Logs", "paths": ["logs"]},
-    {"label": "Predictions", "paths": ["predictions"]},
-    {"label": "Evaluation output", "paths": ["evaluation_output"]},
-    {"label": "Ablation results", "paths": ["ablations/results"]},
-    {"label": "__pycache__ (all)", "paths": "__pycache__"},
-    # --- MOVED CACHES OUT OF STANDARD CLEANUP ---
-    {
-        "label": "⚠️ DANGEROUS: SAR Dataset Cache (.npy files)",
-        "paths": ["data/sar_cache"],
-    },
-    {
-        "label": "⚠️ DANGEROUS: Ship Crop Library (.pkl files)",
-        "paths": ["data/ship_crops"],
-    },
-    {"label": "⚠️ DANGEROUS: SAR Stats (.json files)", "paths": ["data/sar_stats"]},
+# Safe-to-delete training artifacts (relative to project root).
+DEFAULT_PATHS: list[str] = [
+    "checkpoints",
+    "logs",
+    "predictions",
+    "evaluation_output",
+    "data/sar_cache",
+    "data/sar_stats",
+    "data/ship_crops",
+    "ship_crops",
+    "sar_cache",
+    "sar_stats",
+    "sar_stats.json",
+    "results_paper_ablation",
 ]
 
+# Optional / aggressive extras.
+PYCACHE_GLOBS = ("**/__pycache__", "**/.pytest_cache", "**/*.pyc")
+PRETRAINED_PATHS = ("models/pretrained", "pretrained")
 
-def get_size(path: Path) -> int:
+
+def _human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{num_bytes}B"
+
+
+def _path_size(path: Path) -> int:
     if not path.exists():
         return 0
     if path.is_file():
         return path.stat().st_size
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                pass
+    return total
 
 
-def fmt_size(nbytes: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if nbytes < 1024:
-            return f"{nbytes:.1f} {unit}"
-        nbytes /= 1024
-    return f"{nbytes:.1f} TB"
+def collect_targets(
+    *,
+    include_pycache: bool,
+    include_pretrained: bool,
+) -> list[Path]:
+    targets: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved in seen:
+            return
+        # Never climb above project root.
+        try:
+            resolved.relative_to(ROOT)
+        except ValueError:
+            return
+        if not path.exists():
+            return
+        seen.add(resolved)
+        targets.append(path)
+
+    for rel in DEFAULT_PATHS:
+        add(ROOT / rel)
+
+    if include_pycache:
+        for pattern in PYCACHE_GLOBS:
+            for match in ROOT.glob(pattern):
+                add(match)
+
+    if include_pretrained:
+        for rel in PRETRAINED_PATHS:
+            add(ROOT / rel)
+
+    return sorted(targets, key=lambda p: str(p))
 
 
-def count_files(path: Path) -> int:
-    if not path.exists():
-        return 0
-    if path.is_file():
-        return 1
-    return sum(1 for f in path.rglob("*") if f.is_file())
-
-
-def find_pycaches() -> list[Path]:
-    return sorted(ROOT.rglob("__pycache__"))
-
-
-def iter_group_paths(group: dict) -> list[Path]:
-    if group["paths"] == "__pycache__":
-        return find_pycaches()
-    return [ROOT / rel_path for rel_path in group["paths"]]
-
-
-def get_group_info(group: dict) -> tuple[int, int]:
-    paths = iter_group_paths(group)
-    total_files = sum(count_files(path) for path in paths)
-    total_size = sum(get_size(path) for path in paths)
-    return total_files, total_size
-
-
-# --- FIX: Completely remove the directory instead of just its contents ---
-def empty_path(path: Path) -> int:
-    if not path.exists():
-        return 0
-
-    freed = get_size(path)
-    if path.is_file():
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
-    else:
-        # This will permanently delete the folder itself (like __pycache__)
-        shutil.rmtree(path, ignore_errors=True)
-    return freed
-
-
-def delete_group(group: dict) -> int:
-    return sum(empty_path(path) for path in iter_group_paths(group))
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive cleanup utility for SAR Oil Spill artifacts"
+        description=(
+            "Clean training artifacts (caches, stats, checkpoints, logs, "
+            "predictions) for a fresh run."
+        )
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Actually delete files. Without this flag, only dry-run.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also remove __pycache__ / .pytest_cache / *.pyc.",
+    )
+    parser.add_argument(
+        "--include-pretrained",
+        action="store_true",
+        help=(
+            "Also delete models/pretrained (forces re-download). "
+            "Not recommended for routine restarts."
+        ),
+    )
+    parser.add_argument(
+        "--extra",
+        action="append",
+        default=[],
+        help="Extra relative path under the project root to delete (repeatable).",
     )
     return parser.parse_args()
 
 
-def main() -> None:
-    parse_args()
-    print("\n  SAR Oil Spill - Cleanup Tool")
-    print("  " + "=" * 40)
-    print(
-        "  Standard pre-run cleanup (Option 1) will NO LONGER delete your SAR caches."
+def main() -> int:
+    args = parse_args()
+    targets = collect_targets(
+        include_pycache=bool(args.all),
+        include_pretrained=bool(args.include_pretrained),
     )
-    print()
-
-    for i, group in enumerate(GROUPS, 1):
-        files, size = get_group_info(group)
-        status = f"{files} files, {fmt_size(size)}" if files else "empty"
-        print(f"  {i}. {group['label']:<45s} [{status}]")
-
-    print()
-    print("  a. Select all")
-    print("  q. Quit")
-    print()
-
-    choice = input("  Enter numbers to delete (e.g. 1 7): ").strip().lower()
-
-    if choice in ("q", ""):
-        print("  Cancelled.")
-        return
-
-    if choice == "a":
-        indices = list(range(len(GROUPS)))
-    else:
+    for rel in args.extra:
+        candidate = (ROOT / rel).resolve()
         try:
-            indices = [int(item) - 1 for item in choice.split()]
+            candidate.relative_to(ROOT)
         except ValueError:
-            print("  Invalid input.")
-            return
-        for idx in indices:
-            if idx < 0 or idx >= len(GROUPS):
-                print(f"  Invalid number: {idx + 1}")
-                return
+            print(f"Refusing path outside project root: {rel}", file=sys.stderr)
+            return 2
+        if candidate.exists():
+            targets.append(ROOT / rel)
 
-    print()
-    print("  Will delete:")
-    total_files = 0
-    total_size = 0
-    for idx in indices:
-        files, size = get_group_info(GROUPS[idx])
-        total_files += files
-        total_size += size
-        print(f"    * {GROUPS[idx]['label']}")
+    # De-dupe while preserving order.
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in targets:
+        key = path.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    targets = deduped
 
-    print(f"\n  Total: {total_files} files, {fmt_size(total_size)}")
-    confirm = input("  Confirm? [y/N]: ").strip().lower()
+    if not targets:
+        print("Nothing to clean (no matching artifacts found).")
+        return 0
 
-    if confirm != "y":
-        print("  Cancelled.")
-        return
+    total_bytes = sum(_path_size(p) for p in targets)
+    mode = "DELETE" if args.yes else "DRY-RUN"
+    print(f"[{mode}] Project root: {ROOT}")
+    print(f"[{mode}] {len(targets)} path(s), ~{_human_size(total_bytes)}")
+    for path in targets:
+        kind = "dir" if path.is_dir() else "file"
+        print(f"  - ({kind}, {_human_size(_path_size(path))}) {path.relative_to(ROOT)}")
 
-    freed = 0
-    for idx in indices:
-        freed += delete_group(GROUPS[idx])
-        print(f"  Cleared {GROUPS[idx]['label']}")
+    if not args.yes:
+        print("\nDry-run only. Re-run with --yes to delete.")
+        return 0
 
-    print(f"\n  Done. Freed {fmt_size(freed)}.")
+    failed = 0
+    for path in targets:
+        try:
+            remove_path(path)
+            print(f"  removed {path.relative_to(ROOT)}")
+        except OSError as exc:
+            failed += 1
+            print(f"  FAILED {path.relative_to(ROOT)}: {exc}", file=sys.stderr)
+
+    if failed:
+        print(f"Finished with {failed} failure(s).", file=sys.stderr)
+        return 1
+    print("Cleanup complete.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

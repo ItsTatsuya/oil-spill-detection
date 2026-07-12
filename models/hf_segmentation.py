@@ -30,12 +30,19 @@ class HFModelSpec:
     backbone_prefixes: tuple[str, ...]
 
 
+# transformers <4.5x used encoder.patch_embeddings.N; 5.x uses stages.N.patch_embeddings.
+_SEGFORMER_FIRST_CONV_CANDIDATES: tuple[str, ...] = (
+    "segformer.stages.0.patch_embeddings.proj.weight",
+    "segformer.encoder.patch_embeddings.0.proj.weight",
+)
+
 MODEL_SPECS: dict[str, HFModelSpec] = {
     "segformer": HFModelSpec(
         architecture="segformer",
         config_cls=SegformerConfig,
         model_cls=SegformerForSemanticSegmentation,
-        first_conv_key="segformer.encoder.patch_embeddings.0.proj.weight",
+        # Prefer stages (transformers 5.x); resolve_first_conv_key falls back dynamically.
+        first_conv_key=_SEGFORMER_FIRST_CONV_CANDIDATES[0],
         head_prefixes=("decode_head.classifier.",),
         backbone_prefixes=("segformer.",),
     ),
@@ -48,6 +55,36 @@ MODEL_SPECS: dict[str, HFModelSpec] = {
         backbone_prefixes=("mobilevit.",),
     ),
 }
+
+
+def resolve_first_conv_key(
+    state_dict: dict[str, torch.Tensor],
+    preferred: str | None = None,
+    candidates: tuple[str, ...] = (),
+) -> str:
+    """Locate the RGB stem conv weight across HF naming schemes."""
+    ordered: list[str] = []
+    if preferred:
+        ordered.append(preferred)
+    ordered.extend(candidates)
+    # Heuristic: first patch-embed / stem 4D weight with in_ch in {1,3,4} (or any).
+    for key in state_dict:
+        if key in ordered:
+            continue
+        if not key.endswith("proj.weight") and "conv_stem" not in key:
+            continue
+        if "patch_embeddings" in key or "conv_stem" in key:
+            ordered.append(key)
+    for key in ordered:
+        weight = state_dict.get(key)
+        if weight is not None and weight.ndim == 4:
+            return key
+    raise RuntimeError(
+        "Could not resolve first-convolution weight key in model state dict. "
+        f"Tried preferred={preferred!r}, candidates={candidates!r}. "
+        "Sample keys: "
+        + ", ".join(list(state_dict)[:8])
+    )
 
 CUSTOM_SEGFORMER_HEAD_PREFIXES: tuple[str, ...] = (
     "decoder.",
@@ -129,9 +166,15 @@ def _repo_folder_name(model_id: str) -> str:
 
 
 def _map_segformer_pretrained_key_for_custom_model(key: str) -> str:
+    """Map HF ForSemanticSegmentation keys onto CustomSegformer/hybrid encoder.* keys."""
     if key.startswith("segformer."):
         return f"encoder.{key[len('segformer.') :]}"
     return key
+
+
+def _is_segformer_backbone_key(key: str) -> bool:
+    # transformers 5.x: segformer.stages.*; older: segformer.encoder.*
+    return key.startswith("segformer.stages.") or key.startswith("segformer.encoder.")
 
 
 def _resolve_pretrained_source(config: dict) -> tuple[str, bool]:
@@ -295,7 +338,7 @@ def _convert_segformer_pretrained_backbone_keys(
 ) -> dict[str, torch.Tensor]:
     converted: dict[str, torch.Tensor] = {}
     for key, value in pretrained_state_dict.items():
-        if not key.startswith("segformer.encoder."):
+        if not _is_segformer_backbone_key(key):
             continue
         converted[_map_segformer_pretrained_key_for_custom_model(key)] = value
     return converted
@@ -324,20 +367,30 @@ def _build_custom_segformer_model(config: dict) -> CustomSegformerModel:
     converted = _convert_segformer_pretrained_backbone_keys(
         pretrained_model.state_dict()
     )
-    first_conv_key = _map_segformer_pretrained_key_for_custom_model(spec.first_conv_key)
-    if first_conv_key not in model.state_dict():
-        raise RuntimeError(
-            "Resolved first conv key is missing in custom SegFormer state dict: "
-            f"{first_conv_key}"
-        )
+    model_state = model.state_dict()
+    first_conv_key = resolve_first_conv_key(
+        model_state,
+        preferred=_map_segformer_pretrained_key_for_custom_model(spec.first_conv_key),
+        candidates=tuple(
+            _map_segformer_pretrained_key_for_custom_model(k)
+            for k in _SEGFORMER_FIRST_CONV_CANDIDATES
+        ),
+    )
     adapted = adapt_pretrained_state_dict(
         converted,
-        model.state_dict(),
+        model_state,
         first_conv_key=first_conv_key,
         num_channels=num_channels,
         channel_init=channel_init,
         head_prefixes=CUSTOM_SEGFORMER_HEAD_PREFIXES,
     )
+    first_w = adapted.get(first_conv_key)
+    if first_w is None or first_w.shape[1] != num_channels:
+        raise RuntimeError(
+            f"First-conv adapt failed for custom SegFormer ({first_conv_key}): "
+            f"expected in_ch={num_channels}, got "
+            f"{None if first_w is None else tuple(first_w.shape)}"
+        )
 
     missing, unexpected = model.load_state_dict(adapted, strict=False)
     if unexpected:
@@ -370,20 +423,30 @@ def _build_oilspill_hybrid_segformer_model(config: dict) -> SegformerOilSpillHyb
     converted = _convert_segformer_pretrained_backbone_keys(
         pretrained_model.state_dict()
     )
-    first_conv_key = _map_segformer_pretrained_key_for_custom_model(spec.first_conv_key)
-    if first_conv_key not in model.state_dict():
-        raise RuntimeError(
-            "Resolved first conv key is missing in hybrid SegFormer state dict: "
-            f"{first_conv_key}"
-        )
+    model_state = model.state_dict()
+    first_conv_key = resolve_first_conv_key(
+        model_state,
+        preferred=_map_segformer_pretrained_key_for_custom_model(spec.first_conv_key),
+        candidates=tuple(
+            _map_segformer_pretrained_key_for_custom_model(k)
+            for k in _SEGFORMER_FIRST_CONV_CANDIDATES
+        ),
+    )
     adapted = adapt_pretrained_state_dict(
         converted,
-        model.state_dict(),
+        model_state,
         first_conv_key=first_conv_key,
         num_channels=num_channels,
         channel_init=channel_init,
         head_prefixes=CUSTOM_SEGFORMER_HEAD_PREFIXES,
     )
+    first_w = adapted.get(first_conv_key)
+    if first_w is None or first_w.shape[1] != num_channels:
+        raise RuntimeError(
+            f"First-conv adapt failed for hybrid SegFormer ({first_conv_key}): "
+            f"expected in_ch={num_channels}, got "
+            f"{None if first_w is None else tuple(first_w.shape)}"
+        )
 
     missing, unexpected = model.load_state_dict(adapted, strict=False)
     if unexpected:
@@ -442,14 +505,46 @@ def build_hf_segmentation_model(config: dict) -> nn.Module:
         pretrained_source,
         local_files_only=local_files_only,
     )
+    model_state = model.state_dict()
+    first_conv_candidates = (
+        _SEGFORMER_FIRST_CONV_CANDIDATES if architecture == "segformer" else ()
+    )
+    first_conv_key = resolve_first_conv_key(
+        model_state,
+        preferred=spec.first_conv_key,
+        candidates=first_conv_candidates,
+    )
+    # Pretrained checkpoint may use a different naming scheme than the empty model
+    # if versions mixed; resolve against the pretrained dict as well for inflate.
+    pretrained_state = pretrained_model.state_dict()
+    pretrained_first_conv_key = resolve_first_conv_key(
+        pretrained_state,
+        preferred=first_conv_key,
+        candidates=first_conv_candidates + (spec.first_conv_key,),
+    )
+    if pretrained_first_conv_key != first_conv_key:
+        # Align inflate under the live model key name.
+        if pretrained_first_conv_key in pretrained_state:
+            pretrained_state = dict(pretrained_state)
+            pretrained_state[first_conv_key] = pretrained_state.pop(
+                pretrained_first_conv_key
+            )
+
     adapted = adapt_pretrained_state_dict(
-        pretrained_model.state_dict(),
-        model.state_dict(),
-        first_conv_key=spec.first_conv_key,
+        pretrained_state,
+        model_state,
+        first_conv_key=first_conv_key,
         num_channels=num_channels,
         channel_init=channel_init,
         head_prefixes=spec.head_prefixes,
     )
+    first_w = adapted.get(first_conv_key)
+    if first_w is None or first_w.shape[1] != num_channels:
+        raise RuntimeError(
+            f"First-conv adapt failed for {first_conv_key}: "
+            f"expected in_ch={num_channels}, got "
+            f"{None if first_w is None else tuple(first_w.shape)}"
+        )
     missing, unexpected = model.load_state_dict(adapted, strict=False)
     unexpected = [
         name for name in unexpected if not name.startswith(spec.head_prefixes)
@@ -458,9 +553,31 @@ def build_hf_segmentation_model(config: dict) -> nn.Module:
         raise RuntimeError(
             f"Unexpected pretrained keys for {architecture}: {unexpected}"
         )
-    if any(name == spec.first_conv_key for name in missing):
+    if any(name == first_conv_key for name in missing):
         raise RuntimeError(
-            f"Failed to initialize first convolution for {architecture}: {spec.first_conv_key}"
+            f"Failed to initialize first convolution for {architecture}: {first_conv_key}"
+        )
+    # Classifier head is intentionally re-init (ADE-150 -> 5-class); backbone should load.
+    backbone_missing = [
+        name
+        for name in missing
+        if not name.startswith(spec.head_prefixes) and name != first_conv_key
+    ]
+    logger.info(
+        "Pretrained load: first_conv_key=%s adapted_keys=%d missing=%d "
+        "(backbone_missing=%d) first_conv_in_ch=%d.",
+        first_conv_key,
+        len(adapted),
+        len(missing),
+        len(backbone_missing),
+        int(model.state_dict()[first_conv_key].shape[1]),
+    )
+    if len(backbone_missing) > max(5, len(adapted) // 20):
+        logger.warning(
+            "Many backbone weights missing after pretrained load (%d). "
+            "Transfer may be weak. Examples: %s",
+            len(backbone_missing),
+            backbone_missing[:8],
         )
 
     return HFSegmentationModel(architecture=architecture, model=model)

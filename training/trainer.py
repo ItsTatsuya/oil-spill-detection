@@ -63,7 +63,7 @@ class Trainer:
         self.validate_every = int(train_cfg.get("validate_every_n_epochs", 2))
         self.save_every = int(train_cfg.get("save_every_n_epochs", 10))
         self.checkpoint_dir = str(
-            train_cfg.get("checkpoint_dir", "./checkpoints/segformer")
+            train_cfg.get("checkpoint_dir", "./checkpoints/v2_deeplab_r50")
         )
         self.precision = str(train_cfg.get("precision", "bf16")).lower()
         self.grad_accum_steps = int(train_cfg.get("gradient_accumulation_steps", 1))
@@ -72,9 +72,12 @@ class Trainer:
         self.val_num_workers = int(train_cfg.get("val_num_workers", 2))
         self.pin_memory = bool(train_cfg.get("pin_memory", True))
         self.persistent_workers = bool(train_cfg.get("persistent_workers", True))
+        self.prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
+        progressive_raw = train_cfg.get("progressive_schedule") or {1: 512, 41: 576}
+        if not isinstance(progressive_raw, dict) or not progressive_raw:
+            progressive_raw = {1: 512, 41: 576}
         self.progressive_schedule = {
-            int(k): int(v)
-            for k, v in train_cfg.get("progressive_schedule", {1: 512, 41: 576}).items()
+            int(k): int(v) for k, v in progressive_raw.items()
         }
         self.early_stop_patience_epochs = int(
             train_cfg.get("early_stop_patience_epochs", 30)
@@ -86,11 +89,15 @@ class Trainer:
         self.use_model_ema = bool(ema_cfg.get("enabled", True))
         self.use_ema_for_validation = bool(ema_cfg.get("use_for_validation", True))
         self.save_best_ema = bool(ema_cfg.get("save_best_ema", True))
+        # Default EMA on CPU to free VRAM on 8GB cards (RTX 4060 Ti).
+        ema_device = str(ema_cfg.get("device", "cpu"))
         self.model_ema = (
             ModelEMA(
                 self.model,
                 decay=float(ema_cfg.get("decay", 0.9998)),
                 update_after_step=int(ema_cfg.get("update_after_step", 0)),
+                device=ema_device,
+                update_every=int(ema_cfg.get("update_every", 1)),
             )
             if self.use_model_ema
             else None
@@ -178,6 +185,7 @@ class Trainer:
             "fuse.",
             "dropout.",
             "classifier.",
+            "aux_classifier.",
             "enhancers.",
             "aspp.",
             "fuse_s16.",
@@ -393,16 +401,18 @@ class Trainer:
             shuffle = False
         self._train_sampler = sampler
 
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=True,
-            persistent_workers=self.persistent_workers and self.num_workers > 0,
-        )
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "shuffle": shuffle,
+            "sampler": sampler,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "drop_last": True,
+            "persistent_workers": self.persistent_workers and self.num_workers > 0,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(self.prefetch_factor, 2)
+        return DataLoader(self.train_dataset, **loader_kwargs)
 
     def _set_train_epoch(self, epoch: int) -> None:
         if hasattr(self.train_dataset, "set_epoch"):
@@ -447,14 +457,16 @@ class Trainer:
                 self.val_dataset,
                 list(range(self.rank, len(self.val_dataset), self.world_size)),
             )
-        return DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=self.val_num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers and self.val_num_workers > 0,
-        )
+        val_kwargs: dict[str, Any] = {
+            "batch_size": 1,
+            "shuffle": False,
+            "num_workers": self.val_num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers and self.val_num_workers > 0,
+        }
+        if self.val_num_workers > 0:
+            val_kwargs["prefetch_factor"] = max(self.prefetch_factor, 2)
+        return DataLoader(dataset, **val_kwargs)
 
     def _refresh_train_augmentation(self, epoch: int) -> bool:
         crop_size = get_progressive_crop_size(epoch, self.progressive_schedule)

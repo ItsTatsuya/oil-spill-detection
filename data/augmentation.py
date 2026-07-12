@@ -27,6 +27,7 @@ def get_input_normalize_stats(
     num_channels: int,
     amplitude_channel_index: Optional[int] = 0,
 ) -> tuple[list[float], list[float]]:
+    """Legacy helper: ImageNet-normalize a single amplitude channel index."""
     if num_channels <= 0:
         raise ValueError(f"num_channels must be positive, got {num_channels}")
     mean = [0.0] * num_channels
@@ -38,12 +39,34 @@ def get_input_normalize_stats(
 
 
 def get_config_normalize_stats(config: dict) -> tuple[list[float], list[float]]:
+    """Per-channel mean/std aligned with the active channel schema.
+
+    Amplitude channels use ImageNet RGB stats (cycling R/G/B) so a 3-channel
+    amplitude-repeat input matches pretrained SegFormer stem expectations.
+
+    Hand-crafted SAR maps (variance / gradient / GLCM) are already scaled to
+    roughly [0, 1] in ``SARFeatureEncoder``. Using mean=0,std=1 left them ~5x
+    smaller than ImageNet-normalized amplitude (~[-2, 2]), so the pretrained
+    stem under-used those channels. We map [0,1] features to a similar range
+    with mean=0.5, std=0.25 -> ~[-2, 2].
+    """
     channel_names = resolve_sar_channel_names(config)
-    amplitude_idx = channel_names.index("amplitude") if "amplitude" in channel_names else None
-    return get_input_normalize_stats(
-        resolve_model_num_channels(config),
-        amplitude_channel_index=amplitude_idx,
-    )
+    num_channels = resolve_model_num_channels(config)
+    if len(channel_names) != num_channels:
+        raise RuntimeError(
+            f"Channel schema length {len(channel_names)} != model.num_channels {num_channels}"
+        )
+
+    # Default: texture-like channels in [0, 1]
+    mean = [0.5] * num_channels
+    std = [0.25] * num_channels
+    amp_slot = 0
+    for idx, name in enumerate(channel_names):
+        if name == "amplitude":
+            mean[idx] = float(IMAGENET_MEAN[amp_slot % 3])
+            std[idx] = float(IMAGENET_STD[amp_slot % 3])
+            amp_slot += 1
+    return mean, std
 
 
 class SpeckleNoise(ImageOnlyTransform):
@@ -269,24 +292,43 @@ class SARSegmentationAugmentation:
         aug_cfg = config.get("augmentation", {})
         self.train_cfg = aug_cfg.get("train", {})
         self.test_cfg = aug_cfg.get("test", {})
+        self.ignore_index = int(config.get("loss", {}).get("ce_ignore_index", -100))
 
     def get_train_transform(self, crop_size_override: Optional[int] = None) -> A.Compose:
-        crop_size = int(crop_size_override or self.train_cfg.get("crop_size", 512))
+        # Spatial crops are applied by ClassAwareCropper before this transform;
+        # crop_size_override is accepted for API compatibility with the trainer.
+        _ = crop_size_override
         rotation_deg = float(self.train_cfg.get("rotation_degrees", 15))
 
+        # Constant mask border with ignore_index avoids inventing fake class
+        # labels when affine samples outside the image (BORDER_REFLECT did that).
+        affine_kwargs = dict(
+            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+            scale=(0.9, 1.1),
+            rotate=(-rotation_deg, rotation_deg),
+            interpolation=cv2.INTER_LINEAR,
+            mask_interpolation=cv2.INTER_NEAREST,
+            border_mode=cv2.BORDER_CONSTANT,
+            p=0.3,
+        )
+        # Albumentations 1.x uses cval/cval_mask; 2.x uses fill/fill_mask.
+        try:
+            affine = A.Affine(
+                **affine_kwargs,
+                fill=0,
+                fill_mask=self.ignore_index,
+            )
+        except TypeError:
+            affine = A.Affine(
+                **affine_kwargs,
+                cval=0,
+                cval_mask=self.ignore_index,
+            )
         transforms_list = [
             A.HorizontalFlip(p=float(self.train_cfg.get("horizontal_flip_prob", 0.5))),
             A.VerticalFlip(p=float(self.train_cfg.get("vertical_flip_prob", 0.3))),
             A.RandomRotate90(p=0.5),
-            A.Affine(
-                translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
-                scale=(0.9, 1.1),
-                rotate=(-rotation_deg, rotation_deg),
-                interpolation=cv2.INTER_LINEAR,
-                mask_interpolation=cv2.INTER_NEAREST,
-                border_mode=cv2.BORDER_REFLECT,
-                p=0.3,
-            ),
+            affine,
         ]
         return A.Compose(transforms_list)
 
@@ -304,7 +346,31 @@ class SARSegmentationAugmentation:
         )
 
     def get_test_transform(self) -> A.Compose:
+        """Val/test geometric transform.
+
+        Default is identity (native resolution). Destructive square resize is
+        only applied when ``augmentation.test.mode: resize`` is set explicitly.
+        Prefer sliding-window inference at the training crop size instead.
+        """
+        mode = str(self.test_cfg.get("mode", "native")).strip().lower()
+        if mode in {"native", "identity", "none", ""}:
+            # No-op compose keeps the Dataset transform API stable.
+            return A.Compose([A.NoOp()])
+
+        if mode != "resize":
+            logger.warning(
+                "Unknown augmentation.test.mode=%r. Using native resolution.",
+                mode,
+            )
+            return A.Compose([A.NoOp()])
+
         resize_size = int(self.test_cfg.get("resize", 640))
+        logger.warning(
+            "Using destructive square resize %dx%d for val/test. "
+            "This breaks aspect ratio vs train crops; prefer sliding_window + native.",
+            resize_size,
+            resize_size,
+        )
         return A.Compose(
             [
                 A.Resize(

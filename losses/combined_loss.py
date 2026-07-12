@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from constants import CLASS_NAMES
+from constants import (
+    CLASS_NAMES,
+    DEFAULT_PIXEL_COUNTS,
+    compute_median_freq_weights,
+)
 from losses.boundary_loss import BoundaryLoss
 from losses.confusion_penalty_loss import ConfusionPenaltyLoss
 from losses.dice_loss import DiceLoss
@@ -27,6 +31,8 @@ class CombinedLoss(nn.Module):
                 dataset_counts
             ) == len(CLASS_NAMES):
                 pixel_counts = [int(value) for value in dataset_counts]
+        if pixel_counts is None:
+            pixel_counts = list(DEFAULT_PIXEL_COUNTS)
         hybrid_cfg = loss_cfg.get("hybrid_loss_weights", {})
         self.ce_weight = float(hybrid_cfg.get("ce", 1.0))
         self.dice_weight = float(hybrid_cfg.get("dice", 1.0))
@@ -40,11 +46,28 @@ class CombinedLoss(nn.Module):
             int(idx) for idx in loss_cfg.get("ohem_class_indices", [])
         ]
         self.ohem_start_epoch = int(loss_cfg.get("ohem_start_epoch", 0))
+
+        ce_weight_mode = str(
+            loss_cfg.get("ce_class_weights", "median_frequency")
+        ).strip().lower()
+        ce_weight_tensor = self._resolve_ce_class_weights(
+            ce_weight_mode, pixel_counts
+        )
+        if ce_weight_tensor is not None:
+            self.register_buffer("ce_class_weights", ce_weight_tensor)
+        else:
+            self.ce_class_weights = None  # type: ignore[assignment]
+
         dice_cfg = loss_cfg.get("dice", {})
+        dice_class_weights = self._resolve_dice_class_weights(
+            dice_cfg.get("class_weights", "none"),
+            pixel_counts,
+        )
         self.dice_loss = DiceLoss(
             smooth=float(dice_cfg.get("smooth", 1.0)),
             ignore_index=self.ce_ignore_index,
             aggregation=str(dice_cfg.get("aggregation", "per_image")),
+            class_weights=dice_class_weights,
         )
         self.focal_loss = FocalLoss(
             gamma=float(loss_cfg.get("focal", {}).get("gamma", 2.0)),
@@ -95,6 +118,8 @@ class CombinedLoss(nn.Module):
         self.auxiliary_enabled = bool(auxiliary_cfg.get("enabled", False))
         self.aux_s16_weight = float(aux_weights_cfg.get("s16", 0.0))
         self.aux_s8_weight = float(aux_weights_cfg.get("s8", 0.0))
+        # Torchvision DeepLab aux head (predictions['aux_logits']).
+        self.tv_aux_weight = float(loss_cfg.get("aux_weight", 0.0))
 
     def _scheduled_weight(
         self,
@@ -115,6 +140,73 @@ class CombinedLoss(nn.Module):
         progress = float(epoch - ramp_start) / float(max(ramp_end - ramp_start, 1))
         return float(target_weight) * progress
 
+    @staticmethod
+    def _resolve_ce_class_weights(
+        mode: str,
+        pixel_counts: list[int],
+    ) -> Optional[torch.Tensor]:
+        if mode in {"none", "off", "uniform", "false", "0"}:
+            return None
+        if mode in {
+            "median_frequency",
+            "median_freq",
+            "inverse_frequency",
+            "true",
+            "on",
+            "1",
+        }:
+            counts_map = {
+                name: int(count) for name, count in zip(CLASS_NAMES, pixel_counts)
+            }
+            return compute_median_freq_weights(counts_map)
+        raise ValueError(
+            "loss.ce_class_weights must be 'median_frequency' or 'none', "
+            f"got {mode!r}"
+        )
+
+    @staticmethod
+    def _resolve_dice_class_weights(
+        spec,
+        pixel_counts: list[int],
+    ) -> Optional[torch.Tensor]:
+        """Dice class weights: none | median_frequency | explicit list of 5 floats."""
+        if spec is None:
+            return None
+        if isinstance(spec, (list, tuple)):
+            if len(spec) != len(CLASS_NAMES):
+                raise ValueError(
+                    f"loss.dice.class_weights list must have {len(CLASS_NAMES)} "
+                    f"values, got {len(spec)}"
+                )
+            return torch.tensor([float(v) for v in spec], dtype=torch.float32)
+        mode = str(spec).strip().lower()
+        if mode in {"none", "off", "uniform", "false", "0"}:
+            return None
+        if mode in {
+            "median_frequency",
+            "median_freq",
+            "inverse_frequency",
+            "true",
+            "on",
+            "1",
+        }:
+            counts_map = {
+                name: int(count) for name, count in zip(CLASS_NAMES, pixel_counts)
+            }
+            # Softer than CE: sqrt of median-freq so Dice is not ship-dominated.
+            weights = compute_median_freq_weights(counts_map)
+            return torch.sqrt(weights.clamp(min=1e-6))
+        raise ValueError(
+            "loss.dice.class_weights must be 'none', 'median_frequency', or a "
+            f"list of {len(CLASS_NAMES)} floats, got {spec!r}"
+        )
+
+    def _ce_weight_arg(self) -> Optional[torch.Tensor]:
+        weights = getattr(self, "ce_class_weights", None)
+        if weights is None:
+            return None
+        return weights
+
     def _compute_ce_loss(
         self,
         logits: torch.Tensor,
@@ -125,9 +217,13 @@ class CombinedLoss(nn.Module):
         if self.ce_mode != "class_restricted_ohem" or epoch < self.ohem_start_epoch:
             return self._compute_standard_ce_loss(logits, targets)
 
+        weight = self._ce_weight_arg()
+        if weight is not None:
+            weight = weight.to(device=logits.device, dtype=logits.dtype)
         per_pixel = F.cross_entropy(
             logits,
             targets,
+            weight=weight,
             ignore_index=self.ce_ignore_index,
             label_smoothing=self.ce_label_smoothing,
             reduction="none",
@@ -152,9 +248,13 @@ class CombinedLoss(nn.Module):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
+        weight = self._ce_weight_arg()
+        if weight is not None:
+            weight = weight.to(device=logits.device, dtype=logits.dtype)
         return F.cross_entropy(
             logits,
             targets,
+            weight=weight,
             ignore_index=self.ce_ignore_index,
             label_smoothing=self.ce_label_smoothing,
         )
@@ -292,6 +392,7 @@ class CombinedLoss(nn.Module):
         zero = logits.new_zeros(())
         aux_s16_loss = zero
         aux_s8_loss = zero
+        tv_aux_loss = zero
         if self.auxiliary_enabled:
             aux_s16_logits = predictions.get("aux_s16")
             if aux_s16_logits is not None and self.aux_s16_weight > 0.0:
@@ -301,6 +402,18 @@ class CombinedLoss(nn.Module):
             if aux_s8_logits is not None and self.aux_s8_weight > 0.0:
                 aux_s8_loss = self._compute_auxiliary_loss(aux_s8_logits, targets)
                 total = total + self.aux_s8_weight * aux_s8_loss
+
+        aux_logits = predictions.get("aux_logits")
+        if aux_logits is not None and self.tv_aux_weight > 0.0:
+            if aux_logits.shape[-2:] != targets.shape[-2:]:
+                aux_logits = F.interpolate(
+                    aux_logits,
+                    size=targets.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            tv_aux_loss = self._compute_standard_ce_loss(aux_logits, targets)
+            total = total + self.tv_aux_weight * tv_aux_loss
 
         return {
             "total": total,
@@ -317,6 +430,7 @@ class CombinedLoss(nn.Module):
             "ship_aux": zero.detach(),
             "aux_s8": aux_s8_loss.detach(),
             "aux_s16": aux_s16_loss.detach(),
+            "aux_tv": tv_aux_loss.detach(),
             "ce_norm": ce.detach(),
             "focal_norm": focal.detach(),
             "dice_norm": dice.detach(),
@@ -352,5 +466,13 @@ class CombinedLoss(nn.Module):
         probs = probs * valid_mask_f
 
         intersection = (probs * one_hot).sum(dim=(0, 2, 3))
-        union = (probs + one_hot - probs * one_hot).sum(dim=(0, 2, 3)).clamp(min=1e-6)
-        return (1.0 - (intersection / union)).mean()
+        card_pred = probs.sum(dim=(0, 2, 3))
+        card_tgt = one_hot.sum(dim=(0, 2, 3))
+        union = (card_pred + card_tgt - intersection).clamp(min=1e-6)
+        # Only average classes present in the batch targets (avoids empty-class
+        # IoU≈0 from the previous union.clamp(min=1e-6) trick).
+        present = card_tgt > 0
+        if not bool(present.any()):
+            return probs.new_zeros(())
+        iou = intersection[present] / union[present]
+        return (1.0 - iou).mean()

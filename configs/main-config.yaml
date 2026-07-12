@@ -1,3 +1,6 @@
+# SegFormer-B3 + SAR multi-feature texture stack (amplitude / variance / gradient / GLCM).
+# Fixed pipeline: native eval, weighted CE/Dice, fine GLCM, balanced channel norms.
+
 dataset:
   root: ./dataset
   num_classes: 5
@@ -25,58 +28,67 @@ dataset:
 model:
   architecture: segformer
   segformer_decoder: hf_mlp
-  pretrained_name: nvidia/segformer-b2-finetuned-ade-512-512
+  # B3 > B2 for rare-class capacity; B4/B5 usually need smaller batch/crop on 8GB.
+  pretrained_name: nvidia/segformer-b3-finetuned-ade-512-512
   require_local_pretrained: true
   pretrained_cache_dir: ./models/pretrained
+  # 4-ch SAR stack: radiometry + texture + edges + 2nd-order texture.
   num_channels: 4
   num_labels: 5
   channel_init: rgb_mean_inflate
   decoder_channels: 768
 
 sar_features:
-  channel_1: amplitude
-  channel_2: local_variance
-  channel_3: gradient_magnitude
-  channel_4: glcm_contrast
-  channel_schema_version: vv_singleband_4ch
+  channel_1: amplitude          # backscatter (oil/look dark; ships bright)
+  channel_2: local_variance     # smoothness (oil often smoother than open sea)
+  channel_3: gradient_magnitude # edges (ships sharp; oil more diffuse)
+  channel_4: glcm_contrast      # 2nd-order texture (oil vs look-alike cue)
+  channel_schema_version: vv_sar_texture_4ch_v1
+  glcm_stride: 8                # was 64 — too blurry for slicks
   cache:
     enabled: true
 
 training:
-  num_epochs: 400
-  batch_size_per_gpu: 4
-  gradient_accumulation_steps: 4
+  num_epochs: 220
+  # B3 is ~47M params (B2 ~27M): use batch 2 @640 to stay under 8GB; keep eff. batch 16.
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 8
   effective_batch_size: 16
   num_workers: 6
-  val_num_workers: 4
+  val_num_workers: 2
+  prefetch_factor: 4
   cache_dataloaders_by_phase: true
   persistent_workers: true
   pin_memory: true
   precision: bf16
+  torch_compile: false
   validation_profile: fast
   validate_every_n_epochs: 2
   save_every_n_epochs: 10
   keep_top_k_ema_checkpoints: 3
-  checkpoint_dir: ./checkpoints/main_b2
-  log_dir: ./logs/main_b2
+  checkpoint_dir: ./checkpoints/segformer_b3_texture
+  log_dir: ./logs/segformer_b3_texture
   gradient_clip_norm: 1.0
   progressive_schedule:
     1: 640
-  early_stop_start_epoch: 250
-  early_stop_patience_epochs: 50
-  early_stop_min_delta: 0.0005
+  early_stop_start_epoch: 80
+  early_stop_patience_epochs: 45
+  early_stop_min_delta: 0.0003
   model_ema:
-    enabled: false
-    decay: 0.9998
+    enabled: true
+    decay: 0.999
     update_after_step: 0
-    use_for_validation: false
-    save_best_ema: false
+    update_every: 2
+    use_for_validation: true
+    save_best_ema: true
+    device: cpu
 
 optimizer:
   name: adamw
   lr: 3.0e-05
   head_lr_mult: 10.0
   weight_decay: 0.01
+  fused: auto
   betas: [0.9, 0.999]
   eps: 1.0e-08
 
@@ -90,10 +102,10 @@ augmentation:
     crop_size: 640
     crop_strategy: class_aware
     class_aware_crop_probs:
-      ship: 0.20
-      oil_spill: 0.35
-      look_alike: 0.25
-      random: 0.20
+      ship: 0.28
+      oil_spill: 0.32
+      look_alike: 0.22
+      random: 0.18
     horizontal_flip_prob: 0.5
     vertical_flip_prob: 0.3
     rotation_degrees: 15
@@ -108,83 +120,86 @@ augmentation:
       blur_kernel_size: 3
       allowed_target_classes:
         - sea_surface
-        - oil_spill
-      min_allowed_target_fraction: 0.85
+      min_allowed_target_fraction: 0.90
       match_local_intensity: true
   test:
-    resize: 640
+    mode: native
 
 loss:
   ce_ignore_index: -100
-  ce_label_smoothing: 0.03
+  ce_label_smoothing: 0.0
+  ce_class_weights: median_frequency
   hybrid_loss_weights:
-    ce: 0.8
-    dice: 1.0
+    ce: 1.0
+    dice: 1.2
     jaccard: 0.0
-    focal: 0.5
+    focal: 0.4
   focal:
     gamma: 2.0
     alpha: inverse_frequency
   dice:
     smooth: 1.0
+    class_weights: [0.6, 2.2, 1.6, 3.5, 1.0]
   lovasz:
-    weight: 0.75
-    ramp_start_epoch: 21
-    ramp_end_epoch: 80
+    weight: 0.45
+    ramp_start_epoch: 15
+    ramp_end_epoch: 50
   boundary:
-    weight: 0.15
-    ramp_start_epoch: 21
-    ramp_end_epoch: 80
-    downsample_factor: 4
+    weight: 0.0
   confusion_penalty:
     weight: 0.15
     penalize_pairs:
-      - [1, 2]                # Oil vs Look-alike
-      - [0, 1]                # Sea vs Oil
-      - [0, 2]                # Sea vs Look-alike
-    pair_weights: [1.6, 0.25, 0.65]  # <-- 0.65 attacks the 824k false Sea/Look-alike pixels
-    ramp_start_epoch: 150
-    ramp_end_epoch: 260
+      - [1, 2]
+      - [0, 1]
+      - [0, 2]
+    pair_weights: [2.0, 0.35, 0.5]
+    ramp_start_epoch: 15
+    ramp_end_epoch: 60
     margin_start: 0.1
-    margin_end: 0.3
-    margin_ramp_start_epoch: 150
-    margin_ramp_end_epoch: 260
+    margin_end: 0.35
+    margin_ramp_start_epoch: 15
+    margin_ramp_end_epoch: 60
 
 curriculum:
   phase_1:
-    epochs: [1, 50]
+    epochs: [1, 40]
     ship_oversample_factor: 2.5
-  phase_2:
-    epochs: [51, 120]
-    ship_oversample_factor: 3.0
-    oil_spill_oversample_factor: 1.2
-    look_alike_oversample_factor: 1.1
-  phase_3:
-    epochs: [121, 400]
-    ship_oversample_factor: 2.2
     oil_spill_oversample_factor: 1.35
-    look_alike_oversample_factor: 1.0
-    ship_sampling_floor_multiplier: 1.0
+    look_alike_oversample_factor: 1.2
+    ship_sampling_floor_multiplier: 1.3
+  phase_2:
+    epochs: [41, 120]
+    ship_oversample_factor: 2.6
+    oil_spill_oversample_factor: 1.4
+    look_alike_oversample_factor: 1.25
+    ship_sampling_floor_multiplier: 1.3
+  phase_3:
+    epochs: [121, 220]
+    ship_oversample_factor: 2.0
+    oil_spill_oversample_factor: 1.25
+    look_alike_oversample_factor: 1.15
+    ship_sampling_floor_multiplier: 1.1
 
 inference:
+  whole_image:
+    enabled: true
+    align: 32
+  sliding_window:
+    enabled: true
+    crop_size: 640
+    stride: 320
+    batch_size: 4
   tta:
-    enabled: false
+    enabled: true
     augmentation_types:
       - original
       - horizontal_flip
       - vertical_flip
-      - rotate_90
-      - rotate_180
-      - rotate_270
-      - hflip_rotate_90
-      - hflip_rotate_270
     aggregation: mean_softmax
   multiscale:
     enabled: false
-    scales: [0.75, 1.0, 1.25]
-    aggregation: mean_softmax
 
 evaluation:
-  profile: fast
+  profile: full
   save_predictions: true
-  prediction_dir: ./predictions/main_b2
+  prediction_dir: ./predictions/segformer_b3_texture

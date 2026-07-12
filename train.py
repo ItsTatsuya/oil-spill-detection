@@ -16,6 +16,28 @@ import numpy as np
 import torch
 
 torch.set_float32_matmul_precision("high")
+
+
+def configure_nvidia_runtime() -> None:
+    """Enable Ada / Ampere-friendly CUDA knobs (TF32, cuDNN autotune, SDP)."""
+    if not torch.cuda.is_available():
+        return
+    # TF32 Tensor Cores on Ampere/Ada (RTX 4060 Ti = Ada Lovelace).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    # Prefer Flash / mem-efficient attention SDPA kernels when available.
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+
+
+configure_nvidia_runtime()
+
 from constants import CLASS_NAMES
 from data.augmentation import SARSegmentationAugmentation
 from data.copy_paste import CopyPasteAugmentation
@@ -32,7 +54,6 @@ from utils.logger import Logger
 warnings.filterwarnings("ignore", message="Argument.*are not valid for transform")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +78,7 @@ def parse_args():
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/segformer_sar.yaml",
+        default="configs/main-config.yaml",
         help="Path to configuration YAML file",
     )
     resume_group = parser.add_mutually_exclusive_group()
@@ -140,10 +161,11 @@ def main():
     exp_logger = Logger(config=config)
 
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
         exp_logger.info(
-            "Disabled reduced-precision BF16 GEMM reductions for stability "
-            "(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False)."
+            "NVIDIA runtime: TF32="
+            f"{torch.backends.cuda.matmul.allow_tf32} "
+            f"cudnn.benchmark={torch.backends.cudnn.benchmark} "
+            f"device={torch.cuda.get_device_name(0)}"
         )
 
     stats_path = resolve_sar_stats_path(config)
@@ -241,15 +263,19 @@ def main():
     exp_logger.info("Building segmentation model...")
     model = build_model(config)
 
-    # --- ADA LOVELACE OPTIMIZATION ---
-    exp_logger.info("Compiling model for Ada Lovelace (Triton)...")
-    from torch._inductor import config as inductor_config
+    compile_enabled = bool(train_cfg.get("torch_compile", False))
+    if compile_enabled:
+        exp_logger.info("Compiling model with torch.compile...")
+        from torch._inductor import config as inductor_config
 
-    inductor_config.max_autotune = False
-    inductor_config.max_autotune_gemm = False
-    # We compile the model BEFORE wrapping it in DDP
-    model = torch.compile(model)
-    # ---------------------------------
+        inductor_config.max_autotune = False
+        inductor_config.max_autotune_gemm = False
+        model = torch.compile(model)
+    else:
+        exp_logger.info(
+            "torch.compile disabled (training.torch_compile=false). "
+            "Set training.torch_compile=true to enable."
+        )
 
     model, is_distributed, local_rank = setup_distributed(model)
 

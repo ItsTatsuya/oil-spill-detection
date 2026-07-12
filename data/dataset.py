@@ -138,7 +138,7 @@ class OilSpillDataset(Dataset):
             raise FileNotFoundError(
                 f"Dataset root not found: {self.root}\n"
                 "Please set dataset.root in your config file, for example "
-                "configs/segformer_sar.yaml, "
+                "configs/main-config.yaml, "
                 "to the path of the Krestenitis 2019 oil spill dataset."
             )
 
@@ -484,7 +484,9 @@ class OilSpillDataset(Dataset):
             raise RuntimeError(f"Expected (H, W, C) feature image, got {image.shape}")
 
         channel_names = resolve_sar_channel_names(self.config)
-        amplitude_idx = channel_names.index("amplitude") if "amplitude" in channel_names else None
+        amplitude_indices = [
+            idx for idx, name in enumerate(channel_names) if name == "amplitude"
+        ]
         amp_p1 = 0.0
         amp_p99 = 1.0
         if self.sar_encoder is not None:
@@ -494,8 +496,10 @@ class OilSpillDataset(Dataset):
                 amp_p1 = float(p1)
                 amp_p99 = float(p99)
 
+        # Clip each channel independently. Amplitude is further p1-p99 stretched;
+        # texture maps are already ~[0,1] from SARFeatureEncoder.
         normalized = np.clip(image.astype(np.float32).copy(), 0.0, 1.0)
-        if amplitude_idx is not None:
+        for amplitude_idx in amplitude_indices:
             amp = np.clip(normalized[..., amplitude_idx], amp_p1, amp_p99)
             normalized[..., amplitude_idx] = (amp - amp_p1) / (amp_p99 - amp_p1 + 1e-8)
 

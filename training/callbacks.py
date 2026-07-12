@@ -10,47 +10,84 @@ logger = logging.getLogger(__name__)
 
 
 class ModelEMA:
+    """EMA of model weights. Shadow buffers live on CPU to save VRAM (8GB GPUs)."""
+
     def __init__(
         self,
         model: nn.Module,
         decay: float = 0.9998,
         update_after_step: int = 200,
+        device: str | torch.device = "cpu",
+        update_every: int = 1,
     ) -> None:
         self.decay = float(decay)
         self.update_after_step = int(update_after_step)
+        self.update_every = max(int(update_every), 1)
         self.num_updates = 0
+        self.device = torch.device(device)
         model_to_track = self._unwrap_model(model)
         self.shadow_state = {
-            name: tensor.detach().clone()
+            name: tensor.detach().to(self.device, copy=True)
             for name, tensor in model_to_track.state_dict().items()
         }
+        logger.info(
+            "ModelEMA shadow on %s (update_every=%d).",
+            self.device,
+            self.update_every,
+        )
 
     def update(self, model: nn.Module, global_step: int) -> bool:
         self.num_updates = int(global_step)
         if self.num_updates < self.update_after_step:
             return False
+        # Skip most steps when EMA lives on CPU — full state copies dominate step time.
+        if self.update_every > 1 and (self.num_updates % self.update_every) != 0:
+            return False
 
         current_state = self._unwrap_model(model).state_dict()
+        # Slightly higher effective decay when updating less often so EMA stays smooth.
+        decay = self.decay
+        if self.update_every > 1:
+            decay = float(decay ** self.update_every)
         for name, tensor in current_state.items():
             shadow = self.shadow_state[name]
+            src = tensor.detach().to(shadow.device, non_blocking=False)
             if torch.is_floating_point(tensor):
-                shadow.mul_(self.decay).add_(tensor.detach(), alpha=1.0 - self.decay)
+                shadow.mul_(decay).add_(src, alpha=1.0 - decay)
             else:
-                shadow.copy_(tensor.detach())
+                shadow.copy_(src)
         return True
 
     @contextmanager
     def average_parameters(self, model: nn.Module):
+        """Load EMA weights for validation, restore live weights after.
+
+        Live weights are backed up on CPU so we do not hold two full GPU copies.
+        """
         model_to_use = self._unwrap_model(model)
+        live_state = model_to_use.state_dict()
         raw_state = {
-            name: tensor.detach().clone()
-            for name, tensor in model_to_use.state_dict().items()
+            name: tensor.detach().to("cpu", copy=True)
+            for name, tensor in live_state.items()
         }
-        model_to_use.load_state_dict(self.shadow_state, strict=True)
+        ema_on_device = {
+            name: self.shadow_state[name].to(
+                device=param.device, dtype=param.dtype, non_blocking=False
+            )
+            for name, param in live_state.items()
+            if name in self.shadow_state
+        }
+        model_to_use.load_state_dict(ema_on_device, strict=True)
         try:
             yield
         finally:
-            model_to_use.load_state_dict(raw_state, strict=True)
+            restore = {
+                name: tensor.to(
+                    device=live_state[name].device, dtype=live_state[name].dtype
+                )
+                for name, tensor in raw_state.items()
+            }
+            model_to_use.load_state_dict(restore, strict=True)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -58,7 +95,7 @@ class ModelEMA:
             "update_after_step": self.update_after_step,
             "num_updates": self.num_updates,
             "shadow_state_dict": {
-                name: tensor.detach().clone()
+                name: tensor.detach().cpu().clone()
                 for name, tensor in self.shadow_state.items()
             },
         }
@@ -71,7 +108,9 @@ class ModelEMA:
         self.num_updates = int(state_dict.get("num_updates", self.num_updates))
         for name, tensor in state_dict.get("shadow_state_dict", {}).items():
             if name in self.shadow_state:
-                self.shadow_state[name].copy_(tensor)
+                self.shadow_state[name].copy_(
+                    tensor.to(device=self.shadow_state[name].device)
+                )
 
     def _unwrap_model(self, model: nn.Module) -> nn.Module:
         return model.module if hasattr(model, "module") else model
